@@ -1,0 +1,27 @@
+NetworkMonitor/
+│
+├── main.py
+│
+├── presentation/
+│   ├── __init__.py
+│   └── dashboard.py
+│
+├── application/
+│   ├── __init__.py
+│   ├── monitor_service.py
+│   └── bandwidth_calculator.py
+│
+├── infrastructure/
+│   ├── __init__.py
+│   └── network_collector.py
+│
+├── models/
+│   ├── __init__.py
+│   └── network_sample.py
+│
+└── config/
+    ├── __init__.py
+    └── settings.py
+cấu trúc tổ chức
+xây dựng app window
+sử dụng các thư viện python hỗ trợ tương tác với kernal để lấy dữ liệu thực hiện xử lí can thiệp

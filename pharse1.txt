@@ -1,0 +1,19 @@
+25/8
+#### Theo dõi băng thông của card mạng thực hiện vẽ biểu đồ
++ dùng lệnh để lấy thông tin từ card mạng sau thời gian t
++ lưu lại data
++ thực hiện tính tốc độ mạng thông qua chênh lệch
++ thực hiện ghi lại data tốc độ 
++ vẽ biểu đồ, view lên tốc độ hiện tại
++ thực hiện xây dựng theo mô hình đảm bảo việc mở rộng tích hợp các chức năng tiếp theo
+
+
+**** pip install psutil // thư viện
+**** pip install psutil matplotlib // thư viện
+
+tối ưu cách vẽ để tránh giật lag 
+tối ưu giao diện vẽ 
+**thiếu: 
+chọn 1 ngày trong quá khứ có thực hiện đo thì hệ thống vẽ lại biểu đồ ngày hôm đó
+có thể chọn 1 điểm trên biểu đồ thì nó dừng biểu đồ lại hiển thị tốc độ tại điểm đó có thời gian cụ thể có hiển thị tốc độ mạng
+sau khi cho biểu đồ tiếp tục thì nó vẽ theo hiện tại
