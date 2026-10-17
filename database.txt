@@ -1,0 +1,54 @@
+****Đề xuất cấu trúc database cho pharse 1 với mục tiêu là xây dụng các chức năng chạy offine thuận tiện cho việc mở rộng triển khai online sau này 
+                         ┌─────────────────────┐
+                         │       DEVICES       │
+                         │─────────────────────│
+                         │ PK id               │
+                         │ UQ device_uuid      │
+                         │ hostname            │
+                         │ os                  │
+                         │ os_version          │
+                         │ agent_version       │
+                         │ status              │
+                         │ last_seen           │
+                         │ created_at          │
+                         │ updated_at          │
+                         └──────────┬──────────┘
+                                    │
+                    ┌───────────────┼────────────────┐
+                    │               │                │
+                  1:N             1:N              1:N
+                    │               │                │
+                    ▼               ▼                ▼
+          ┌────────────────┐ ┌──────────────┐ ┌────────────────────┐
+          │    NETWORK     │ │   PROCESSES  │ │ NETWORK_CONNECTIONS│
+          │   INTERFACES   │ │──────────────│ │────────────────────│
+          │────────────────│ │ PK id        │ │ PK id              │
+          │ PK id          │ │ FK device_id │ │ FK device_id       │
+          │ FK device_id   │ │ pid          │ │ FK process_id      │
+          │ name           │ │ name         │ │ protocol           │
+          │ type           │ │ path         │ │ local_ip           │
+          │ mac            │ │ first_seen   │ │ local_port         │
+          │ speed          │ │ last_seen    │ │ remote_ip          │
+          │ active         │ │ status       │ │ remote_port        │
+          └───────┬────────┘ └──────┬───────┘ │ state              │
+                  │                 │         │ first_seen         │
+                  │                 │         │ last_seen          │
+                  │                 │         └────────────────────┘
+                  │                 │
+                 1:N               1:N
+                  │                 │
+                  ▼                 ▼
+       ┌────────────────────┐ ┌────────────────────┐
+       │ INTERFACE_TRAFFIC  │ │  PROCESS_TRAFFIC   │
+       │────────────────────│ │────────────────────│
+       │ PK id              │ │ PK id              │
+       │ FK interface_id    │ │ FK process_id      │
+       │ timestamp          │ │ timestamp          │
+       │ rx_bytes           │ │ rx_bytes           │
+       │ tx_bytes           │ │ tx_bytes           │
+       └────────────────────┘ └────────────────────┘
+-Ta có 3 bộ phận chính đảm nhiệm các vai trò khác nhau:
++INTERFACE_TRAFFIC ,PROCESS_TRAFFIC  đây là các bảng lưu dữ liệu chính các bảng này sẽ phình dữ liệu lên rất nhânh qua quá trình sữ dụng 
++NETWORK_CONNECTIONS,NETWORK INTERFACES,PROCESSES là những bảng tương đối tĩnh nó chỉ thực hiệ việc giảm sát kết nối và lưu thông tin của đối tượng được theo dõi
++DEVICES là bảng thực hiện kết nối các thành phần định danh máy phục vụ cho việc triển khai online chạy với nhiều máy sau này 
+-xây dựng trên MySQL

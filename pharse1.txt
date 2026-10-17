@@ -17,3 +17,10 @@ tối ưu giao diện vẽ
 chọn 1 ngày trong quá khứ có thực hiện đo thì hệ thống vẽ lại biểu đồ ngày hôm đó
 có thể chọn 1 điểm trên biểu đồ thì nó dừng biểu đồ lại hiển thị tốc độ tại điểm đó có thời gian cụ thể có hiển thị tốc độ mạng
 sau khi cho biểu đồ tiếp tục thì nó vẽ theo hiện tại
+13/9
+các chức năng còn thiếu ở pharse 1 sẽ đưuocj bố sung sau khi chốt database nó sẽ được thực hiện để phù hợp với mô hình quản lí các máy tính trong 1 LAN
+xây dựng mô hình database để phục vụ việc lưu trữ dữ liệu theo hướng sau này triển khai theo dõi qua mạng(chưa cần phải làm toàn bộ chức năng bây giờ chỉ cần việc thực hiện view lên)
+15/9
+viết tiếp phần lưuuw dữ liệu cho hệ thống với agent chạy trên máy cá nhân
+viết các chức năng xem lại dữu liệu
+viết phần giám sát các process,giám sát kết nối 

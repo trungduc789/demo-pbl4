@@ -23,5 +23,5 @@ NetworkMonitor/
     ├── __init__.py
     └── settings.py
 cấu trúc tổ chức
-xây dựng app window
+xây dựng app thực hiện giám sát băng thông từ xa 
 sử dụng các thư viện python hỗ trợ tương tác với kernal để lấy dữ liệu thực hiện xử lí can thiệp
