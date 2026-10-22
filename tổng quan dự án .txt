@@ -1,27 +1,81 @@
+================================================================================
+        ĐỀ TÀI PBL4: CÔNG CỤ GIÁM SÁT BĂNG THÔNG MẠNG (NETWORK MONITOR)
+================================================================================
+
+1. CẤU TRÚC TỔ CHỨC THƯ MỤC DỰ ÁN (CLEAN ARCHITECTURE)
+--------------------------------------------------------------------------------
 NetworkMonitor/
 │
-├── main.py
+├── main.py                          # Điểm khởi chạy ứng dụng (Entrypoint), quản lý vòng đời ứng dụng GUI
+├── requirements.txt                 # Danh sách các thư viện Python phụ thuộc cần thiết
+├── demo.sql                         # Kịch bản DDL khởi tạo cơ sở dữ liệu MySQL (6 bảng)
+├── database.txt                     # Sơ đồ và mô tả kiến trúc cơ sở dữ liệu
+├── pharse1.txt                      # Ghi chú yêu cầu và lộ trình hoàn thiện giai đoạn 1
 │
-├── presentation/
+├── config/                          # Tầng cấu hình (Configuration Layer)
 │   ├── __init__.py
-│   └── dashboard.py
+│   └── settings.py                  # Cấu hình chu kỳ lấy mẫu, kích thước bộ đệm, thông số MySQL
 │
-├── application/
+├── models/                          # Tầng thực thể (Domain Models)
 │   ├── __init__.py
-│   ├── monitor_service.py
-│   └── bandwidth_calculator.py
+│   └── network_sample.py            # Khai báo cấu trúc dữ liệu: RawNetworkSample, BandwidthSpeed, ProcessNetworkSample
 │
-├── infrastructure/
+├── infrastructure/                  # Tầng hạ tầng & Tương tác Kernel/Hệ điều hành (Infrastructure Layer)
 │   ├── __init__.py
-│   └── network_collector.py
+│   ├── network_collector.py         # Lấy thông số byte truyền/nhận từ card mạng qua psutil
+│   ├── database_manager.py          # Quản lý kết nối MySQL (Thread-Safe), tự động khởi tạo bảng, ghi & truy vấn lịch sử
+│   ├── etw_consumer.py              # Đọc sự kiện gói tin kernel TCP/IP thông qua Event Tracing for Windows (ETW API)
+│   └── qos_manager.py               # Quản lý chính sách điều tiết băng thông mạng qua Windows QoS Policy
 │
-├── models/
+├── application/                     # Tầng nghiệp vụ (Application Layer)
 │   ├── __init__.py
-│   └── network_sample.py
+│   ├── bandwidth_calculator.py      # Tính toán delta tốc độ upload/download (KB/s, MB/s)
+│   └── monitor_service.py           # Điều phối luồng dữ liệu giữa Collector, ETW, QoS và Database
 │
-└── config/
-    ├── __init__.py
-    └── settings.py
-cấu trúc tổ chức
-xây dựng app thực hiện giám sát băng thông từ xa 
-sử dụng các thư viện python hỗ trợ tương tác với kernal để lấy dữ liệu thực hiện xử lí can thiệp
+├── presentation/                    # Tầng giao diện người dùng (Presentation Layer - GUI)
+│   ├── __init__.py
+│   └── dashboard.py                 # Giao diện đồ họa đa tab PyQt6 + PyQtGraph thời gian thực phong cách GlassWire
+│
+└── utils/                           # Tiện ích bổ trợ (Utilities)
+    └── safe_print.py                # Hàm in log an toàn, tránh lỗi encode tiếng Việt UTF-8 trên Windows console
+
+
+2. MỤC TIÊU VÀ ĐẶC TẢ HỆ THỐNG
+--------------------------------------------------------------------------------
+- Xây dựng ứng dụng giám sát và quản lý băng thông mạng trên hệ điều hành Windows theo mô hình Clean Architecture (Domain - Infrastructure - Application - Presentation).
+- Sử dụng trực tiếp các API hệ điều hành và thư viện cấp thấp (Win32 API, Event Tracing for Windows - ETW, psutil) để tương tác trực tiếp với Kernel lấy thông số lưu lượng chính xác theo thời gian thực.
+- Thiết kế theo kiến trúc Agent hướng tới khả năng mở rộng quản trị tập trung nhiều máy tính trong mạng nội bộ (LAN) hoặc qua Internet trong các giai đoạn tiếp theo.
+
+
+3. CÁC TÍNH NĂNG CHÍNH CỦA HỆ THỐNG
+--------------------------------------------------------------------------------
+a. Giám sát băng thông thời gian thực (Traffic Monitor):
+   - Biểu đồ sóng lưu lượng Upload/Download độ mượt cao, ứng dụng bộ lọc Gaussian và thuật toán nội suy Hermite chống rung giật.
+   - Thống kê chi tiết lưu lượng tải xuống, tải lên, phân chia tỷ lệ lưu lượng WAN/LAN.
+   - Scrubber thời gian thực: Tua lại, chọn một điểm bất kỳ trên đồ thị để dừng biểu đồ, xem chi tiết tốc độ và mốc thời gian tại điểm đó; ấn tiếp tục để vẽ lại theo thời gian thực.
+   - Theo dõi băng thông tiêu thụ theo từng tiến trình (Process) ứng dụng riêng biệt.
+
+b. Bảo vệ & Điều tiết lưu lượng mạng (GlassWire Protect / QoS):
+   - Quản lý và giới hạn tốc độ truyền dữ liệu (Upload Throttling) đối với các tiến trình thông qua Windows QoS Policy (PowerShell NetQosPolicy).
+   - Kiểm tra tính xác thực của file thực thi ứng dụng.
+
+c. Quét & Giám sát kết nối mạng (Network Scanner):
+   - Bảng theo dõi toàn bộ Socket kết nối mạng đang hoạt động trên hệ thống (IP nguồn/đích, Cổng, Giao thức TCP/UDP, Trạng thái kết nối, Tên tiến trình).
+
+d. Nhật ký & Phân tích cơ sở dữ liệu (Log Analysis & History):
+   - Tích hợp hệ quản trị CSDL MySQL gồm 6 bảng: devices, network_interfaces, interface_traffic, processes, process_traffic, network_connections.
+   - Cho phép chọn ngày bất kỳ trong quá khứ để tải lại và tái hiện biểu đồ lưu lượng đã ghi nhận.
+   - Kiểm tra tính toàn vẹn và dung lượng dữ liệu của hệ thống.
+
+e. Giám sát tài nguyên phần cứng (Hardware Resources):
+   - Theo dõi thời gian thực mức sử dụng CPU, RAM và tốc độ đọc/ghi ổ đĩa (Disk I/O).
+
+
+4. CÔNG NGHỆ VÀ THƯ VIỆN SỬ DỤNG
+--------------------------------------------------------------------------------
+- Ngôn ngữ: Python 3.10+
+- Giao diện người dùng: PyQt6, PyQtGraph
+- Tương tác hệ thống & Kernel: psutil, ctypes, Win32 API (advapi32, ETW)
+- Tính toán dữ liệu: NumPy
+- Cơ sở dữ liệu: MySQL, mysql-connector-python
+- Môi trường chạy và quản lý CSDL: XAMPP (Apache, MySQL, phpMyAdmin)
