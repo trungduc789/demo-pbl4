@@ -136,3 +136,29 @@ CREATE TABLE network_connections (
     INDEX idx_connections_last_seen (last_seen),
     INDEX idx_connections_remote_ip (remote_ip)
 ) ENGINE=InnoDB;
+
+
+-- 7. POLICY LOGS (NHẬT KÝ CHÍNH SÁCH BÓP BĂNG THÔNG & AN NINH MẠNG)
+CREATE TABLE policy_logs (
+    id                  BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    device_id           BIGINT UNSIGNED NOT NULL,
+    policy_type         VARCHAR(50) NOT NULL DEFAULT 'BANDWIDTH_LIMIT',
+    target_app          VARCHAR(255) NOT NULL,
+    limit_kbps          DOUBLE DEFAULT 0.0,
+    direction           VARCHAR(20) DEFAULT 'both',
+    action              ENUM('APPLY', 'REMOVE') NOT NULL,
+    throttled_packets   BIGINT UNSIGNED DEFAULT 0,
+    throttled_bytes     BIGINT UNSIGNED DEFAULT 0,
+    status              VARCHAR(50) DEFAULT 'SUCCESS',
+    details             TEXT,
+    applied_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+
+    CONSTRAINT fk_policy_device
+        FOREIGN KEY (device_id)
+        REFERENCES devices(id)
+        ON DELETE CASCADE,
+
+    INDEX idx_policy_device (device_id),
+    INDEX idx_policy_app (target_app),
+    INDEX idx_policy_applied_at (applied_at DESC)
+) ENGINE=InnoDB;

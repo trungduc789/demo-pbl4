@@ -8,6 +8,7 @@ from ctypes import wintypes
 from collections import defaultdict
 from typing import Dict, Optional, Tuple, Callable
 from datetime import datetime
+import psutil
 from utils.safe_print import safe_print as print
 
 # ============================================================================
@@ -175,6 +176,10 @@ class ETWNetworkConsumer:
         # Dành cho fallback tracker khi không có quyền Administrator
         self._use_fallback = False
         self._last_process_io: Dict[int, Tuple[int, int]] = {}
+        try:
+            self._prev_net_io = psutil.net_io_counters()
+        except Exception:
+            self._prev_net_io = None
 
         # Giữ tham chiếu callback để GC không thu hồi
         self._c_callback = EVENT_RECORD_CALLBACK(self._event_callback)
@@ -310,11 +315,62 @@ class ETWNetworkConsumer:
         """
         Lấy ra mẫu dữ liệu tổng hợp byte (rx_bytes, tx_bytes) theo từng PID
         trong khoảng thời gian vừa qua, đồng thời reset bộ đếm cho chu kỳ tiếp theo.
+        Tự động đối chiếu và chuẩn hóa theo lưu lượng thực tế của toàn bộ card mạng
+        để triệt tiêu hoàn toàn hiện tượng thao tác đọc/ghi file đĩa (Disk I/O)
+        bị tính nhầm thành lưu lượng mạng làm vọt trần QoS!
         """
         with self._lock:
             snapshot = dict(self._traffic_accumulator)
             self._traffic_accumulator.clear()
-        return snapshot
+
+        if not snapshot:
+            return {}
+
+        # Đo lưu lượng card mạng thực tế của toàn hệ thống
+        try:
+            curr_net = psutil.net_io_counters()
+            if self._prev_net_io is not None:
+                real_rx = max(0, curr_net.bytes_recv - self._prev_net_io.bytes_recv)
+                real_tx = max(0, curr_net.bytes_sent - self._prev_net_io.bytes_sent)
+            else:
+                real_rx = None
+                real_tx = None
+            self._prev_net_io = curr_net
+        except Exception:
+            real_rx = None
+            real_tx = None
+
+        if real_rx is None or real_tx is None:
+            return snapshot
+
+        sum_rx = sum(d.get('rx_bytes', 0) for d in snapshot.values())
+        sum_tx = sum(d.get('tx_bytes', 0) for d in snapshot.values())
+
+        # Nếu tổng delta I/O vượt quá lưu lượng card mạng thực tế (do ghi đĩa cache/database)
+        # -> Chuẩn hóa theo tỷ trọng lưu lượng thực tế
+        normalized = {}
+        for pid, d in snapshot.items():
+            rx = d.get('rx_bytes', 0)
+            tx = d.get('tx_bytes', 0)
+
+            if real_rx == 0:
+                norm_rx = 0
+            elif sum_rx > real_rx:
+                norm_rx = int(rx * (real_rx / sum_rx))
+            else:
+                norm_rx = rx
+
+            if real_tx == 0:
+                norm_tx = 0
+            elif sum_tx > real_tx:
+                norm_tx = int(tx * (real_tx / sum_tx))
+            else:
+                norm_tx = tx
+
+            if norm_rx > 0 or norm_tx > 0:
+                normalized[pid] = {'rx_bytes': norm_rx, 'tx_bytes': norm_tx}
+
+        return normalized
 
     def stop(self):
         """Dừng ETW Consumer và dọn dẹp Trace Session."""

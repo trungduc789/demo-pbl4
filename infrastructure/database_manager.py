@@ -19,6 +19,7 @@ from mysql.connector import Error
 
 from config.settings import DB_CONFIG
 from infrastructure.network_collector import NetworkCollector
+from utils.file_logger import FileLogger
 from utils.safe_print import safe_print as print
 
 
@@ -32,6 +33,7 @@ class DatabaseManager:
         self.device_id: Optional[int] = None
         self.interface_ids: Dict[str, int] = {}
         self.collector = NetworkCollector()
+        self._last_reconnect_attempt = 0.0
         with self._lock:
             self._connect()
             # Tự động kiểm tra và đăng ký máy/card mạng ngay khi khởi tạo
@@ -41,6 +43,8 @@ class DatabaseManager:
 
 
     def _connect(self):
+        import time as _t
+        self._last_reconnect_attempt = _t.time()
         try:
             base_config = {
                 "host": self.config.get("host", "127.0.0.1"),
@@ -50,6 +54,7 @@ class DatabaseManager:
                 "charset": self.config.get("charset", "utf8mb4"),
                 "autocommit": True,
                 "use_pure": True,
+                "connection_timeout": 3,
             }
 
             temp_conn = mysql.connector.connect(**base_config)
@@ -61,13 +66,15 @@ class DatabaseManager:
 
             full_config = dict(self.config)
             full_config["use_pure"] = True
+            full_config["connection_timeout"] = 3
             self.connection = mysql.connector.connect(**full_config)
             if self.connection is not None:
                 self.connection.autocommit = True
             self._ensure_schema()
             return self.connection
-        except Error as exc:
+        except Exception as exc:
             print(f"[DB] Không kết nối được MySQL: {exc}")
+            self.connection = None
             return None
 
     def _ensure_schema(self):
@@ -171,6 +178,26 @@ class DatabaseManager:
                 INDEX idx_connections_remote_ip (remote_ip),
                 INDEX idx_connections_lookup (device_id, protocol, local_ip, local_port)
             ) ENGINE=InnoDB;
+
+            CREATE TABLE IF NOT EXISTS policy_logs (
+                id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                device_id BIGINT UNSIGNED NOT NULL,
+                policy_type VARCHAR(50) NOT NULL DEFAULT 'BANDWIDTH_LIMIT',
+                target_app VARCHAR(255) NOT NULL,
+                limit_kbps DOUBLE DEFAULT 0.0,
+                direction VARCHAR(20) DEFAULT 'both',
+                action ENUM('APPLY', 'REMOVE') NOT NULL,
+                throttled_packets BIGINT UNSIGNED DEFAULT 0,
+                throttled_bytes BIGINT UNSIGNED DEFAULT 0,
+                status VARCHAR(50) DEFAULT 'SUCCESS',
+                details TEXT,
+                applied_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                CONSTRAINT fk_policy_device
+                    FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE,
+                INDEX idx_policy_device (device_id),
+                INDEX idx_policy_app (target_app),
+                INDEX idx_policy_applied_at (applied_at DESC)
+            ) ENGINE=InnoDB;
             """
             for statement in schema.split(";"):
                 if statement.strip():
@@ -182,9 +209,11 @@ class DatabaseManager:
             cursor.close()
 
     def ensure_connection(self):
+        import time as _t
         with self._lock:
             if self.connection is None or not self.connection.is_connected():
-                self.connection = self._connect()
+                if _t.time() - getattr(self, "_last_reconnect_attempt", 0.0) > 5.0:
+                    self.connection = self._connect()
             return self.connection
 
     def get_or_create_device(self) -> Optional[int]:
@@ -556,20 +585,6 @@ class DatabaseManager:
                                 if db_proc_id:
                                     proc_id_cache[pid] = db_proc_id
 
-                                    # Lưu vết lưu lượng I/O bytes của tiến trình nếu có
-                                    try:
-                                        p = psutil.Process(pid)
-                                        proc_io = p.io_counters()
-                                        cursor.execute(
-                                            """
-                                            INSERT INTO process_traffic (process_id, timestamp, rx_bytes, tx_bytes)
-                                            VALUES (%s, %s, %s, %s)
-                                            """,
-                                            (db_proc_id, record_time, int(proc_io.read_bytes), int(proc_io.write_bytes)),
-                                        )
-                                    except (AttributeError, psutil.AccessDenied, psutil.NoSuchProcess):
-                                        pass
-
                     # 4. Ghi hoặc cập nhật kết nối vào network_connections
                     self.save_or_update_connection(
                         cursor=cursor,
@@ -582,6 +597,23 @@ class DatabaseManager:
                         remote_port=conn_info.remote_port,
                         state=conn_info.state,
                         record_time=record_time
+                    )
+
+                    # 4.1. Ghi nhật ký kết nối IP tiến trình ra file logs/connections.log
+                    proc_name_for_log = "Unknown"
+                    if pid and pid in proc_id_cache:
+                        p_info = self.collector.get_process_info(pid)
+                        if p_info:
+                            proc_name_for_log = p_info.name
+                    FileLogger.log_connection(
+                        proc_name=proc_name_for_log,
+                        pid=pid,
+                        protocol=conn_info.protocol,
+                        local_ip=conn_info.local_ip,
+                        local_port=conn_info.local_port,
+                        remote_ip=conn_info.remote_ip,
+                        remote_port=conn_info.remote_port,
+                        state=conn_info.state
                     )
 
                 # 5. Theo dõi thời điểm tiến trình kết thúc
@@ -740,17 +772,23 @@ class DatabaseManager:
 
     def get_daily_traffic_series(self, target_date_str: str) -> list:
         """
-        Lấy chuỗi dữ liệu lưu lượng theo ngày từ interface_traffic và tính toán tốc độ KB/s.
-        Trả về danh sách [{'timestamp': float, 'datetime_str': str, 'down_kb': float, 'up_kb': float}].
+        Lấy chuỗi dữ liệu lưu lượng theo ngày từ interface_traffic và cấu trúc thành chuỗi 24 giờ.
+        Chia ngày thành các bucket thời gian (mỗi 3 phút = 480 điểm) trải đều từ 00:00:00 đến 23:59:59
+        để người dùng xem tổng quan toàn ngày dùng mạng mấy tiếng, giờ nào băng thông cao nhất.
         """
         import time as _t
+        import numpy as _np
         with self._lock:
             conn = self.ensure_connection()
             if conn is None:
                 return []
             cursor = conn.cursor()
-            series = []
             try:
+                # 1. Tính toán mốc bắt đầu và kết thúc 24h của ngày
+                dt_start = datetime.strptime(target_date_str, "%Y-%m-%d")
+                t_day_start = dt_start.timestamp()
+                t_day_end = t_day_start + 86400.0
+
                 query = """
                 SELECT timestamp, SUM(rx_bytes) AS total_rx, SUM(tx_bytes) AS total_tx
                 FROM interface_traffic
@@ -763,6 +801,8 @@ class DatabaseManager:
                 if len(rows) < 2:
                     return []
 
+                # 2. Tính toán tốc độ mạng thực tế từ các mẫu đo liên tục
+                raw_samples = []
                 prev_t = None
                 prev_rx = None
                 prev_tx = None
@@ -774,32 +814,240 @@ class DatabaseManager:
                     cur_tx = float(row[2])
 
                     if prev_t is not None:
-                        dt_sec = max(0.2, t_val - prev_t)
+                        dt_sec = t_val - prev_t
+                        if dt_sec <= 0:
+                            continue
+                        # Bỏ qua ngắt quãng khi app không chạy (>60s)
+                        if dt_sec > 60.0:
+                            prev_t = t_val
+                            prev_rx = cur_rx
+                            prev_tx = cur_tx
+                            continue
+
                         delta_rx = max(0.0, cur_rx - prev_rx)
                         delta_tx = max(0.0, cur_tx - prev_tx)
                         down_kb = delta_rx / (dt_sec * 1024.0)
                         up_kb = delta_tx / (dt_sec * 1024.0)
-
-                        series.append({
-                            "timestamp": t_val,
-                            "datetime_str": dt.strftime("%Y-%m-%d %H:%M:%S"),
-                            "down_kb": down_kb,
-                            "up_kb": up_kb
-                        })
+                        raw_samples.append((t_val, down_kb, up_kb, delta_rx, delta_tx))
 
                     prev_t = t_val
                     prev_rx = cur_rx
                     prev_tx = cur_tx
 
+                if not raw_samples:
+                    return []
+
+                # 3. Phân bổ dữ liệu vào 480 bucket trải dài toàn bộ 24 giờ (mỗi bucket 3 phút)
+                bucket_sec = 180.0
+                n_buckets = 480
+                series = []
+
+                raw_idx = 0
+                n_raw = len(raw_samples)
+
+                for i in range(n_buckets):
+                    b_start = t_day_start + i * bucket_sec
+                    b_end = b_start + bucket_sec
+                    b_center = b_start + (bucket_sec / 2.0)
+
+                    # Gom các mẫu nằm trong bucket [b_start, b_end)
+                    b_down = []
+                    b_up = []
+                    b_rx_bytes = 0.0
+                    b_tx_bytes = 0.0
+                    while raw_idx < n_raw and raw_samples[raw_idx][0] < b_end:
+                        if raw_samples[raw_idx][0] >= b_start:
+                            b_down.append(raw_samples[raw_idx][1])
+                            b_up.append(raw_samples[raw_idx][2])
+                            b_rx_bytes += raw_samples[raw_idx][3]
+                            b_tx_bytes += raw_samples[raw_idx][4]
+                        raw_idx += 1
+
+                    if b_down:
+                        d_val = float(_np.mean(b_down))
+                        u_val = float(_np.mean(b_up))
+                    else:
+                        d_val = 0.0
+                        u_val = 0.0
+
+                    series.append({
+                        "timestamp": b_center,
+                        "datetime_str": _t.strftime("%Y-%m-%d %H:%M:%S", _t.localtime(b_center)),
+                        "down_kb": d_val,
+                        "up_kb": u_val,
+                        "rx_bytes": int(b_rx_bytes),
+                        "tx_bytes": int(b_tx_bytes)
+                    })
+
+                return series
             except Exception as e:
                 print(f"[DB] Lỗi lấy chuỗi lưu lượng ngày {target_date_str}: {e}")
+                return []
             finally:
                 cursor.close()
-            return series
 
     def get_processes_around_time(self, target_datetime, tolerance_seconds: float = 3.0) -> list:
         """
         Lấy các tiến trình có phát sinh lưu lượng mạng xung quanh một mốc thời gian cụ thể.
+        Tránh cú pháp INTERVAL %s của MySQL bằng cách tính toán khoảng thời gian trong Python.
+        """
+        from datetime import timedelta
+        with self._lock:
+            conn = self.ensure_connection()
+            if conn is None:
+                return []
+            cursor = conn.cursor()
+            procs = []
+            try:
+                if isinstance(target_datetime, (int, float)):
+                    target_dt = datetime.fromtimestamp(target_datetime)
+                else:
+                    target_dt = target_datetime
+
+                start_dt = target_dt - timedelta(seconds=float(tolerance_seconds))
+                end_dt = target_dt + timedelta(seconds=float(tolerance_seconds))
+
+                query = """
+                SELECT p.pid, p.process_name, SUM(pt.rx_bytes) AS total_rx, SUM(pt.tx_bytes) AS total_tx
+                FROM process_traffic pt
+                JOIN processes p ON pt.process_id = p.id
+                WHERE pt.timestamp BETWEEN %s AND %s
+                GROUP BY p.pid, p.process_name
+                ORDER BY SUM(pt.rx_bytes + pt.tx_bytes) DESC
+                LIMIT 10
+                """
+                cursor.execute(query, (start_dt, end_dt))
+                for row in cursor.fetchall():
+                    procs.append({
+                        "pid": row[0],
+                        "name": row[1],
+                        "rx_bytes": int(row[2] or 0),
+                        "tx_bytes": int(row[3] or 0)
+                    })
+            except Exception as e:
+                print(f"[DB] Lỗi lấy tiến trình tại mốc thời gian: {e}")
+            finally:
+                cursor.close()
+            return procs
+
+    def get_daily_summary(self, target_date_str: str, series: Optional[list] = None) -> dict:
+        """
+        Thống kê các chỉ số mạng trong ngày:
+        - Tổng dung lượng Download & Upload (từ delta card mạng)
+        - Thời gian thực tế máy dùng mạng trong ngày (Active Hours)
+        - Khung giờ cao điểm nhất và dung lượng giờ đó
+        - Tốc độ đỉnh và thời điểm
+        """
+        if series is None:
+            series = self.get_daily_traffic_series(target_date_str)
+
+        import time as _t
+        dt_start = datetime.strptime(target_date_str, "%Y-%m-%d")
+        t_day_start = dt_start.timestamp()
+        t_day_end = t_day_start + 86400.0
+
+        summary = {
+            "total_rx_bytes": 0,
+            "total_tx_bytes": 0,
+            "peak_down_kb": 0.0,
+            "peak_up_kb": 0.0,
+            "peak_down_time": "-",
+            "peak_up_time": "-",
+            "active_hours": 0.0,
+            "active_hours_str": "0 giờ",
+            "peak_hour_range": "-",
+            "peak_hour_mb": 0.0,
+            "sample_count": len(series),
+            "day_start": t_day_start,
+            "day_end": t_day_end,
+            "first_time": "-",
+            "last_time": "-",
+        }
+        if not series:
+            return summary
+
+        summary["first_time"] = series[0]["datetime_str"]
+        summary["last_time"] = series[-1]["datetime_str"]
+
+        max_down = 0.0
+        max_up = 0.0
+        tot_rx_kb = 0.0
+        tot_tx_kb = 0.0
+
+        hourly_rx_kb = [0.0] * 24
+        active_bucket_count = 0
+        bucket_sec = 180.0
+
+        has_direct_bytes = any("rx_bytes" in pt for pt in series)
+        tot_rx_bytes = 0
+        tot_tx_bytes = 0
+
+        for i, pt in enumerate(series):
+            d = pt["down_kb"]
+            u = pt["up_kb"]
+            if d > max_down:
+                max_down = d
+                summary["peak_down_time"] = pt["datetime_str"]
+            if u > max_up:
+                max_up = u
+                summary["peak_up_time"] = pt["datetime_str"]
+
+            if (d + u) > 1.0:
+                active_bucket_count += 1
+
+            if has_direct_bytes:
+                b_rx = pt.get("rx_bytes", 0)
+                b_tx = pt.get("tx_bytes", 0)
+                tot_rx_bytes += b_rx
+                tot_tx_bytes += b_tx
+                hr = int((pt["timestamp"] - t_day_start) // 3600)
+                if 0 <= hr < 24:
+                    hourly_rx_kb[hr] += (b_rx + b_tx) / 1024.0
+            else:
+                # Tích lũy dung lượng theo tốc độ ước tính nếu không có direct bytes
+                tot_rx_kb += d * bucket_sec
+                tot_tx_kb += u * bucket_sec
+                hr = int((pt["timestamp"] - t_day_start) // 3600)
+                if 0 <= hr < 24:
+                    hourly_rx_kb[hr] += (d + u) * bucket_sec
+
+        # Thời gian dùng mạng trong ngày
+        active_sec = active_bucket_count * bucket_sec
+        active_hours = active_sec / 3600.0
+        summary["active_hours"] = round(active_hours, 1)
+        h_part = int(active_hours)
+        m_part = int(round((active_hours - h_part) * 60))
+        if h_part > 0 and m_part > 0:
+            summary["active_hours_str"] = f"{h_part} giờ {m_part} phút"
+        elif h_part > 0:
+            summary["active_hours_str"] = f"{h_part} giờ"
+        else:
+            summary["active_hours_str"] = f"{m_part} phút"
+
+        # Khung giờ cao điểm nhất
+        peak_hr = 0
+        max_hr_kb = 0.0
+        for hr_idx, kb in enumerate(hourly_rx_kb):
+            if kb > max_hr_kb:
+                max_hr_kb = kb
+                peak_hr = hr_idx
+
+        if max_hr_kb > 0:
+            summary["peak_hour_range"] = f"{peak_hr:02d}:00 - {(peak_hr + 1):02d}:00"
+            summary["peak_hour_mb"] = round(max_hr_kb / 1024.0, 1)
+        else:
+            summary["peak_hour_range"] = "Không phát sinh"
+            summary["peak_hour_mb"] = 0.0
+
+        summary["peak_down_kb"] = max_down
+        summary["peak_up_kb"] = max_up
+        summary["total_rx_bytes"] = tot_rx_bytes if has_direct_bytes else int(tot_rx_kb * 1024.0)
+        summary["total_tx_bytes"] = tot_tx_bytes if has_direct_bytes else int(tot_tx_kb * 1024.0)
+        return summary
+
+    def get_top_processes_for_date(self, target_date_str: str, limit: int = 15) -> list:
+        """
+        Lấy danh sách các ứng dụng tiêu thụ băng thông nhiều nhất trong ngày từ bảng process_traffic.
         """
         with self._lock:
             conn = self.ensure_connection()
@@ -809,26 +1057,189 @@ class DatabaseManager:
             procs = []
             try:
                 query = """
-                SELECT p.pid, p.process_name, pt.rx_bytes, pt.tx_bytes
+                SELECT MAX(p.pid) AS pid, p.process_name, 
+                       SUM(pt.rx_bytes) AS total_rx, 
+                       SUM(pt.tx_bytes) AS total_tx,
+                       SUM(pt.rx_bytes + pt.tx_bytes) AS grand_total
                 FROM process_traffic pt
                 JOIN processes p ON pt.process_id = p.id
-                WHERE pt.timestamp BETWEEN DATE_SUB(%s, INTERVAL %s SECOND) AND DATE_ADD(%s, INTERVAL %s SECOND)
-                ORDER BY (pt.rx_bytes + pt.tx_bytes) DESC
-                LIMIT 10
+                WHERE DATE(pt.timestamp) = %s
+                GROUP BY p.process_name
+                ORDER BY grand_total DESC
+                LIMIT %s
                 """
-                cursor.execute(query, (target_datetime, int(tolerance_seconds), target_datetime, int(tolerance_seconds)))
-                for row in cursor.fetchall():
+                cursor.execute(query, (target_date_str, limit))
+                rows = cursor.fetchall()
+
+                # Tính tổng lưu lượng của tất cả tiến trình trong ngày để tính tỷ lệ %
+                all_traffic_sum = sum(int(r[4] or 0) for r in rows) if rows else 1
+
+                for row in rows:
+                    rx = int(row[2] or 0)
+                    tx = int(row[3] or 0)
+                    total = int(row[4] or 0)
+                    pct = (total / max(1, all_traffic_sum)) * 100.0
                     procs.append({
                         "pid": row[0],
                         "name": row[1],
-                        "rx_bytes": row[2],
-                        "tx_bytes": row[3]
+                        "rx_bytes": rx,
+                        "tx_bytes": tx,
+                        "total_bytes": total,
+                        "percent": round(pct, 1)
                     })
             except Exception as e:
-                print(f"[DB] Lỗi lấy tiến trình tại mốc thời gian: {e}")
+                print(f"[DB] Lỗi lấy top tiến trình theo ngày: {e}")
             finally:
                 cursor.close()
             return procs
+
+    def get_detailed_traffic_logs(self, target_date_str: str, proc_name_filter: str = "", limit: int = 50, offset: int = 0) -> list:
+        """
+        Lấy danh sách nhật ký chi tiết lưu lượng của các tiến trình trong ngày, hỗ trợ tìm kiếm theo tên tiến trình.
+        """
+        with self._lock:
+            conn = self.ensure_connection()
+            if conn is None:
+                return []
+            cursor = conn.cursor()
+            logs = []
+            try:
+                if proc_name_filter.strip():
+                    query = """
+                    SELECT pt.timestamp, p.pid, p.process_name, pt.rx_bytes, pt.tx_bytes
+                    FROM process_traffic pt
+                    JOIN processes p ON pt.process_id = p.id
+                    WHERE DATE(pt.timestamp) = %s AND p.process_name LIKE %s
+                    ORDER BY pt.timestamp DESC
+                    LIMIT %s OFFSET %s
+                    """
+                    cursor.execute(query, (target_date_str, f"%{proc_name_filter.strip()}%", limit, offset))
+                else:
+                    query = """
+                    SELECT pt.timestamp, p.pid, p.process_name, pt.rx_bytes, pt.tx_bytes
+                    FROM process_traffic pt
+                    JOIN processes p ON pt.process_id = p.id
+                    WHERE DATE(pt.timestamp) = %s
+                    ORDER BY pt.timestamp DESC
+                    LIMIT %s OFFSET %s
+                    """
+                    cursor.execute(query, (target_date_str, limit, offset))
+
+                for row in cursor.fetchall():
+                    logs.append({
+                        "timestamp": row[0],
+                        "pid": row[1],
+                        "name": row[2],
+                        "rx_bytes": int(row[3] or 0),
+                        "tx_bytes": int(row[4] or 0),
+                    })
+            except Exception as e:
+                print(f"[DB] Lỗi lấy nhật ký chi tiết: {e}")
+            finally:
+                cursor.close()
+            return logs
+
+    def save_policy_log(
+        self,
+        policy_type: str,
+        target_app: str,
+        limit_kbps: float,
+        direction: str,
+        action: str,
+        throttled_packets: int = 0,
+        throttled_bytes: int = 0,
+        status: str = "SUCCESS",
+        details: str = ""
+    ) -> bool:
+        """
+        Ghi lại lịch sử áp dụng hoặc gỡ bỏ chính sách can thiệp băng thông/an ninh mạng vào MySQL.
+        Đồng thời ghi vào file logs/policies.log.
+        """
+        # 1. Ghi file log văn bản
+        FileLogger.log_policy(
+            action=action,
+            policy_type=policy_type,
+            target_app=target_app,
+            limit_kbps=limit_kbps,
+            direction=direction,
+            throttled_packets=throttled_packets,
+            throttled_bytes=throttled_bytes,
+            status=status,
+            details=details
+        )
+
+        # 2. Ghi vào CSDL MySQL
+        with self._lock:
+            conn = self.ensure_connection()
+            if conn is None:
+                return False
+
+            device_id = self.device_id if self.device_id is not None else self.get_or_create_device()
+            if device_id is None:
+                return False
+
+            cursor = conn.cursor()
+            try:
+                sql = """
+                INSERT INTO policy_logs (
+                    device_id, policy_type, target_app, limit_kbps, direction, 
+                    action, throttled_packets, throttled_bytes, status, details, applied_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """
+                now_dt = datetime.now()
+                cursor.execute(sql, (
+                    device_id,
+                    policy_type,
+                    target_app,
+                    limit_kbps,
+                    direction,
+                    action.upper(),
+                    throttled_packets,
+                    throttled_bytes,
+                    status,
+                    details,
+                    now_dt
+                ))
+                conn.commit()
+                return True
+            except Exception as exc:
+                print(f"[DB Error] Không thể lưu policy_log vào MySQL: {exc}")
+                return False
+            finally:
+                cursor.close()
+
+    def get_policy_logs(self, limit: int = 50) -> List[Dict]:
+        """Lấy danh sách lịch sử chính sách an ninh mạng đã áp dụng."""
+        logs = []
+        with self._lock:
+            conn = self.ensure_connection()
+            if conn is None:
+                return logs
+
+            cursor = conn.cursor(dictionary=True)
+            try:
+                cursor.execute(
+                    """
+                    SELECT id, policy_type, target_app, limit_kbps, direction, 
+                           action, throttled_packets, throttled_bytes, status, details, applied_at
+                    FROM policy_logs
+                    ORDER BY applied_at DESC
+                    LIMIT %s
+                    """,
+                    (limit,)
+                )
+                rows = cursor.fetchall()
+                for r in rows:
+                    if isinstance(r.get("applied_at"), datetime):
+                        r["applied_at_str"] = r["applied_at"].strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        r["applied_at_str"] = str(r.get("applied_at") or "")
+                    logs.append(r)
+            except Exception as exc:
+                print(f"[DB Error] Không thể đọc danh sách policy_logs: {exc}")
+            finally:
+                cursor.close()
+        return logs
 
     def close(self):
         with self._lock:
