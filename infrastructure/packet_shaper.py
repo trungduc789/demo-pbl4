@@ -1,3 +1,5 @@
+import os
+import subprocess
 import time
 import queue
 import threading
@@ -26,6 +28,12 @@ class WinDivertPacketShaper:
         self.limit_kbps: float = 0.0
         self.direction: str = "both"  # "upload", "download", "both"
         self.is_active: bool = False
+        self.is_blocked: bool = False
+
+        # Danh sách các ứng dụng bị CHẶN HOÀN TOÀN: {app_name.lower(): {"direction": "both"|"upload"|"download", "exe": exe_path}}
+        self.blocked_apps: Dict[str, Dict] = {}
+        self.blocked_ports: Set[int] = set()
+        self.blocked_pids: Set[int] = set()
 
         # Quản lý luồng và hàng đợi
         self._divert_handle: Optional[pydivert.WinDivert] = None
@@ -56,6 +64,24 @@ class WinDivertPacketShaper:
         except Exception:
             return False
 
+    def _find_pids_for_name(self, app_name: str) -> Set[int]:
+        if not app_name:
+            return set()
+        target_lower = app_name.lower()
+        target_base = target_lower.replace(".exe", "").strip()
+        found = set()
+        for p in psutil.process_iter(['pid', 'name', 'exe']):
+            try:
+                p_name = (p.info.get('name') or "").lower()
+                p_exe = (p.info.get('exe') or "").lower()
+                if p_name == target_lower or p_name.replace(".exe", "") == target_base:
+                    found.add(p.info['pid'])
+                elif target_base and (target_base in p_name or target_base in p_exe):
+                    found.add(p.info['pid'])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return found
+
     def _find_target_pids(self) -> Set[int]:
         """Tìm tất cả PID thuộc ứng dụng mục tiêu (kể cả tiến trình con)."""
         if not self.target_app:
@@ -82,8 +108,14 @@ class WinDivertPacketShaper:
             return
 
         found_pids = self._find_target_pids()
+        # Tìm PIDs cho tất cả các app bị chặn
+        all_blocked_pids = set()
+        for b_name in list(self.blocked_apps.keys()):
+            all_blocked_pids.update(self._find_pids_for_name(b_name))
+
         with self._lock:
             self.target_pids = found_pids
+            self.blocked_pids = all_blocked_pids
 
         now = time.time()
         new_ports = set()
@@ -258,12 +290,28 @@ class WinDivertPacketShaper:
                                 if self.direction in ("download", "both"):
                                     is_target = True
 
+                        # 1. Kiểm tra nếu gói tin thuộc về ứng dụng bị CHẶN HOÀN TOÀN (BLOCK)
+                        is_drop = False
+                        with self._lock:
+                            if self.is_blocked and is_target:
+                                is_drop = True
+                            elif packet.is_outbound and packet.src_port in self.blocked_ports:
+                                is_drop = True
+                            elif packet.is_inbound and packet.dst_port in self.blocked_ports:
+                                is_drop = True
+
+                        if is_drop:
+                            # DROP GÓI TIN NGAY TẠI KERNEL DRIVER! KHÔNG GỬI LẠI!
+                            p_len = len(packet.raw) if packet.raw else 64
+                            self._update_speed_stats(p_len, packet.is_inbound)
+                            continue
+
+                        # 2. Nếu là ứng dụng chỉ bị BÓP BĂNG THÔNG (THROTTLE)
                         if is_target:
                             packet_len = len(packet.raw) if packet.raw else 64
                             try:
                                 self._packet_queue.put_nowait((packet, packet_len, packet.is_inbound))
                             except queue.Full:
-                                # Khi hàng đợi đầy, drop gói tin để ép TCP/QUIC hạ cửa sổ tắc nghẽn (cwnd)
                                 pass
                         else:
                             # Gói tin của các app khác -> Cho qua NGAY LẬP TỨC
@@ -281,6 +329,177 @@ class WinDivertPacketShaper:
                 print(f"[PacketShaper Error] WinDivert capture dừng: {e}")
         finally:
             self._divert_handle = None
+
+    @staticmethod
+    def _apply_windows_firewall_rule(app_name: str, exe_path: str = "", action: str = "block") -> bool:
+        """Thêm quy tắc vào Windows Defender Firewall để chặn/cho phép ứng dụng."""
+        rule_name = f"PBL4_Block_{app_name}"
+        if not exe_path or not os.path.exists(exe_path):
+            target_lower = app_name.lower()
+            for p in psutil.process_iter(['name', 'exe']):
+                try:
+                    if (p.info.get('name') or "").lower() == target_lower:
+                        exe_path = p.info.get('exe', '')
+                        if exe_path and os.path.exists(exe_path):
+                            break
+                except Exception:
+                    pass
+
+        prog_param = f'program="{exe_path}"' if exe_path and os.path.exists(exe_path) else ''
+        cmd_out = f'netsh advfirewall firewall add rule name="{rule_name}_Out" dir=out action={action} {prog_param} enable=yes'
+        cmd_in = f'netsh advfirewall firewall add rule name="{rule_name}_In" dir=in action={action} {prog_param} enable=yes'
+        try:
+            r1 = subprocess.run(cmd_out, shell=True, capture_output=True, text=True, timeout=3)
+            r2 = subprocess.run(cmd_in, shell=True, capture_output=True, text=True, timeout=3)
+            return r1.returncode == 0 and r2.returncode == 0
+        except Exception as e:
+            print(f"[Firewall Rule Warning] {e}")
+            return False
+
+    @staticmethod
+    def _remove_windows_firewall_rule(app_name: str) -> bool:
+        """Xóa quy tắc chặn của ứng dụng khỏi Windows Defender Firewall."""
+        rule_name = f"PBL4_Block_{app_name}"
+        try:
+            subprocess.run(f'netsh advfirewall firewall delete rule name="{rule_name}_Out"', shell=True, capture_output=True, text=True, timeout=3)
+            subprocess.run(f'netsh advfirewall firewall delete rule name="{rule_name}_In"', shell=True, capture_output=True, text=True, timeout=3)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _terminate_app_sockets(app_pids: Set[int]):
+        """Cắt đứt ngay lập tức các kết nối TCP hiện có của ứng dụng bằng Windows SetTcpEntry."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            class MIB_TCPROW(ctypes.Structure):
+                _fields_ = [
+                    ("dwState", wintypes.DWORD),
+                    ("dwLocalAddr", wintypes.DWORD),
+                    ("dwLocalPort", wintypes.DWORD),
+                    ("dwRemoteAddr", wintypes.DWORD),
+                    ("dwRemotePort", wintypes.DWORD),
+                ]
+            MIB_TCP_STATE_DELETE_TCB = 12
+            for pid in app_pids:
+                try:
+                    for conn in psutil.Process(pid).net_connections(kind='tcp'):
+                        if conn.status == 'ESTABLISHED' and conn.laddr and conn.raddr:
+                            row = MIB_TCPROW()
+                            row.dwState = MIB_TCP_STATE_DELETE_TCB
+                            try:
+                                import socket
+                                row.dwLocalAddr = int.from_bytes(socket.inet_aton(conn.laddr.ip), 'little')
+                                row.dwLocalPort = socket.htons(conn.laddr.port)
+                                row.dwRemoteAddr = int.from_bytes(socket.inet_aton(conn.raddr.ip), 'little')
+                                row.dwRemotePort = socket.htons(conn.raddr.port)
+                                ctypes.windll.iphlpapi.SetTcpEntry(ctypes.byref(row))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def block_app(self, app_name: str, direction: str = "both", exe_path: str = "") -> Tuple[bool, str]:
+        """
+        Chặn hoàn toàn quyền truy cập mạng của ứng dụng:
+        1. Thêm quy tắc Windows Defender Firewall (Inbound & Outbound) cho file .exe.
+        2. Kích hoạt WinDivert Kernel Dropper: Hủy bỏ (Drop) ngay lập tức mọi gói tin gửi/nhận.
+        3. Cắt đứt các kết nối socket TCP đang mở.
+        """
+        target = app_name if app_name.lower().endswith(".exe") else f"{app_name}.exe"
+        target_key = target.lower()
+
+        # 1. Thêm vào danh sách chặn
+        with self._lock:
+            self.blocked_apps[target_key] = {"direction": direction.lower(), "exe": exe_path}
+            self.target_app = target
+            self.is_blocked = True
+            self.limit_kbps = 0.0
+
+        pids = self._find_pids_for_name(target_key)
+        with self._lock:
+            self.blocked_pids.update(pids)
+
+        # 2. Cắt các socket đang kết nối
+        self._terminate_app_sockets(pids)
+
+        # 3. Kích hoạt Windows Defender Firewall
+        fw_ok = self._apply_windows_firewall_rule(target, exe_path, action="block")
+
+        # 4. Kích hoạt luồng WinDivert để drop các gói tin tại driver
+        if self.is_admin() and not self.is_active:
+            self.is_active = True
+            self._stop_event.clear()
+            self._update_target_ports()
+            self._port_monitor_thread = threading.Thread(
+                target=self._port_monitor_loop, daemon=True, name="PacketShaper-PortMonitor"
+            )
+            self._port_monitor_thread.start()
+            self._capture_thread = threading.Thread(
+                target=self._capture_loop, daemon=True, name="PacketShaper-Capture"
+            )
+            self._capture_thread.start()
+
+        msg = f"Đã kích hoạt chặn hoàn toàn truy cập mạng cho ứng dụng '{target}' thành công."
+        print(f"[PacketShaper] {msg}")
+        return True, msg
+
+    def unblock_app(self, app_name: str) -> Tuple[bool, str]:
+        """Gỡ bỏ chặn cho một ứng dụng cụ thể."""
+        target = app_name if app_name.lower().endswith(".exe") else f"{app_name}.exe"
+        target_key = target.lower()
+
+        with self._lock:
+            if target_key in self.blocked_apps:
+                del self.blocked_apps[target_key]
+
+        # Xóa rule Windows Firewall
+        self._remove_windows_firewall_rule(target)
+
+        with self._lock:
+            if not self.blocked_apps and self.is_blocked:
+                self.is_blocked = False
+                if self.limit_kbps <= 0:
+                    self.remove_limit()
+
+        msg = f"Đã gỡ chặn mạng cho ứng dụng '{target}' thành công."
+        print(f"[PacketShaper] {msg}")
+        return True, msg
+
+    def unblock_all(self) -> Tuple[bool, str]:
+        """Gỡ bỏ chặn cho tất cả các ứng dụng."""
+        all_targets = list(self.blocked_apps.keys())
+        for target in all_targets:
+            self._remove_windows_firewall_rule(target)
+
+        with self._lock:
+            self.blocked_apps.clear()
+            self.blocked_ports.clear()
+            self.blocked_pids.clear()
+            self.is_blocked = False
+
+        if self.limit_kbps <= 0:
+            self.remove_limit()
+
+        msg = "Đã gỡ bỏ toàn bộ chính sách chặn mạng cho tất cả ứng dụng."
+        print(f"[PacketShaper] {msg}")
+        return True, msg
+
+    # Các hàm tương thích để hỗ trợ gọi linh hoạt
+    def start(self, target_app: str, limit_kbps: float = 0.0, direction: str = "both") -> Tuple[bool, str]:
+        """Tương thích gọi start(): tự động chuyển thành block_app hoặc apply_limit."""
+        if limit_kbps <= 1.0:
+            return self.block_app(target_app, direction=direction)
+        else:
+            return self.apply_limit(target_app, limit_kbps=limit_kbps, direction=direction)
+
+    def stop(self) -> Tuple[bool, str]:
+        """Tương thích gọi stop(): gỡ toàn bộ chặn và bóp băng thông."""
+        self.unblock_all()
+        return self.remove_limit()
 
     def apply_limit(self, app_name: str, limit_kbps: float, direction: str = "both") -> Tuple[bool, str]:
         """

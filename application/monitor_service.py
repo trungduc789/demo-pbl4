@@ -218,6 +218,45 @@ class MonitorService:
     # =========================================================================
     # CÁC PHƯƠNG THỨC ĐIỀU KHIỂN BĂNG THÔNG WINDIVERT (PACKET SHAPER)
     # =========================================================================
+    def block_application(self, app_name: str, direction: str = "both", exe_path: str = "") -> Tuple[bool, str]:
+        """Chặn hoàn toàn quyền truy cập mạng của ứng dụng (Windows Firewall + WinDivert Drop)."""
+        success, msg = self.packet_shaper.block_app(app_name, direction, exe_path)
+        status_str = "SUCCESS" if success else "FAILED"
+        if hasattr(self, 'db_manager') and self.db_manager:
+            self.db_manager.save_policy_log(
+                policy_type="FIREWALL_BLOCK",
+                target_app=app_name,
+                limit_kbps=0.0,
+                direction=direction,
+                action="BLOCK",
+                throttled_packets=0,
+                throttled_bytes=0,
+                status=status_str,
+                details=msg
+            )
+        return success, msg
+
+    def unblock_application(self, app_name: str) -> Tuple[bool, str]:
+        """Gỡ bỏ chặn truy cập mạng cho ứng dụng."""
+        success, msg = self.packet_shaper.unblock_app(app_name)
+        if hasattr(self, 'db_manager') and self.db_manager:
+            self.db_manager.save_policy_log(
+                policy_type="FIREWALL_BLOCK",
+                target_app=app_name,
+                limit_kbps=0.0,
+                direction="both",
+                action="UNBLOCK",
+                throttled_packets=0,
+                throttled_bytes=0,
+                status="SUCCESS" if success else "FAILED",
+                details=msg
+            )
+        return success, msg
+
+    def unblock_all_applications(self) -> Tuple[bool, str]:
+        """Gỡ chặn cho tất cả ứng dụng."""
+        return self.packet_shaper.unblock_all()
+
     def apply_bandwidth_limit(self, app_name: str, limit_kbps: float, direction: str = "both") -> Tuple[bool, str]:
         """Áp dụng bóp băng thông thực tế (Token Bucket qua WinDivert NDIS kernel)."""
         success, msg = self.packet_shaper.apply_limit(app_name, limit_kbps, direction)
@@ -303,4 +342,4 @@ class MonitorService:
             self.db_manager.close()
 
 
-
+

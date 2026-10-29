@@ -11,7 +11,7 @@ import threading
 import platform
 import uuid
 from datetime import datetime
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple, Any
 
 import mysql.connector
 import psutil
