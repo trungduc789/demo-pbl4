@@ -24,3 +24,9 @@ xây dựng mô hình database để phục vụ việc lưu trữ dữ liệu t
 viết tiếp phần lưuuw dữ liệu cho hệ thống với agent chạy trên máy cá nhân
 viết các chức năng xem lại dữu liệu
 viết phần giám sát các process,giám sát kết nối 
+
+
+29/10
+Chức năng protect ban đầu chỉ thiết kế để giới hạn tốc độ(throttling: làm chậm gói tin khi vượt ngưỡng KB/s). Khi nhấn block thì nó không hủy gói tin mà chỉ gán
+tốc độ về 0 nên gói tin vẫn có thể lọt qua được. 
+--> Lỡ sửa sang chặn hẳn gói tin không thể đi qua được 
