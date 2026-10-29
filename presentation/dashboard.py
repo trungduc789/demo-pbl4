@@ -12,6 +12,20 @@ from application.monitor_service import MonitorService
 from config.settings import UPDATE_INTERVAL, MAX_DATA_POINTS
 from utils.safe_print import safe_print as print
 
+from presentation.glasswire_icons import (
+    get_glasswire_logo_icon,
+    get_traffic_monitor_icon,
+    get_protect_icon,
+    get_log_analysis_icon,
+    get_network_scanner_icon,
+    get_hardware_resources_icon,
+    get_graph_toggle_icon,
+    get_usage_toggle_icon,
+    get_filter_icon,
+)
+from presentation.traffic_usage_view import GlassWireUsageView
+from presentation.protect_view import GlassWireProtectView
+
 
 # Bảng tham số làm mịn và hiển thị riêng biệt chuẩn hóa cho từng mốc thời gian (Scale-tailored smoothing)
 TIME_SCALE_CONFIGS = {
@@ -27,26 +41,33 @@ TIME_SCALE_CONFIGS = {
         "sigma": 3.5,           # Làm mịn 3.5s gom các nhịp xung 1 phút thành sóng mềm
         "radius_seconds": 10,
         "n_dense": 280,
-        "tick_step": 15.0,       # Vạch mốc mỗi 15 giây
+        "tick_step": 10.0,       # Vạch mốc mỗi 10 giây
     },
     300.0: {
         "name": "5 Minutes",
-        "sigma": 10.0,          # Độ lệch chuẩn 10s tạo đồi cát vàng cuộn 25-35s chuẩn GlassWire
+        "sigma": 10.0,          # Độ lệch chuẩn 10s tạo dải cát vàng cuộn 25-35s chuẩn GlassWire
         "radius_seconds": 30,
         "n_dense": 380,
-        "tick_step": 60.0,       # Vạch mốc mỗi 1 phút tròn
+        "tick_step": 40.0,       # Vạch mốc mỗi 40s (ví dụ: 7:14:40PM tới 7:15:20PM theo đúng yêu cầu)
     },
     600.0: {
         "name": "10 Minutes",
-        "sigma": 20.0,          # Sóng thoải rộng toàn cảnh 10 phút (đồi sóng 45-60s)
+        "sigma": 20.0,          # Sóng thoải rộng toàn cảnh 10 phút (dải sóng 45-60s)
         "radius_seconds": 55,
         "n_dense": 450,
-        "tick_step": 120.0,      # Vạch mốc mỗi 2 phút tròn
+        "tick_step": 60.0,       # Vạch mốc mỗi 60 giây (nối gần lại)
+    },
+    3600.0: {
+        "name": "1 Hour",
+        "sigma": 40.0,          # Khung nhìn 1 tiếng
+        "radius_seconds": 120,
+        "n_dense": 600,
+        "tick_step": 300.0,      # Vạch mốc mỗi 5 phút
     },
     86400.0: {
         "name": "24 Hours",
         "sigma": 1.2,           # Độ mịn Gaussian phù hợp với 480 bucket 3 phút của toàn cảnh 24 giờ
-        "radius_seconds": 3,     # Bán kính 3 bucket (làm mềm đỉnh nhọn trong ~9 phút mà không làm nhòe cả ngày)
+        "radius_seconds": 3,     # Bán kính 3 bucket
         "n_dense": 800,
         "tick_step": 7200.0,     # Vạch mốc mỗi 2 giờ
     }
@@ -67,11 +88,12 @@ class TimeAxisItem(pg.AxisItem):
     def tickValues(self, minVal, maxVal, size):
         span = max(1.0, maxVal - minVal)
         if span > 600.0:
-            # Tự động co giãn bước nhảy cho dải thời gian lịch sử dài
             if span <= 1800.0:
-                step = 300.0      # 5 phút
+                step = 180.0      # 3 phút
+            elif span <= 3600.0:
+                step = 300.0      # 5 phút (cho khung 1 Hour)
             elif span <= 7200.0:
-                step = 900.0      # 15 phút
+                step = 600.0      # 10 phút
             elif span <= 21600.0:
                 step = 1800.0     # 30 phút
             elif span <= 43200.0:
@@ -91,7 +113,7 @@ class TimeAxisItem(pg.AxisItem):
             if curr >= minVal - step:
                 ticks.append(curr)
             curr += step
-            if len(ticks) > 25:
+            if len(ticks) > 30:
                 break
         return [(step, ticks)]
 
@@ -107,10 +129,10 @@ class TimeAxisItem(pg.AxisItem):
                 hr = lt.tm_hour % 12
                 hr = 12 if hr == 0 else hr
                 am_pm = "PM" if lt.tm_hour >= 12 else "AM"
+                # Khi khung >= 1 giờ (3600s), hiển thị giờ và phút.
+                # Khi khung < 1 giờ (30s, 1m, 5m, 10m): luôn hiển thị đầy đủ cả giây (ví dụ: 7:14:40 PM -> 7:15:20 PM)
                 if span >= 3600.0:
                     res.append(f"{hr}:{lt.tm_min:02d} {am_pm}")
-                elif span >= 60.0:
-                    res.append(f"{hr}:{lt.tm_min:02d}:00 {am_pm}")
                 else:
                     res.append(f"{hr}:{lt.tm_min:02d}:{lt.tm_sec:02d} {am_pm}")
             except Exception:
@@ -213,6 +235,347 @@ class GlassWireWanLanWidget(QtWidgets.QWidget):
             painter.setPen(QtCore.Qt.PenStyle.NoPen)
             painter.setBrush(QtGui.QColor("#F59E0B"))
             painter.drawRoundedRect(QtCore.QRectF(bar_x, 34, 12, 6), 3, 3)
+
+
+class GlassWireAppHoverPopup(QtWidgets.QFrame):
+    """
+    Bảng popup xổ xuống khi rê chuột vào pill 'App + X more' (chuẩn như Hình 2).
+    Hiển thị tiêu đề App, Down, Up và danh sách tất cả các ứng dụng có lưu lượng tại thời điểm đó.
+    """
+    def __init__(self, icon_manager, parent=None):
+        super().__init__(parent, QtCore.Qt.WindowType.ToolTip | QtCore.Qt.WindowType.FramelessWindowHint)
+        self.icon_manager = icon_manager
+        self.setObjectName("glasswireAppPopup")
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFixedWidth(340)
+
+        shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(16)
+        shadow.setColor(QtGui.QColor(15, 23, 42, 60))
+        shadow.setOffset(0, 4)
+        self.setGraphicsEffect(shadow)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(0)
+
+        container = QtWidgets.QFrame()
+        container.setObjectName("popupContainer")
+        container.setStyleSheet("""
+            QFrame#popupContainer {
+                background-color: #FFFFFF;
+                border: 1px solid #CBD5E1;
+                border-radius: 6px;
+            }
+        """)
+        c_layout = QtWidgets.QVBoxLayout(container)
+        c_layout.setContentsMargins(8, 6, 8, 6)
+        c_layout.setSpacing(4)
+
+        # Header: App | ↓ | ↑
+        header = QtWidgets.QWidget()
+        h_layout = QtWidgets.QHBoxLayout(header)
+        h_layout.setContentsMargins(4, 2, 4, 4)
+        h_layout.setSpacing(6)
+
+        lbl_app = QtWidgets.QLabel("Ứng dụng truyền nhận lúc đó")
+        lbl_app.setStyleSheet("font-size: 11px; font-weight: bold; color: #475569;")
+        h_layout.addWidget(lbl_app, stretch=1)
+
+        lbl_d = QtWidgets.QLabel("↓")
+        lbl_d.setStyleSheet("font-size: 13px; font-weight: 800; color: #D97706;")
+        lbl_d.setFixedWidth(70)
+        lbl_d.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        h_layout.addWidget(lbl_d)
+
+        lbl_u = QtWidgets.QLabel("↑")
+        lbl_u.setStyleSheet("font-size: 13px; font-weight: 800; color: #DC2626;")
+        lbl_u.setFixedWidth(70)
+        lbl_u.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        h_layout.addWidget(lbl_u)
+
+        c_layout.addWidget(header)
+
+        # Divider
+        div = QtWidgets.QFrame()
+        div.setFixedHeight(1)
+        div.setStyleSheet("background-color: #E2E8F0; border: none;")
+        c_layout.addWidget(div)
+
+        # Table
+        self.table = QtWidgets.QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.horizontalHeader().setVisible(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setShowGrid(False)
+        self.table.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.table.setStyleSheet("""
+            QTableWidget {
+                background-color: transparent;
+                border: none;
+                font-size: 11px;
+            }
+            QTableWidget::item {
+                padding: 2px 4px;
+                border-bottom: 1px solid #F1F5F9;
+            }
+            QScrollBar:vertical {
+                border: none;
+                background-color: #F8FAFC;
+                width: 6px;
+                border-radius: 3px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #CBD5E1;
+                border-radius: 3px;
+                min-height: 20px;
+            }
+        """)
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(1, 70)
+        self.table.setColumnWidth(2, 70)
+
+        c_layout.addWidget(self.table)
+        layout.addWidget(container)
+
+    def set_app_data(self, proc_list: list):
+        """Nạp danh sách tất cả ứng dụng tại thời điểm đó."""
+        self.table.setRowCount(len(proc_list))
+        for idx, p in enumerate(proc_list):
+            name = p.get("name", "Unknown")
+            name_item = QtWidgets.QTableWidgetItem(f"  {name}")
+            name_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+            name_item.setForeground(QtGui.QBrush(QtGui.QColor("#0F172A")))
+
+            icon = self.icon_manager.get_icon(p.get("exe", ""), name)
+            name_item.setIcon(icon)
+            self.table.setItem(idx, 0, name_item)
+
+            d_val = p.get("down_kb", 0.0)
+            u_val = p.get("up_kb", 0.0)
+            d_str = self._format_speed_short(d_val)
+            u_str = self._format_speed_short(u_val)
+
+            d_item = QtWidgets.QTableWidgetItem(d_str)
+            d_item.setFont(QtGui.QFont("Segoe UI", 9))
+            d_item.setForeground(QtGui.QBrush(QtGui.QColor("#334155")))
+            d_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(idx, 1, d_item)
+
+            u_item = QtWidgets.QTableWidgetItem(u_str)
+            u_item.setFont(QtGui.QFont("Segoe UI", 9))
+            u_item.setForeground(QtGui.QBrush(QtGui.QColor("#334155")))
+            u_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(idx, 2, u_item)
+
+        row_h = 24
+        tot_h = min(220, max(30, len(proc_list) * row_h + 8))
+        self.table.setFixedHeight(tot_h)
+        self.setFixedHeight(tot_h + 46)
+
+    def _format_speed_short(self, speed_kb: float) -> str:
+        if speed_kb < 1.0:
+            return f"{speed_kb * 1024.0:,.0f} B/s"
+        elif speed_kb < 1024.0:
+            return f"{speed_kb:,.1f} KB/s"
+        else:
+            return f"{speed_kb / 1024.0:,.1f} MB/s"
+
+
+class GlassWireAppTriggerPill(QtWidgets.QWidget):
+    """
+    Pill hiển thị '📁 App + X more' trên thanh inspection bar.
+    Khi rê chuột vào sẽ hiển thị GlassWireAppHoverPopup bên dưới.
+    """
+    def __init__(self, popup: GlassWireAppHoverPopup, parent=None):
+        super().__init__(parent)
+        self.popup = popup
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.hide_timer = QtCore.QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.setInterval(220)
+        self.hide_timer.timeout.connect(self._check_and_hide_popup)
+
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(6, 2, 8, 2)
+        layout.setSpacing(6)
+
+        self.lbl_icon = QtWidgets.QLabel()
+        self.lbl_icon.setFixedSize(16, 16)
+        layout.addWidget(self.lbl_icon)
+
+        self.lbl_text = QtWidgets.QLabel("Không có ứng dụng nào")
+        self.lbl_text.setStyleSheet("""
+            font-size: 11px;
+            font-weight: bold;
+            color: #2563EB;
+        """)
+        layout.addWidget(self.lbl_text)
+
+        self.setStyleSheet("""
+            GlassWireAppTriggerPill {
+                background-color: #F8FAFC;
+                border: 1px solid #CBD5E1;
+                border-radius: 5px;
+            }
+            GlassWireAppTriggerPill:hover {
+                background-color: #EFF6FF;
+                border-color: #93C5FD;
+            }
+        """)
+
+    def set_app_summary(self, top_procs: list, icon_manager):
+        if not top_procs:
+            self.lbl_icon.clear()
+            self.lbl_text.setText("Không có ứng dụng nào truyền nhận")
+            self.lbl_text.setStyleSheet("font-size: 11px; font-weight: normal; color: #64748B;")
+            self.popup.set_app_data([])
+            return
+
+        self.popup.set_app_data(top_procs)
+        first_app = top_procs[0]
+        first_name = first_app.get("name", "Unknown")
+        first_icon = icon_manager.get_icon(first_app.get("exe", ""), first_name)
+        self.lbl_icon.setPixmap(first_icon.pixmap(16, 16))
+
+        count = len(top_procs)
+        if count > 1:
+            more_cnt = count - 1
+            self.lbl_text.setText(f"{first_name}  +{more_cnt} more")
+        else:
+            self.lbl_text.setText(first_name)
+        self.lbl_text.setStyleSheet("font-size: 11px; font-weight: bold; color: #2563EB;")
+
+    def enterEvent(self, event):
+        self.hide_timer.stop()
+        if self.popup.table.rowCount() > 0:
+            pt = self.mapToGlobal(QtCore.QPoint(0, self.height() + 3))
+            # Kiểm tra nếu tràn màn hình thì bật lên phía trên
+            screen_geom = QtGui.QGuiApplication.primaryScreen().geometry()
+            if pt.y() + self.popup.height() > screen_geom.bottom() - 10:
+                pt.setY(self.mapToGlobal(QtCore.QPoint(0, 0)).y() - self.popup.height() - 3)
+            self.popup.move(pt)
+            self.popup.show()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.hide_timer.start()
+        super().leaveEvent(event)
+
+    def _check_and_hide_popup(self):
+        if not self.underMouse() and not self.popup.underMouse():
+            self.popup.hide()
+        elif self.popup.underMouse():
+            self.hide_timer.start(250)
+
+
+class GlassWirePointInspectionBar(QtWidgets.QFrame):
+    """
+    Thanh hiển thị thông số chi tiết khi dừng/ghim tại một điểm trên biểu đồ (chuẩn Hình 2).
+    Gồm: [↓ Downloads]  [↑ Uploads]  [📁 App + X more]  ...  [Thời gian dừng]  [✕ Tiếp tục]
+    """
+    resume_clicked = QtCore.pyqtSignal()
+
+    def __init__(self, icon_manager, parent=None):
+        super().__init__(parent)
+        self.setObjectName("pointInspectionBar")
+        self.setFixedHeight(34)
+        self.setStyleSheet("""
+            QFrame#pointInspectionBar {
+                background-color: #FFFFFF;
+                border-top: 1px solid #E2E8F0;
+                border-bottom: 1px solid #E2E8F0;
+            }
+        """)
+
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(12, 0, 12, 0)
+        layout.setSpacing(12)
+
+        # 1. Download speed with amber arrow
+        self.lbl_down = QtWidgets.QLabel("↓ 0.0 B/s")
+        self.lbl_down.setStyleSheet("font-size: 12px; font-weight: 800; color: #D97706;")
+        layout.addWidget(self.lbl_down)
+
+        # 2. Upload speed with red arrow
+        self.lbl_up = QtWidgets.QLabel("↑ 0.0 B/s")
+        self.lbl_up.setStyleSheet("font-size: 12px; font-weight: 800; color: #DC2626;")
+        layout.addWidget(self.lbl_up)
+
+        # Separator
+        sep1 = QtWidgets.QFrame()
+        sep1.setFixedSize(1, 16)
+        sep1.setStyleSheet("background-color: #CBD5E1;")
+        layout.addWidget(sep1)
+
+        # 3. App pill trigger button with hover popup
+        self.popup = GlassWireAppHoverPopup(icon_manager)
+        self.app_pill = GlassWireAppTriggerPill(self.popup, self)
+        layout.addWidget(self.app_pill)
+
+        layout.addStretch()
+
+        # 4. Thời gian đang dừng là bao nhiêu
+        self.lbl_time = QtWidgets.QLabel("")
+        self.lbl_time.setStyleSheet("font-size: 11px; font-weight: 600; color: #64748B;")
+        layout.addWidget(self.lbl_time)
+
+        # 5. Nút tiếp tục live / bỏ ghim
+        self.btn_resume = QtWidgets.QPushButton("▶ Tiếp Tục")
+        self.btn_resume.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.btn_resume.setFixedHeight(22)
+        self.btn_resume.setStyleSheet("""
+            QPushButton {
+                background-color: #10B981;
+                color: #FFFFFF;
+                font-size: 10px;
+                font-weight: bold;
+                padding: 2px 8px;
+                border-radius: 4px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #059669;
+            }
+        """)
+        self.btn_resume.clicked.connect(self.resume_clicked.emit)
+        layout.addWidget(self.btn_resume)
+
+        self.btn_close = QtWidgets.QPushButton("✕")
+        self.btn_close.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.btn_close.setFixedSize(20, 20)
+        self.btn_close.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                color: #64748B;
+                font-size: 11px;
+                font-weight: bold;
+                border: none;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #F1F5F9;
+                color: #0F172A;
+            }
+        """)
+        self.btn_close.clicked.connect(self.resume_clicked.emit)
+        layout.addWidget(self.btn_close)
+
+    def set_inspection_data(self, down_val: float, up_val: float, t_val: float, top_procs: list, icon_manager, format_func):
+        self.lbl_down.setText(f"↓ {format_func(down_val)}")
+        self.lbl_up.setText(f"↑ {format_func(up_val)}")
+
+        lt = time.localtime(t_val)
+        time_str = time.strftime("%H:%M:%S  -  %d/%m/%Y", lt)
+        self.lbl_time.setText(f"Thời điểm dừng: {time_str}")
+
+        self.app_pill.set_app_summary(top_procs, icon_manager)
+
+    def hide(self):
+        if hasattr(self, 'popup'):
+            self.popup.hide()
+        super().hide()
 
 
 class GlassWireTimelineScrubber(QtWidgets.QWidget):
@@ -659,6 +1022,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         init_times = np.linspace(now - 650.0, now, 650)
         self.down_points = deque([(t, 0.0) for t in init_times], maxlen=2400)
         self.up_points = deque([(t, 0.0) for t in init_times], maxlen=2400)
+        self.window_sample_history = deque(maxlen=86400)
 
         self.latest_down = 0.0
         self.latest_up = 0.0
@@ -691,6 +1055,12 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self.historical_series: List[Dict] = []
         self.current_hist_page_series: List[Dict] = []
         self.raw_hist_logs: List[Dict] = []
+
+        # Bộ lọc chiều lưu lượng và sắp xếp (Filter & Sort Sidebar)
+        self.filter_direction = "both"      # "both", "incoming", "outgoing"
+        self.filter_sort = "high_to_low"    # "high_to_low", "low_to_high", "alpha"
+        self.filter_scope = "all"           # "all", "wan", "lan"
+        self.current_traffic_view = "graph" # "graph" hoặc "usage" 
 
         self._init_ui()
         self._start_worker()
@@ -836,29 +1206,30 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
     # =========================================================================
     def _create_glasswire_header(self) -> QtWidgets.QWidget:
         header = QtWidgets.QWidget()
-        header.setFixedHeight(56)
+        header.setFixedHeight(54)
         header.setStyleSheet("background-color: #FFFFFF; border-bottom: 1px solid #E2E8F0;")
         layout = QtWidgets.QHBoxLayout(header)
         layout.setContentsMargins(18, 0, 18, 0)
         layout.setSpacing(16)
 
-        # 4 Tab điều hướng
+        # Các Tab điều hướng chính
         self.nav_buttons: List[QtWidgets.QPushButton] = []
-
-        tabs_data = [
-            ("📈 Traffic\nMonitor", 0),
-            ("🛡️ Protect", 1),
-            ("📊 Usage\nHistory", 2),
-            ("🕸️ Network\nScanner", 3),
+        self.nav_tabs_info = [
+            ("Traffic\nMonitor", 0, get_traffic_monitor_icon),
+            ("Protect", 1, get_protect_icon),
+            ("Log\nAnalysis", 2, get_log_analysis_icon),
+            ("Network\nScanner", 3, get_network_scanner_icon),
         ]
 
         nav_container = QtWidgets.QHBoxLayout()
         nav_container.setSpacing(8)
 
-        for text, page_idx in tabs_data:
+        for text, page_idx, icon_factory in self.nav_tabs_info:
             btn = QtWidgets.QPushButton(text)
             btn.setCheckable(True)
             btn.setFixedHeight(40)
+            btn.setIcon(icon_factory(page_idx == 0))
+            btn.setIconSize(QtCore.QSize(22, 22))
             btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
             btn.clicked.connect(lambda checked, idx=page_idx: self._switch_nav_page(idx))
             nav_container.addWidget(btn)
@@ -873,7 +1244,9 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         """Chuyển trang hiển thị và áp dụng giao diện nút bấm GlassWire"""
         self.stacked_pages.setCurrentIndex(index)
         for i, btn in enumerate(self.nav_buttons):
+            text, page_idx, icon_factory = self.nav_tabs_info[i]
             if i == index:
+                btn.setIcon(icon_factory(True))
                 btn.setStyleSheet("""
                     QPushButton {
                         background-color: #EBF3FC;
@@ -887,6 +1260,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
                     }
                 """)
             else:
+                btn.setIcon(icon_factory(False))
                 btn.setStyleSheet("""
                     QPushButton {
                         background-color: transparent;
@@ -905,101 +1279,122 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
                 """)
 
         if index == 1:
+            if hasattr(self, 'protect_view'):
+                self.protect_view.update_protect_table(self.latest_proc_speeds, self.app_accumulated_bytes, self.app_metadata)
             self._refresh_policy_table()
         elif index == 2:
             self._on_enter_usage_history_page()
         elif index == 3:
             self._refresh_connections()
 
-    # =========================================================================
-    # TRANG 0: TRAFFIC MONITOR (CHUẨN GLASSWIRE SPLIT-VIEW)
-    # =========================================================================
     def _setup_traffic_monitor_page(self, parent: QtWidgets.QWidget):
         layout = QtWidgets.QHBoxLayout(parent)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        splitter.setStyleSheet("QSplitter::handle { background-color: #E2E8F0; width: 1px; }")
+        # Khung chứa nội dung chính của Traffic Monitor
+        traffic_main_widget = QtWidgets.QWidget()
+        traffic_main_widget.setStyleSheet("background-color: #FFFFFF;")
+        traffic_main_layout = QtWidgets.QVBoxLayout(traffic_main_widget)
+        traffic_main_layout.setContentsMargins(12, 8, 12, 6)
+        traffic_main_layout.setSpacing(6)
 
         # ---------------------------------------------------------------------
-        # 1. BẢNG DANH SÁCH ỨNG DỤNG BÊN TRÁI (LEFT SIDEBAR)
+        # 1. THANH CÔNG CỤ TRÊN CÙNG CỦA BIỂU ĐỒ (TOP TOOLBAR)
         # ---------------------------------------------------------------------
-        left_panel = QtWidgets.QWidget()
-        left_panel.setStyleSheet("background-color: #FFFFFF;")
-        left_layout = QtWidgets.QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(8, 8, 8, 4)
-        left_layout.setSpacing(6)
-
-        # Thanh công cụ bộ lọc: Apps ▾ | WAN & LAN ▾ | ⇅ | 🔍
-        filter_bar = QtWidgets.QHBoxLayout()
-        filter_bar.setSpacing(6)
-
-        lbl_apps_drop = QtWidgets.QPushButton("Apps ▾")
-        lbl_apps_drop.setFixedHeight(24)
-        lbl_apps_drop.setStyleSheet("background-color: transparent; color: #475569; font-size: 11px; font-weight: bold; padding: 2px 4px;")
-        filter_bar.addWidget(lbl_apps_drop)
-
-        lbl_wan_drop = QtWidgets.QPushButton("WAN & LAN ▾")
-        lbl_wan_drop.setFixedHeight(24)
-        lbl_wan_drop.setStyleSheet("background-color: transparent; color: #475569; font-size: 11px; font-weight: bold; padding: 2px 4px;")
-        filter_bar.addWidget(lbl_wan_drop)
-
-        btn_sort = QtWidgets.QPushButton("⇅")
-        btn_sort.setFixedSize(24, 24)
-        btn_sort.setStyleSheet("background-color: transparent; color: #64748B; font-size: 13px; font-weight: bold;")
-        filter_bar.addWidget(btn_sort)
-
-        filter_bar.addStretch()
-
-        self.search_app_input = QtWidgets.QLineEdit()
-        self.search_app_input.setPlaceholderText("🔍 Tìm...")
-        self.search_app_input.setFixedWidth(80)
-        self.search_app_input.setStyleSheet("border-radius: 12px; padding: 3px 8px; font-size: 11px; background-color: #FFFFFF; border: 1px solid #CBD5E1;")
-        self.search_app_input.textChanged.connect(self._filter_app_list)
-        filter_bar.addWidget(self.search_app_input)
-
-        left_layout.addLayout(filter_bar)
-
-        # Bảng danh sách ứng dụng GlassWire
-        self.app_list_table = QtWidgets.QTableWidget()
-        self.app_list_table.setColumnCount(3)
-        self.app_list_table.setHorizontalHeaderLabels(["App", "↓", "↑"])
-        self.app_list_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.app_list_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.app_list_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.app_list_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.app_list_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
-        self.app_list_table.verticalHeader().setVisible(False)
-        self.app_list_table.setShowGrid(False)
-        self.app_list_table.itemSelectionChanged.connect(self._on_app_selected)
-        self.app_list_table.doubleClicked.connect(self._on_app_double_clicked)
-        left_layout.addWidget(self.app_list_table)
-
-        left_panel.setMinimumWidth(260)
-        left_panel.setMaximumWidth(380)
-        splitter.addWidget(left_panel)
-
-        # ---------------------------------------------------------------------
-        # 2. KHU VỰC ĐỒ THỊ SÓNG & HUD BÊN PHẢI (RIGHT MAIN PANEL)
-        # ---------------------------------------------------------------------
-        right_panel = QtWidgets.QWidget()
-        right_panel.setStyleSheet("background-color: #FFFFFF;")
-        right_layout = QtWidgets.QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(12, 8, 12, 6)
-        right_layout.setSpacing(6)
-
-        # Thanh công cụ trên biểu đồ: Thang đo (3 MB ▾) | Live/Pause | Lịch sử | [📈][☷][🌐] | 5 Minutes ▾
         chart_top_bar = QtWidgets.QHBoxLayout()
         chart_top_bar.setSpacing(10)
 
+        # Nút Filter ở góc bên trái (như Hình 1 - hiển thị khi bảng ứng dụng đang đóng)
+        self.btn_toggle_filter = QtWidgets.QPushButton(" Filter")
+        self.btn_toggle_filter.setIcon(get_filter_icon())
+        self.btn_toggle_filter.setFixedHeight(28)
+        self.btn_toggle_filter.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle_filter.setStyleSheet("""
+            QPushButton {
+                background-color: #FFFFFF;
+                border: 1px solid #CBD5E1;
+                border-radius: 14px;
+                padding: 2px 14px;
+                font-size: 11px;
+                font-weight: 600;
+                color: #475569;
+            }
+            QPushButton:hover {
+                background-color: #F8FAFC;
+                color: #0F172A;
+                border-color: #94A3B8;
+            }
+        """)
+        self.btn_toggle_filter.clicked.connect(self._open_app_panel)
+        chart_top_bar.addWidget(self.btn_toggle_filter)
+
+        chart_top_bar.addStretch()
+
+        # Capsule Toggle Button: 1 nút Graph, 1 nút Usage
+        capsule_container = QtWidgets.QFrame()
+        capsule_container.setFixedHeight(32)
+        capsule_container.setStyleSheet("""
+            QFrame {
+                background-color: #F1F5F9;
+                border-radius: 16px;
+                padding: 2px;
+            }
+        """)
+        cap_layout = QtWidgets.QHBoxLayout(capsule_container)
+        cap_layout.setContentsMargins(3, 2, 3, 2)
+        cap_layout.setSpacing(4)
+
+        self.btn_view_graph = QtWidgets.QPushButton(" Graph")
+        self.btn_view_graph.setIcon(get_graph_toggle_icon(True))
+        self.btn_view_graph.setFixedHeight(26)
+        self.btn_view_graph.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.btn_view_graph.setStyleSheet("""
+            QPushButton {
+                background-color: #2563EB;
+                color: #FFFFFF;
+                font-size: 11px;
+                font-weight: bold;
+                border-radius: 13px;
+                padding: 2px 14px;
+                border: none;
+            }
+        """)
+        self.btn_view_graph.clicked.connect(lambda: self._switch_traffic_view("graph"))
+
+        self.btn_view_usage = QtWidgets.QPushButton(" Usage")
+        self.btn_view_usage.setIcon(get_usage_toggle_icon(False))
+        self.btn_view_usage.setFixedHeight(26)
+        self.btn_view_usage.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.btn_view_usage.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                color: #64748B;
+                font-size: 11px;
+                font-weight: 600;
+                border-radius: 13px;
+                padding: 2px 14px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #E2E8F0;
+                color: #1E293B;
+            }
+        """)
+        self.btn_view_usage.clicked.connect(lambda: self._switch_traffic_view("usage"))
+
+        cap_layout.addWidget(self.btn_view_graph)
+        cap_layout.addWidget(self.btn_view_usage)
+        chart_top_bar.addWidget(capsule_container)
+
+        chart_top_bar.addStretch()
+
+        # Thang đo (3 MB ▾)
         self.scale_indicator = QtWidgets.QLabel("3 MB ▾")
         self.scale_indicator.setStyleSheet("font-size: 13px; font-weight: bold; color: #475569; min-width: 60px;")
         chart_top_bar.addWidget(self.scale_indicator)
 
-        # -------------------------------------------------------------
-        # KHỐI 1: ĐIỀU KHIỂN CHẾ ĐỘ LIVE (THỜI GIAN THỰC)
-        # -------------------------------------------------------------
+        # Điều khiển LIVE
         self.live_controls_widget = QtWidgets.QWidget()
         lc_layout = QtWidgets.QHBoxLayout(self.live_controls_widget)
         lc_layout.setContentsMargins(0, 0, 0, 0)
@@ -1052,9 +1447,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
 
         chart_top_bar.addWidget(self.live_controls_widget)
 
-        # -------------------------------------------------------------
-        # KHỐI 2: ĐIỀU KHIỂN CHẾ ĐỘ LỊCH SỬ (CHỈ HIỆN KHI XEM LỊCH SỬ)
-        # -------------------------------------------------------------
+        # Điều khiển Lịch sử
         self.history_controls_widget = QtWidgets.QWidget()
         hc_layout = QtWidgets.QHBoxLayout(self.history_controls_widget)
         hc_layout.setContentsMargins(0, 0, 0, 0)
@@ -1095,45 +1488,63 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self.btn_back_to_live.clicked.connect(self._exit_history_mode)
         hc_layout.addWidget(self.btn_back_to_live)
 
+        # Các nút phóng to / thu nhỏ khi xem lịch sử
+        self.btn_hist_zoom_in = QtWidgets.QPushButton("🔍+ Phóng To")
+        self.btn_hist_zoom_in.setFixedHeight(28)
+        self.btn_hist_zoom_in.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.btn_hist_zoom_in.setStyleSheet("background-color: #EFF6FF; color: #2563EB; font-size: 11px; font-weight: bold; padding: 3px 10px; border: 1px solid #BFDBFE; border-radius: 5px;")
+        self.btn_hist_zoom_in.setToolTip("Phóng to biểu đồ vào khung giờ cao điểm (hoặc dùng con lăn chuột)")
+        self.btn_hist_zoom_in.clicked.connect(self._zoom_in_history)
+        hc_layout.addWidget(self.btn_hist_zoom_in)
+
+        self.btn_hist_zoom_out = QtWidgets.QPushButton("🔍- Thu Nhỏ")
+        self.btn_hist_zoom_out.setFixedHeight(28)
+        self.btn_hist_zoom_out.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.btn_hist_zoom_out.setStyleSheet("background-color: #EFF6FF; color: #2563EB; font-size: 11px; font-weight: bold; padding: 3px 10px; border: 1px solid #BFDBFE; border-radius: 5px;")
+        self.btn_hist_zoom_out.setToolTip("Thu nhỏ biểu đồ xem toàn cảnh (hoặc dùng con lăn chuột)")
+        self.btn_hist_zoom_out.clicked.connect(self._zoom_out_history)
+        hc_layout.addWidget(self.btn_hist_zoom_out)
+
+        self.btn_hist_zoom_24h = QtWidgets.QPushButton("⟲ Xem 24H")
+        self.btn_hist_zoom_24h.setFixedHeight(28)
+        self.btn_hist_zoom_24h.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.btn_hist_zoom_24h.setStyleSheet("background-color: #F8FAFC; color: #475569; font-size: 11px; font-weight: 600; padding: 3px 10px; border: 1px solid #CBD5E1; border-radius: 5px;")
+        self.btn_hist_zoom_24h.setToolTip("Đặt lại góc nhìn trọn vẹn 24 giờ")
+        self.btn_hist_zoom_24h.clicked.connect(self._reset_history_24h)
+        hc_layout.addWidget(self.btn_hist_zoom_24h)
+
         self.history_controls_widget.setVisible(False)
         chart_top_bar.addWidget(self.history_controls_widget)
 
-        # Biến combobox giữ ngầm cho logic đồng bộ CSDL
         self.combo_history_date = QtWidgets.QComboBox()
         self.combo_history_date.setVisible(False)
 
-        chart_top_bar.addStretch()
-
-        # -------------------------------------------------------------
-        # KHỐI 3: KHOẢNG THỜI GIAN
-        # -------------------------------------------------------------
-
         # Dropdown thời gian hiển thị (Mặc định: 5 Minutes)
         self.combo_time_window = QtWidgets.QComboBox()
-        self.combo_time_window.addItems(["30 Seconds", "1 Minute", "5 Minutes", "10 Minutes", "24 Hours"])
+        self.combo_time_window.addItems(["30 Seconds", "1 Minute", "5 Minutes", "10 Minutes", "1 Hour", "24 Hours"])
         self.combo_time_window.setCurrentIndex(2)
         self.combo_time_window.setFixedHeight(28)
         self.combo_time_window.setStyleSheet("font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 6px;")
         self.combo_time_window.currentIndexChanged.connect(self._on_time_window_changed)
         chart_top_bar.addWidget(self.combo_time_window)
 
-        right_layout.addLayout(chart_top_bar)
+        traffic_main_layout.addLayout(chart_top_bar)
 
-        # BANNER SOI DỮ LIỆU TẠI ĐIỂM (HIỂN THỊ KHI DỪNG / CHỌN ĐIỂM TRÊN BIỂU ĐỒ)
+        # BANNER SOI DỮ LIỆU TẠI ĐIỂM
         self.point_inspector_card = QtWidgets.QFrame()
         self.point_inspector_card.setObjectName("pointInspectorCard")
         self.point_inspector_card.setStyleSheet("""
             QFrame#pointInspectorCard {
-                background-color: #FFFFFF;
-                border: 1px solid #CBD5E1;
-                border-left: 5px solid #2563EB;
+                background-color: #F8FAFC;
+                border: 1px solid #E2E8F0;
+                border-left: 4px solid #2563EB;
                 border-radius: 6px;
-                padding: 6px 12px;
+                padding: 4px 10px;
             }
         """)
         self.point_inspector_card.setVisible(False)
         pic_layout = QtWidgets.QHBoxLayout(self.point_inspector_card)
-        pic_layout.setContentsMargins(6, 4, 6, 4)
+        pic_layout.setContentsMargins(10, 4, 10, 4)
         pic_layout.setSpacing(10)
 
         self.lbl_point_details = QtWidgets.QLabel("Đang soi điểm...")
@@ -1185,12 +1596,165 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         btn_box.addWidget(self.btn_card_close)
 
         pic_layout.addLayout(btn_box)
-        right_layout.addWidget(self.point_inspector_card)
+        traffic_main_layout.addWidget(self.point_inspector_card)
 
-        # BIỂU ĐỒ PYQTGRAPH SÓNG VÀNG RỰC RỠ GLASSWIRE
+        # ---------------------------------------------------------------------
+        # STACK 2 VIEW: VIEW 0 (GRAPH) & VIEW 1 (USAGE)
+        # ---------------------------------------------------------------------
+        self.traffic_content_stack = QtWidgets.QStackedWidget()
+
+        # VIEW 0: GRAPH VIEW (SPLITTER GỒM PANEL BÊN TRÁI VÀ BIỂU ĐỒ)
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.splitter.setStyleSheet("QSplitter::handle { background-color: #E2E8F0; width: 1px; }")
+
+        # 1. Bảng danh sách ứng dụng bên trái (MẶC ĐỊNH ẨN ĐỂ HIỆN FULL BIỂU ĐỒ NHƯ HÌNH 1)
+        self.left_panel = QtWidgets.QWidget()
+        self.left_panel.setStyleSheet("background-color: #FFFFFF;")
+        left_layout = QtWidgets.QVBoxLayout(self.left_panel)
+        left_layout.setContentsMargins(6, 4, 6, 4)
+        left_layout.setSpacing(6)
+
+        # Header của panel bên trái (Bộ lọc chiều và WAN/LAN như Hình 2)
+        filter_bar = QtWidgets.QHBoxLayout()
+        filter_bar.setContentsMargins(0, 2, 0, 2)
+        filter_bar.setSpacing(6)
+
+        # Dropdown sắp xếp chiều lưu lượng: Incoming & Outgoing, Incoming only, Outgoing only
+        self.combo_filter_dir = QtWidgets.QComboBox()
+        self.combo_filter_dir.addItems(["Incoming & Outgoing", "Incoming only", "Outgoing only"])
+        self.combo_filter_dir.setFixedHeight(26)
+        self.combo_filter_dir.setStyleSheet("""
+            QComboBox {
+                background-color: #F8FAFC;
+                color: #334155;
+                font-size: 11px;
+                font-weight: bold;
+                border: 1px solid #CBD5E1;
+                border-radius: 5px;
+                padding: 1px 8px;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 14px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #FFFFFF;
+                color: #1E293B;
+                selection-background-color: #EBF3FC;
+                selection-color: #2563EB;
+                border: 1px solid #CBD5E1;
+            }
+        """)
+        self.combo_filter_dir.currentIndexChanged.connect(self._on_filter_direction_combo_changed)
+        filter_bar.addWidget(self.combo_filter_dir)
+
+        # Dropdown sắp xếp WAN / LAN: WAN & LAN, WAN only, LAN only
+        self.combo_filter_scope = QtWidgets.QComboBox()
+        self.combo_filter_scope.addItems(["WAN & LAN", "WAN only", "LAN only"])
+        self.combo_filter_scope.setFixedHeight(26)
+        self.combo_filter_scope.setStyleSheet("""
+            QComboBox {
+                background-color: #F8FAFC;
+                color: #334155;
+                font-size: 11px;
+                font-weight: bold;
+                border: 1px solid #CBD5E1;
+                border-radius: 5px;
+                padding: 1px 8px;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 14px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #FFFFFF;
+                color: #1E293B;
+                selection-background-color: #EBF3FC;
+                selection-color: #2563EB;
+                border: 1px solid #CBD5E1;
+            }
+        """)
+        self.combo_filter_scope.currentIndexChanged.connect(self._on_filter_scope_combo_changed)
+        filter_bar.addWidget(self.combo_filter_scope)
+
+        filter_bar.addStretch()
+
+        # Ô tìm kiếm ứng dụng
+        self.search_app_input = QtWidgets.QLineEdit()
+        self.search_app_input.setPlaceholderText("🔍 Tìm...")
+        self.search_app_input.setFixedWidth(75)
+        self.search_app_input.setFixedHeight(26)
+        self.search_app_input.setStyleSheet("""
+            QLineEdit {
+                border-radius: 13px;
+                padding: 2px 8px;
+                font-size: 11px;
+                background-color: #FFFFFF;
+                border: 1px solid #CBD5E1;
+                color: #1E293B;
+            }
+            QLineEdit:focus {
+                border-color: #2563EB;
+            }
+        """)
+        self.search_app_input.textChanged.connect(self._filter_app_list)
+        filter_bar.addWidget(self.search_app_input)
+
+        # Nút đóng panel bên trái (✕) để đưa biểu đồ về full hình như Hình 1
+        btn_close_panel = QtWidgets.QPushButton("✕")
+        btn_close_panel.setFixedSize(24, 24)
+        btn_close_panel.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        btn_close_panel.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                color: #64748B;
+                font-size: 13px;
+                font-weight: bold;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #F1F5F9;
+                color: #0F172A;
+            }
+        """)
+        btn_close_panel.clicked.connect(self._close_app_panel)
+        filter_bar.addWidget(btn_close_panel)
+
+        left_layout.addLayout(filter_bar)
+
+        self.app_list_table = QtWidgets.QTableWidget()
+        self.app_list_table.setColumnCount(3)
+        self.app_list_table.setHorizontalHeaderLabels(["App", "↓", "↑"])
+        self.app_list_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.app_list_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.app_list_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.app_list_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.app_list_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.app_list_table.verticalHeader().setVisible(False)
+        self.app_list_table.setShowGrid(False)
+        self.app_list_table.itemSelectionChanged.connect(self._on_app_selected)
+        self.app_list_table.doubleClicked.connect(self._on_app_double_clicked)
+        left_layout.addWidget(self.app_list_table)
+
+        self.left_panel.setMinimumWidth(260)
+        self.left_panel.setMaximumWidth(380)
+
+        # MẶC ĐỊNH: Bảng left_panel ẩn đi để biểu đồ hiển thị full width như Hình 1!
+        self.left_panel.setVisible(False)
+        self.splitter.addWidget(self.left_panel)
+
+        # 2. Khối biểu đồ bên phải
+        right_panel = QtWidgets.QWidget()
+        right_panel.setStyleSheet("background-color: #FFFFFF;")
+        right_layout = QtWidgets.QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(4, 4, 4, 4)
+        right_layout.setSpacing(6)
+
         pg.setConfigOption("antialias", True)
         self.time_axis = TimeAxisItem(orientation='bottom')
         self.plot_widget = pg.PlotWidget(axisItems={'bottom': self.time_axis}, background="#FFFFFF")
+        self.plot_widget.setMinimumHeight(350)
 
         vb = self.plot_widget.getViewBox()
         vb.setDefaultPadding(0.0)
@@ -1199,29 +1763,23 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self.plot_widget.setYRange(0, 1024, padding=0.0)
         self.plot_widget.enableAutoRange(axis='y', enable=False)
 
-        # Trục thời gian đáy
         self.plot_widget.getAxis('bottom').setPen(pg.mkPen("#E2E8F0", width=1))
         self.plot_widget.getAxis('bottom').setTextPen(pg.mkPen("#94A3B8"))
-
-        # Trục bên trái: Ẩn số, giữ lưới ngang tinh tế chuẩn GlassWire
         self.plot_widget.getAxis('left').setStyle(showValues=False)
         self.plot_widget.getAxis('left').setPen(None)
 
-        # Sóng Download: Vàng hổ phách đặc trưng GlassWire (#F59E0B)
         self.curve_down = self.plot_widget.plot(
             pen=pg.mkPen(color="#D97706", width=2.0),
             fillLevel=0,
             brush=(245, 158, 11, 220)
         )
 
-        # Sóng Upload: San hô hồng-cam mỏng dưới chân sóng
         self.curve_up = self.plot_widget.plot(
             pen=pg.mkPen(color="#EA580C", width=1.5),
             fillLevel=0,
             brush=(244, 63, 94, 210)
         )
 
-        # Đường dóng chữ thập tương tác khi rê chuột (Crosshair)
         self.v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#3B82F6", width=1.2, style=QtCore.Qt.PenStyle.DashLine))
         self.h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#CBD5E1", width=1.0, style=QtCore.Qt.PenStyle.DotLine))
         self.v_line.hide()
@@ -1229,12 +1787,10 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self.plot_widget.addItem(self.v_line, ignoreBounds=True)
         self.plot_widget.addItem(self.h_line, ignoreBounds=True)
 
-        # Marker tròn snap theo chuột
         self.hover_marker = pg.ScatterPlotItem(size=8, pen=pg.mkPen("#2563EB", width=2), brush=pg.mkBrush("#FFFFFF"), symbol='o')
         self.hover_marker.hide()
         self.plot_widget.addItem(self.hover_marker)
 
-        # Đường dóng và Marker cố định khi Ghim chọn điểm (Pinned)
         self.pinned_vline = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#DC2626", width=1.5, style=QtCore.Qt.PenStyle.SolidLine))
         self.pinned_vline.hide()
         self.plot_widget.addItem(self.pinned_vline, ignoreBounds=True)
@@ -1243,7 +1799,6 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self.pinned_marker.hide()
         self.plot_widget.addItem(self.pinned_marker)
 
-        # Tooltip badge nhỏ di động theo chuột
         self.hover_badge = QtWidgets.QFrame(self.plot_widget)
         self.hover_badge.setStyleSheet("""
             QFrame {
@@ -1267,25 +1822,168 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         hb_layout.addWidget(self.lbl_hover_text)
         self.hover_badge.hide()
 
-        # Kết nối sự kiện chuột xem dữ liệu tại điểm
         self.plot_widget.scene().sigMouseMoved.connect(self._on_plot_mouse_moved)
         self.plot_widget.scene().sigMouseClicked.connect(self._on_plot_mouse_clicked)
+        self.plot_widget.viewport().installEventFilter(self)
 
         right_layout.addWidget(self.plot_widget, stretch=1)
 
-        # HUD THỐNG KÊ CHI TIẾT TIẾN TRÌNH ĐƯỢC CHỌN (BÊN DƯỚI BIỂU ĐỒ)
-        bottom_hud = self._create_selected_app_hud()
-        right_layout.addWidget(bottom_hud)
+        # Thanh Inspection Bar chi tiết khi dừng tại điểm (chuẩn GlassWire Hình 2)
+        self.point_inspection_bar = GlassWirePointInspectionBar(self.icon_manager)
+        self.point_inspection_bar.resume_clicked.connect(self._resume_live)
+        self.point_inspection_bar.hide()
+        right_layout.addWidget(self.point_inspection_bar)
 
-        # DẢI PANORAMIC TIMELINE SCRUBBER
+        self.splitter.addWidget(right_panel)
+
+        self.traffic_content_stack.addWidget(self.splitter)
+
+        # VIEW 1: USAGE VIEW (4 CỘT CHUẨN: APPS | HOSTS | TRAFFIC TYPE | COUNTRIES)
+        self.usage_view = GlassWireUsageView(self.icon_manager)
+        self.traffic_content_stack.addWidget(self.usage_view)
+
+        traffic_main_layout.addWidget(self.traffic_content_stack, stretch=1)
+
+        # HUD THỐNG KÊ CHI TIẾT DƯỚI ĐÁY
+        bottom_hud = self._create_selected_app_hud()
+        traffic_main_layout.addWidget(bottom_hud)
+
+        # PANORAMIC TIMELINE SCRUBBER
         self.timeline_scrubber = GlassWireTimelineScrubber()
         self.timeline_scrubber.range_selected.connect(self._on_scrubber_range_selected)
         self.timeline_scrubber.time_selected.connect(self._on_scrubber_point_selected)
-        right_layout.addWidget(self.timeline_scrubber)
+        traffic_main_layout.addWidget(self.timeline_scrubber)
 
-        splitter.addWidget(right_panel)
-        splitter.setSizes([300, 960])
-        layout.addWidget(splitter)
+        layout.addWidget(traffic_main_widget)
+
+    def _open_app_panel(self):
+        """Mở bảng ứng dụng và bộ lọc bên trái (như Hình 2)."""
+        self.left_panel.setVisible(True)
+        self.btn_toggle_filter.setVisible(False)
+        if hasattr(self, 'splitter'):
+            tot_w = self.splitter.width() or 1200
+            self.splitter.setSizes([320, max(500, tot_w - 320)])
+        self._update_app_sidebar(self.latest_proc_speeds)
+
+    def _close_app_panel(self):
+        """Đóng bảng bên trái, đưa biểu đồ về hiển thị toàn màn hình (như Hình 1)."""
+        self.left_panel.setVisible(False)
+        self.btn_toggle_filter.setVisible(True)
+
+    def _on_filter_direction_combo_changed(self, index: int):
+        """Xử lý khi người dùng chọn lọc chiều lưu lượng trong header của panel bên trái."""
+        if index == 1:
+            self.filter_direction = "incoming"
+            self.curve_down.show()
+            self.curve_up.hide()
+        elif index == 2:
+            self.filter_direction = "outgoing"
+            self.curve_down.hide()
+            self.curve_up.show()
+        else:
+            self.filter_direction = "both"
+            self.curve_down.show()
+            self.curve_up.show()
+
+        # Cập nhật ngay lập tức bảng bên trái, HUD và Usage view
+        self._update_app_sidebar(self.latest_proc_speeds)
+        self._update_selected_app_hud()
+        if hasattr(self, 'usage_view'):
+            self.usage_view.set_filter_direction(self.filter_direction)
+            if self.traffic_content_stack.currentIndex() == 1:
+                self._update_usage_view_now()
+
+    def _on_filter_scope_combo_changed(self, index: int):
+        """Xử lý khi người dùng chọn lọc phạm vi mạng (WAN / LAN)."""
+        if index == 1:
+            self.filter_scope = "wan"
+        elif index == 2:
+            self.filter_scope = "lan"
+        else:
+            self.filter_scope = "all"
+
+        self._update_app_sidebar(self.latest_proc_speeds)
+        self._update_selected_app_hud()
+
+    def _switch_traffic_view(self, mode: str):
+        """Chuyển đổi giữa chế độ Biểu đồ (Graph) và Danh sách lưu lượng (Usage)."""
+        self.current_traffic_view = mode
+        if mode == "graph":
+            self.traffic_content_stack.setCurrentIndex(0)
+            self.btn_view_graph.setIcon(get_graph_toggle_icon(True))
+            self.btn_view_graph.setStyleSheet("""
+                QPushButton {
+                    background-color: #2563EB;
+                    color: #FFFFFF;
+                    font-size: 11px;
+                    font-weight: bold;
+                    border-radius: 13px;
+                    padding: 2px 14px;
+                    border: none;
+                }
+            """)
+            self.btn_view_usage.setIcon(get_usage_toggle_icon(False))
+            self.btn_view_usage.setStyleSheet("""
+                QPushButton {
+                    background-color: transparent;
+                    color: #64748B;
+                    font-size: 11px;
+                    font-weight: 600;
+                    border-radius: 13px;
+                    padding: 2px 14px;
+                    border: none;
+                }
+                QPushButton:hover {
+                    background-color: #E2E8F0;
+                    color: #1E293B;
+                }
+            """)
+        else:
+            self.traffic_content_stack.setCurrentIndex(1)
+            self.btn_view_usage.setIcon(get_usage_toggle_icon(True))
+            self.btn_view_usage.setStyleSheet("""
+                QPushButton {
+                    background-color: #2563EB;
+                    color: #FFFFFF;
+                    font-size: 11px;
+                    font-weight: bold;
+                    border-radius: 13px;
+                    padding: 2px 14px;
+                    border: none;
+                }
+            """)
+            self.btn_view_graph.setIcon(get_graph_toggle_icon(False))
+            self.btn_view_graph.setStyleSheet("""
+                QPushButton {
+                    background-color: transparent;
+                    color: #64748B;
+                    font-size: 11px;
+                    font-weight: 600;
+                    border-radius: 13px;
+                    padding: 2px 14px;
+                    border: none;
+                }
+                QPushButton:hover {
+                    background-color: #E2E8F0;
+                    color: #1E293B;
+                }
+            """)
+            self._update_usage_view_now()
+
+    def _update_usage_view_now(self):
+        """Thu thập kết nối socket và cập nhật bảng Usage 4 cột thời gian thực theo đúng khung thời gian đã chọn (30s, 1m, 5m, 10m, 1h, 24h)."""
+        try:
+            win_down, win_up, win_app_bytes = self._compute_window_traffic()
+            tot_win_bytes = win_down + win_up
+            active_conns = self.service.collector.collect_tcp_connections()
+            self.usage_view.update_usage_data(
+                win_app_bytes,
+                active_conns,
+                self.app_metadata,
+                total_window_bytes=tot_win_bytes
+            )
+        except Exception as e:
+            print(f"[Usage Update Error] {e}")
 
     def _create_selected_app_hud(self) -> QtWidgets.QWidget:
         """Tạo thanh HUD GlassWire: Tốc độ Tải Xuống, Đồng hồ bán nguyệt, Tốc độ Tải Lên, Phân tích WAN & LAN"""
@@ -1342,162 +2040,23 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
     # TRANG 1: GLASSWIRE PROTECT (WINDIVERT KERNEL PACKET SHAPER)
     # =========================================================================
     def _setup_protect_page(self, parent: QtWidgets.QWidget):
-        scroll = QtWidgets.QScrollArea(parent)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        scroll.setStyleSheet("QScrollArea { background-color: #FFFFFF; border: none; }")
+        layout = QtWidgets.QVBoxLayout(parent)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        content = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(content)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(14)
+        # Giao diện GlassWire Protect phong cách chuẩn xác
+        self.protect_view = GlassWireProtectView(self.service, self.icon_manager)
+        layout.addWidget(self.protect_view)
 
-        title = QtWidgets.QLabel("🛡️ GlassWire Protect - Quản Lý Bóp Băng Thông (WinDivert Kernel Packet Shaper)")
-        title.setStyleSheet("font-size: 17px; font-weight: bold; color: #0F172A;")
-        layout.addWidget(title)
-
-        desc = QtWidgets.QLabel("Can thiệp và bóp băng thông thực tế từng gói tin tầng NDIS (Token Bucket), hỗ trợ cả Upload và Download cho mọi loại kết nối (TCP, UDP, QUIC).")
-        desc.setStyleSheet("font-size: 12px; color: #64748B;")
-        layout.addWidget(desc)
-
-        # Khối hướng dẫn kiến trúc WinDivert Packet Shaper
-        info_banner = QtWidgets.QFrame()
-        info_banner.setStyleSheet("""
-            QFrame {
-                background-color: #FFFFFF;
-                border: 1px solid #E2E8F0;
-                border-left: 4px solid #16A34A;
-                border-radius: 6px;
-                padding: 10px 14px;
-            }
-        """)
-        b_layout = QtWidgets.QVBoxLayout(info_banner)
-        b_layout.setContentsMargins(0, 0, 0, 0)
-        b_layout.setSpacing(4)
-        info_title = QtWidgets.QLabel("ℹ️ CƠ CHẾ CAN THIỆP GÓI TIN KERNEL (WINDIVERT PACKET DIVERTER):")
-        info_title.setStyleSheet("font-weight: bold; color: #15803D; font-size: 12px;")
-        info_text = QtWidgets.QLabel(
-            "• <b>Can thiệp tầng NDIS Kernel:</b> WinDivert bắt gói tin mạng ngay tại tầng mạng hệ thống, kiểm soát được cả TCP, UDP (kể cả HTTP/3 QUIC của Chrome/Brave/Edge).<br>"
-            "• <b>Hỗ trợ cả 2 chiều:</b> Bóp được cả <b>TẢI LÊN (Upload)</b>, <b>TẢI VỀ (Download)</b> hoặc <b>CẢ HAI CHIỀU</b> theo mức trần bạn đặt.<br>"
-            "• <b>Tác dụng tức thời:</b> Áp dụng ngay lập tức cho các kết nối đang chạy mà không cần khởi động lại máy hay phụ thuộc mạng Domain."
-        )
-        info_text.setWordWrap(True)
-        info_text.setStyleSheet("color: #166534; font-size: 12px; line-height: 1.4;")
-        b_layout.addWidget(info_title)
-        b_layout.addWidget(info_text)
-        layout.addWidget(info_banner)
-
-        card = QtWidgets.QFrame()
-        card.setStyleSheet("background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px; padding: 14px;")
-        c_layout = QtWidgets.QHBoxLayout(card)
-        c_layout.setSpacing(12)
-
-        lbl_app = QtWidgets.QLabel("Tiến trình:")
-        lbl_app.setStyleSheet("font-weight: 600; color: #334155;")
+        # Các widget dự phòng giữ nguyên để tương thích ngược 100%
         self.combo_qos_app = QtWidgets.QComboBox()
-        self.combo_qos_app.setEditable(True)
-        self.combo_qos_app.setMinimumWidth(200)
-        self.combo_qos_app.setPlaceholderText("Chọn hoặc nhập app (vd: brave.exe)")
-
-        lbl_dir = QtWidgets.QLabel("Chiều giới hạn:")
-        lbl_dir.setStyleSheet("font-weight: 600; color: #334155;")
         self.combo_shaper_dir = QtWidgets.QComboBox()
-        self.combo_shaper_dir.addItems(["Upload & Download (Cả 2 chiều)", "Chỉ Upload (Tải lên)", "Chỉ Download (Tải về)"])
-        self.combo_shaper_dir.setFixedWidth(200)
-
-        lbl_limit = QtWidgets.QLabel("Mức trần (KB/s):")
-        lbl_limit.setStyleSheet("font-weight: 600; color: #334155;")
-        self.input_qos_limit = QtWidgets.QLineEdit()
-        self.input_qos_limit.setPlaceholderText("VD: 100")
-        self.input_qos_limit.setText("100")
-        self.input_qos_limit.setFixedWidth(90)
-
-        self.btn_apply_qos = QtWidgets.QPushButton("🚀 Áp Dụng Giới Hạn")
-        self.btn_apply_qos.setStyleSheet("background-color: #059669; color: #FFFFFF; font-weight: bold; padding: 8px 16px;")
-        self.btn_apply_qos.clicked.connect(self._on_apply_qos_clicked)
-
-        self.btn_remove_qos = QtWidgets.QPushButton("❌ Gỡ Bỏ Giới Hạn")
-        self.btn_remove_qos.setStyleSheet("background-color: #DC2626; color: #FFFFFF; font-weight: bold; padding: 8px 16px;")
-        self.btn_remove_qos.clicked.connect(self._on_remove_qos_clicked)
-
-        c_layout.addWidget(lbl_app)
-        c_layout.addWidget(self.combo_qos_app)
-        c_layout.addWidget(lbl_dir)
-        c_layout.addWidget(self.combo_shaper_dir)
-        c_layout.addWidget(lbl_limit)
-        c_layout.addWidget(self.input_qos_limit)
-        c_layout.addWidget(self.btn_apply_qos)
-        c_layout.addWidget(self.btn_remove_qos)
-        c_layout.addStretch()
-        layout.addWidget(card)
-
-        # Đo đạc xác minh tốc độ thực tế so với giới hạn
-        verify_card = QtWidgets.QFrame()
-        verify_card.setStyleSheet("background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px; padding: 14px;")
-        v_layout = QtWidgets.QVBoxLayout(verify_card)
-
-        self.qos_meter_label = QtWidgets.QLabel("🎯 Chọn tiến trình và bấm 'Áp Dụng Giới Hạn' để bắt đầu bóp băng thông...")
-        self.qos_meter_label.setStyleSheet("font-size: 13px; font-weight: 600; color: #334155;")
-        v_layout.addWidget(self.qos_meter_label)
-
+        self.input_qos_limit = QtWidgets.QLineEdit("100")
+        self.qos_meter_label = QtWidgets.QLabel("")
         self.qos_progress = QtWidgets.QProgressBar()
-        self.qos_progress.setFixedHeight(18)
-        self.qos_progress.setTextVisible(True)
-        self.qos_progress.setValue(0)
-        self.qos_progress.setStyleSheet("""
-            QProgressBar { background-color: #F1F5F9; border-radius: 6px; text-align: center; font-weight: bold; color: #1E293B; }
-            QProgressBar::chunk { background-color: #10B981; border-radius: 6px; }
-        """)
-        v_layout.addWidget(self.qos_progress)
-        layout.addWidget(verify_card)
-
-        self.qos_status_card = QtWidgets.QLabel("ℹ️ Trạng thái: Chưa có chính sách nào được áp dụng.")
-        self.qos_status_card.setStyleSheet("background-color: #FFFFFF; border: 1px solid #E2E8F0; border-left: 4px solid #2563EB; border-radius: 6px; padding: 10px; font-size: 12px; color: #334155;")
-        layout.addWidget(self.qos_status_card)
-
-        # Khối Bảng Lịch Sử Chính Sách (Policy Audit Table)
-        hist_box = QtWidgets.QFrame()
-        hist_box.setStyleSheet("background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px; padding: 12px;")
-        h_layout = QtWidgets.QVBoxLayout(hist_box)
-        h_layout.setContentsMargins(10, 10, 10, 10)
-        h_layout.setSpacing(8)
-
-        h_header = QtWidgets.QHBoxLayout()
-        h_title = QtWidgets.QLabel("📜 Lịch Sử Áp Dụng Chính Sách (Audit Policy Logs - MySQL & logs/policies.log)")
-        h_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #0F172A;")
-        h_header.addWidget(h_title)
-        h_header.addStretch()
-
-        btn_refresh_hist = QtWidgets.QPushButton("🔄 Làm Mới")
-        btn_refresh_hist.setStyleSheet("background-color: #F1F5F9; color: #334155; font-weight: 600; padding: 4px 12px; border-radius: 5px;")
-        btn_refresh_hist.clicked.connect(self._refresh_policy_table)
-        h_header.addWidget(btn_refresh_hist)
-        h_layout.addLayout(h_header)
-
+        self.qos_status_card = QtWidgets.QLabel("")
         self.policy_table = QtWidgets.QTableWidget()
-        self.policy_table.setColumnCount(7)
-        self.policy_table.setHorizontalHeaderLabels([
-            "Thời Gian", "Thao Tác", "Tiến Trình", "Chiều Giới Hạn", "Mức Trần", "Gói Tin Can Thiệp", "Trạng Thái"
-        ])
-        self.policy_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.policy_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.policy_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.policy_table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.policy_table.verticalHeader().setVisible(False)
-        self.policy_table.setMinimumHeight(200)
-        h_layout.addWidget(self.policy_table)
 
-        layout.addWidget(hist_box)
-        layout.addStretch()
-
-        scroll.setWidget(content)
-        parent_layout = QtWidgets.QVBoxLayout(parent)
-        parent_layout.setContentsMargins(0, 0, 0, 0)
-        parent_layout.addWidget(scroll)
-
-    # =========================================================================
-    # TRANG 2: USAGE HISTORY & NETWORK ANALYTICS (LỊCH SỬ SỬ DỤNG MẠNG & TOP ỨNG DỤNG)
-    # =========================================================================
     def _setup_logs_page(self, parent: QtWidgets.QWidget):
         scroll = QtWidgets.QScrollArea(parent)
         scroll.setWidgetResizable(True)
@@ -1866,7 +2425,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(1500, self._verify_database)
 
     def _on_time_window_changed(self, index: int):
-        windows = [30.0, 60.0, 300.0, 600.0, 86400.0]
+        windows = [30.0, 60.0, 300.0, 600.0, 3600.0, 86400.0]
         self.window_duration = windows[min(index, len(windows) - 1)]
         self.time_axis.set_window_duration(self.window_duration)
         self.timeline_scrubber.set_window_duration(self.window_duration)
@@ -1874,6 +2433,25 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             now = time.time()
             render_now = now - self.render_delay
             self.plot_widget.setXRange(render_now - self.window_duration, render_now, padding=0.0)
+            # Cập nhật ngay bảng bên trái, HUD và Usage view theo khung thời gian vừa chọn
+            self._update_app_sidebar(self.latest_proc_speeds)
+            self._update_selected_app_hud()
+            if hasattr(self, 'usage_view'):
+                self._update_usage_view_now()
+        else:
+            if self.historical_series:
+                day_start = self.history_summary.get("day_start", self.historical_series[0]["timestamp"])
+                day_end = self.history_summary.get("day_end", self.historical_series[-1]["timestamp"])
+                center_t = getattr(self, "pinned_time", None)
+                if center_t is None:
+                    center_t = self.history_summary.get("peak_down_time_ts", (day_start + day_end) / 2.0)
+                half = self.window_duration / 2.0
+                win_start = max(day_start, center_t - half)
+                win_end = min(day_end, win_start + self.window_duration)
+                if win_end - win_start < self.window_duration:
+                    win_start = max(day_start, win_end - self.window_duration)
+                self._render_window_data(win_start, win_end)
+                self.timeline_scrubber.set_slider_range(win_start, win_end)
 
     @QtCore.pyqtSlot(float, float, float, list, float, float)
     def _on_new_sample(self, timestamp, down_kb, up_kb, proc_speeds, total_p_down, total_p_up):
@@ -1906,19 +2484,46 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             self.down_points.append((timestamp, down_kb))
             self.up_points.append((timestamp, up_kb))
 
-            # Lưu mẫu chi tiết vào bộ nhớ phục vụ tính năng xem dữ liệu tại điểm
+            # Lưu vết mẫu theo thời gian để tính toán chính xác lưu lượng theo khung (30s, 1m, 5m, 10m, 1h, 24h)
+            dt = UPDATE_INTERVAL
+            active_procs = {}
+            for p_item in proc_speeds:
+                pname = p_item.get("name", "")
+                if not pname:
+                    continue
+                d_kb = p_item.get("down_kb", 0.0)
+                u_kb = p_item.get("up_kb", 0.0)
+                if d_kb > 0 or u_kb > 0:
+                    active_procs[pname] = (d_kb * 1024.0 * dt, u_kb * 1024.0 * dt)
+
+            if hasattr(self, 'window_sample_history'):
+                self.window_sample_history.append({
+                    "t": timestamp,
+                    "down_b": down_kb * 1024.0 * dt,
+                    "up_b": up_kb * 1024.0 * dt,
+                    "procs": active_procs
+                })
+
+            # Lưu toàn bộ danh sách tiến trình có lưu lượng tại thời điểm này
+            all_active_point_procs = []
+            for p in proc_speeds:
+                p_d = p.get("down_kb", 0.0)
+                p_u = p.get("up_kb", 0.0)
+                if p_d > 0 or p_u > 0:
+                    all_active_point_procs.append({
+                        "name": p.get("name", "Unknown"),
+                        "down_kb": p_d,
+                        "up_kb": p_u,
+                        "pid": p.get("pid", 0),
+                        "exe": p.get("exe", "")
+                    })
+            all_active_point_procs.sort(key=lambda x: x["down_kb"] + x["up_kb"], reverse=True)
+
             self.point_history.append({
                 "timestamp": timestamp,
                 "down_kb": down_kb,
                 "up_kb": up_kb,
-                "top_procs": [
-                    {
-                        "name": p.get("name", "Unknown"),
-                        "down_kb": p.get("down_kb", 0.0),
-                        "up_kb": p.get("up_kb", 0.0)
-                    }
-                    for p in proc_speeds[:4]
-                ] if proc_speeds else []
+                "top_procs": all_active_point_procs
             })
 
             self.timeline_scrubber.add_point(timestamp, down_kb + up_kb)
@@ -1930,6 +2535,10 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
 
             # 3. Đo đạc xác minh QoS thời gian thực
             self._update_qos_realtime_verification(proc_speeds)
+            if hasattr(self, 'protect_view'):
+                self.protect_view.update_protect_table(proc_speeds, self.app_accumulated_bytes, self.app_metadata)
+            if hasattr(self, 'traffic_content_stack') and self.traffic_content_stack.currentIndex() == 1:
+                self._update_usage_view_now()
         except Exception as e:
             print(f"[UI Slot Error] {e}")
 
@@ -1953,26 +2562,66 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         else:
             return f"{speed_kb / 1024.0:,.1f} MB/s"
 
+    def _compute_window_traffic(self, win_duration: Optional[float] = None, t_end: Optional[float] = None) -> Tuple[float, float, Dict[str, Dict[str, float]]]:
+        """
+        Tính tổng lưu lượng download, upload toàn hệ thống và theo từng tiến trình
+        trong đúng khung thời gian win_duration (30s, 1m, 5m, 10m, 1h, 24h).
+        Trả về: (tot_down_bytes, tot_up_bytes, app_bytes_dict)
+        """
+        if win_duration is None:
+            win_duration = getattr(self, "window_duration", 300.0)
+
+        now = t_end if t_end is not None else time.time()
+        cutoff = now - win_duration
+
+        if not hasattr(self, "window_sample_history") or not self.window_sample_history:
+            return self.total_accumulated_down, self.total_accumulated_up, self.app_accumulated_bytes
+
+        tot_down = 0.0
+        tot_up = 0.0
+        app_bytes: Dict[str, Dict[str, float]] = {}
+
+        for s in reversed(self.window_sample_history):
+            st = s.get("t", 0.0)
+            if st < cutoff:
+                break
+            tot_down += s.get("down_b", 0.0)
+            tot_up += s.get("up_b", 0.0)
+            for pname, (pd_b, pu_b) in s.get("procs", {}).items():
+                if pname not in app_bytes:
+                    app_bytes[pname] = {"down": 0.0, "up": 0.0}
+                app_bytes[pname]["down"] += pd_b
+                app_bytes[pname]["up"] += pu_b
+
+        return tot_down, tot_up, app_bytes
+
     def _update_app_sidebar(self, proc_speeds: list):
-        """Cập nhật danh sách ứng dụng trong Sidebar: Giữ cố định tất cả app đã từng có băng thông, không bị xóa/nhấp nháy"""
+        """Cập nhật danh sách ứng dụng trong Sidebar theo chiều lọc Incoming / Outgoing và khung thời gian đã chọn"""
         search_kw = self.search_app_input.text().strip().lower()
 
         # Tạo map tốc độ tức thời của chu kỳ hiện tại
         current_speeds = {p.get("name", ""): p for p in proc_speeds if p.get("name")}
 
+        # Lấy lưu lượng tích lũy chính xác theo khung thời gian đang chọn (30s, 1m, 5m, 10m, 1h, 24h)
+        win_down, win_up, win_app_bytes = self._compute_window_traffic()
+
+        f_scope = getattr(self, "filter_scope", "all")
+        scope_factor = 0.98 if f_scope == "wan" else (0.05 if f_scope == "lan" else 1.0)
+
         display_apps = []
-        for app_name, accum in self.app_accumulated_bytes.items():
+        all_app_names = set(win_app_bytes.keys()) | set(current_speeds.keys())
+        for app_name in all_app_names:
             if app_name == "All apps":
                 continue
 
-            down_b = accum.get("down", 0.0)
-            up_b = accum.get("up", 0.0)
+            accum = win_app_bytes.get(app_name, {"down": 0.0, "up": 0.0})
+            down_b = accum.get("down", 0.0) * scope_factor
+            up_b = accum.get("up", 0.0) * scope_factor
             tot_b = down_b + up_b
 
             cur_p = current_speeds.get(app_name)
             cur_spd = (cur_p.get("down_kb", 0.0) + cur_p.get("up_kb", 0.0)) if cur_p else 0.0
 
-            # Giữ lại tất cả các ứng dụng đã phát sinh lưu lượng hoặc đang hoạt động
             if tot_b <= 0 and cur_spd <= 0:
                 continue
 
@@ -1994,10 +2643,16 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
                 "cur_speed": cur_spd
             })
 
-        # Sắp xếp: Ưu tiên app đang truyền mạng hoặc có tổng lưu lượng lớn nhất lên đầu
-        display_apps.sort(key=lambda x: (x["is_active_now"], x["total_bytes"]), reverse=True)
+        # Sắp xếp theo chiều lưu lượng đang chọn
+        f_dir = getattr(self, "filter_direction", "both")
 
-        # Tránh trigger sự kiện itemSelectionChanged làm mất app đang chọn
+        if f_dir == "incoming":
+            display_apps.sort(key=lambda x: (x["is_active_now"], x["down_bytes"]), reverse=True)
+        elif f_dir == "outgoing":
+            display_apps.sort(key=lambda x: (x["is_active_now"], x["up_bytes"]), reverse=True)
+        else:
+            display_apps.sort(key=lambda x: (x["is_active_now"], x["total_bytes"]), reverse=True)
+
         self.app_list_table.blockSignals(True)
         try:
             prev_selected = self.selected_app_name
@@ -2007,8 +2662,8 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             item_all_name = QtWidgets.QTableWidgetItem("  All apps")
             item_all_name.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
             item_all_name.setForeground(QtGui.QBrush(QtGui.QColor("#0F172A")))
-            
-            # Grid icon ⊞ cho All apps
+
+            # Icon All apps
             pix = QtGui.QPixmap(20, 20)
             pix.fill(QtCore.Qt.GlobalColor.transparent)
             p = QtGui.QPainter(pix)
@@ -2022,17 +2677,43 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             p.end()
             item_all_name.setIcon(QtGui.QIcon(pix))
 
-            down_all_str = self._format_bytes(self.total_accumulated_down)
-            item_all_down = QtWidgets.QTableWidgetItem(down_all_str)
-            item_all_down.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-            item_all_down.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
-            item_all_down.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            total_win_down = win_down * scope_factor
+            total_win_up = win_up * scope_factor
 
-            up_all_str = self._format_bytes(self.total_accumulated_up)
-            item_all_up = QtWidgets.QTableWidgetItem(up_all_str)
-            item_all_up.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-            item_all_up.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
-            item_all_up.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            if f_dir == "incoming":
+                down_all_str = self._format_bytes(total_win_down)
+                item_all_down = QtWidgets.QTableWidgetItem(down_all_str)
+                item_all_down.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+                item_all_down.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
+                item_all_down.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+                item_all_up = QtWidgets.QTableWidgetItem("--")
+                item_all_up.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+                item_all_up.setForeground(QtGui.QBrush(QtGui.QColor("#94A3B8")))
+                item_all_up.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            elif f_dir == "outgoing":
+                item_all_down = QtWidgets.QTableWidgetItem("--")
+                item_all_down.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+                item_all_down.setForeground(QtGui.QBrush(QtGui.QColor("#94A3B8")))
+                item_all_down.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+                up_all_str = self._format_bytes(total_win_up)
+                item_all_up = QtWidgets.QTableWidgetItem(up_all_str)
+                item_all_up.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+                item_all_up.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
+                item_all_up.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            else:
+                down_all_str = self._format_bytes(total_win_down)
+                item_all_down = QtWidgets.QTableWidgetItem(down_all_str)
+                item_all_down.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+                item_all_down.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
+                item_all_down.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+                up_all_str = self._format_bytes(total_win_up)
+                item_all_up = QtWidgets.QTableWidgetItem(up_all_str)
+                item_all_up.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+                item_all_up.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
+                item_all_up.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
 
             self.app_list_table.setItem(0, 0, item_all_name)
             self.app_list_table.setItem(0, 1, item_all_down)
@@ -2046,7 +2727,6 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
                 name_item = QtWidgets.QTableWidgetItem(f"  {name}")
                 name_item.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
 
-                # Lấy Icon thật của tiến trình
                 exe_path = item.get("exe", "")
                 if not exe_path and item.get("pid", 0) > 0:
                     try:
@@ -2056,15 +2736,36 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
                 icon = self.icon_manager.get_icon(exe_path, name)
                 name_item.setIcon(icon)
 
-                down_str = self._format_bytes(item["down_bytes"])
-                d_item = QtWidgets.QTableWidgetItem(down_str)
-                d_item.setForeground(QtGui.QBrush(QtGui.QColor("#475569")))
-                d_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+                if f_dir == "incoming":
+                    down_str = self._format_bytes(item["down_bytes"])
+                    d_item = QtWidgets.QTableWidgetItem(down_str)
+                    d_item.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
+                    d_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+                    d_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
 
-                up_str = self._format_bytes(item["up_bytes"])
-                u_item = QtWidgets.QTableWidgetItem(up_str)
-                u_item.setForeground(QtGui.QBrush(QtGui.QColor("#475569")))
-                u_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+                    u_item = QtWidgets.QTableWidgetItem("--")
+                    u_item.setForeground(QtGui.QBrush(QtGui.QColor("#94A3B8")))
+                    u_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+                elif f_dir == "outgoing":
+                    d_item = QtWidgets.QTableWidgetItem("--")
+                    d_item.setForeground(QtGui.QBrush(QtGui.QColor("#94A3B8")))
+                    d_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+                    up_str = self._format_bytes(item["up_bytes"])
+                    u_item = QtWidgets.QTableWidgetItem(up_str)
+                    u_item.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
+                    u_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+                    u_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+                else:
+                    down_str = self._format_bytes(item["down_bytes"])
+                    d_item = QtWidgets.QTableWidgetItem(down_str)
+                    d_item.setForeground(QtGui.QBrush(QtGui.QColor("#475569")))
+                    d_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+                    up_str = self._format_bytes(item["up_bytes"])
+                    u_item = QtWidgets.QTableWidgetItem(up_str)
+                    u_item.setForeground(QtGui.QBrush(QtGui.QColor("#475569")))
+                    u_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
 
                 self.app_list_table.setItem(idx, 0, name_item)
                 self.app_list_table.setItem(idx, 1, d_item)
@@ -2073,10 +2774,9 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
                 if name == prev_selected:
                     selected_row_idx = idx
 
-                if self.combo_qos_app.findText(name) == -1:
+                if hasattr(self, 'combo_qos_app') and self.combo_qos_app.findText(name) == -1:
                     self.combo_qos_app.addItem(name)
 
-            # Giữ nguyên hàng đang chọn, không bị mất focus hay nhảy chuột
             if selected_row_idx >= 0:
                 self.app_list_table.selectRow(selected_row_idx)
         finally:
@@ -2113,17 +2813,37 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         p.end()
         item_all_name.setIcon(QtGui.QIcon(pix))
 
-        down_all_str = self._format_bytes(total_rx)
-        item_all_down = QtWidgets.QTableWidgetItem(down_all_str)
-        item_all_down.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-        item_all_down.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
-        item_all_down.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        f_dir = getattr(self, "filter_direction", "both")
+        if f_dir == "incoming":
+            item_all_down = QtWidgets.QTableWidgetItem(self._format_bytes(total_rx))
+            item_all_down.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+            item_all_down.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
+            item_all_down.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
 
-        up_all_str = self._format_bytes(total_tx)
-        item_all_up = QtWidgets.QTableWidgetItem(up_all_str)
-        item_all_up.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-        item_all_up.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
-        item_all_up.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            item_all_up = QtWidgets.QTableWidgetItem("--")
+            item_all_up.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+            item_all_up.setForeground(QtGui.QBrush(QtGui.QColor("#94A3B8")))
+            item_all_up.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        elif f_dir == "outgoing":
+            item_all_down = QtWidgets.QTableWidgetItem("--")
+            item_all_down.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+            item_all_down.setForeground(QtGui.QBrush(QtGui.QColor("#94A3B8")))
+            item_all_down.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+            item_all_up = QtWidgets.QTableWidgetItem(self._format_bytes(total_tx))
+            item_all_up.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+            item_all_up.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
+            item_all_up.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        else:
+            item_all_down = QtWidgets.QTableWidgetItem(self._format_bytes(total_rx))
+            item_all_down.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+            item_all_down.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
+            item_all_down.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+            item_all_up = QtWidgets.QTableWidgetItem(self._format_bytes(total_tx))
+            item_all_up.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+            item_all_up.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
+            item_all_up.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
 
         self.app_list_table.setItem(0, 0, item_all_name)
         self.app_list_table.setItem(0, 1, item_all_down)
@@ -2141,13 +2861,32 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             rx_b = item.get("rx_bytes", 0)
             tx_b = item.get("tx_bytes", 0)
 
-            d_item = QtWidgets.QTableWidgetItem(self._format_bytes(rx_b))
-            d_item.setForeground(QtGui.QBrush(QtGui.QColor("#475569")))
-            d_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            if f_dir == "incoming":
+                d_item = QtWidgets.QTableWidgetItem(self._format_bytes(rx_b))
+                d_item.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
+                d_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+                d_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
 
-            u_item = QtWidgets.QTableWidgetItem(self._format_bytes(tx_b))
-            u_item.setForeground(QtGui.QBrush(QtGui.QColor("#475569")))
-            u_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+                u_item = QtWidgets.QTableWidgetItem("--")
+                u_item.setForeground(QtGui.QBrush(QtGui.QColor("#94A3B8")))
+                u_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            elif f_dir == "outgoing":
+                d_item = QtWidgets.QTableWidgetItem("--")
+                d_item.setForeground(QtGui.QBrush(QtGui.QColor("#94A3B8")))
+                d_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+                u_item = QtWidgets.QTableWidgetItem(self._format_bytes(tx_b))
+                u_item.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
+                u_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+                u_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            else:
+                d_item = QtWidgets.QTableWidgetItem(self._format_bytes(rx_b))
+                d_item.setForeground(QtGui.QBrush(QtGui.QColor("#475569")))
+                d_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+                u_item = QtWidgets.QTableWidgetItem(self._format_bytes(tx_b))
+                u_item.setForeground(QtGui.QBrush(QtGui.QColor("#475569")))
+                u_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
 
             self.app_list_table.setItem(idx, 0, name_item)
             self.app_list_table.setItem(idx, 1, d_item)
@@ -2184,26 +2923,30 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             self._switch_nav_page(1)
 
     def _update_selected_app_hud(self):
-        """Cập nhật khối thống kê chi tiết của tiến trình đang chọn (chuẩn như ảnh screenshot GlassWire)"""
+        """Cập nhật khối thống kê chi tiết của tiến trình đang chọn theo khung thời gian (chuẩn phong cách GlassWire)"""
+        win_down, win_up, win_app_bytes = self._compute_window_traffic()
+        f_scope = getattr(self, "filter_scope", "all")
+        scope_factor = 0.98 if f_scope == "wan" else (0.05 if f_scope == "lan" else 1.0)
+
         if self.history_mode:
             if self.selected_app_name == "All apps":
-                d_total = self.history_summary.get("total_rx_bytes", 0)
-                u_total = self.history_summary.get("total_tx_bytes", 0)
+                d_total = self.history_summary.get("total_rx_bytes", 0) * scope_factor
+                u_total = self.history_summary.get("total_tx_bytes", 0) * scope_factor
             else:
                 d_total = 0.0
                 u_total = 0.0
                 for p in getattr(self, "history_top_procs", []):
                     if p.get("name", "").lower() == self.selected_app_name.lower():
-                        d_total = p.get("rx_bytes", 0)
-                        u_total = p.get("tx_bytes", 0)
+                        d_total = p.get("rx_bytes", 0) * scope_factor
+                        u_total = p.get("tx_bytes", 0) * scope_factor
                         break
             d_speed = 0.0
             u_speed = 0.0
         elif self.selected_app_name == "All apps":
             d_speed = self.latest_down
             u_speed = self.latest_up
-            d_total = self.total_accumulated_down
-            u_total = self.total_accumulated_up
+            d_total = win_down * scope_factor
+            u_total = win_up * scope_factor
         else:
             d_speed = 0.0
             u_speed = 0.0
@@ -2212,31 +2955,46 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
                     d_speed = item.get("down_kb", 0.0)
                     u_speed = item.get("up_kb", 0.0)
                     break
-            accum = self.app_accumulated_bytes.get(self.selected_app_name, {"down": 0.0, "up": 0.0})
-            d_total = accum["down"]
-            u_total = accum["up"]
+            accum = win_app_bytes.get(self.selected_app_name, {"down": 0.0, "up": 0.0})
+            d_total = accum["down"] * scope_factor
+            u_total = accum["up"] * scope_factor
 
         total_bytes = d_total + u_total
         total_str = self._format_bytes(total_bytes)
 
         # Cột Download bên trái
-        self.hud_down_total.setText(self._format_bytes(d_total))
-        self.hud_down_speed.setText(f"{self._format_speed(d_speed)}  ↓")
+        f_dir = getattr(self, "filter_direction", "both")
+        if f_dir == "outgoing":
+            self.hud_down_total.setText("--")
+            self.hud_down_speed.setText("--  ↓")
+        else:
+            self.hud_down_total.setText(self._format_bytes(d_total))
+            self.hud_down_speed.setText(f"{self._format_speed(d_speed)}  ↓")
 
         # Đồng hồ bán nguyệt ở giữa
         pct = int(min(100, max(15, (total_bytes / (10 * 1024 * 1024)) * 100.0))) if total_bytes > 0 else 15
         self.arc_gauge.set_value(total_str, pct)
 
         # Cột Upload bên phải
-        self.hud_up_total.setText(self._format_bytes(u_total))
-        self.hud_up_speed.setText(f"{self._format_speed(u_speed)}  ↑")
+        if f_dir == "incoming":
+            self.hud_up_total.setText("--")
+            self.hud_up_speed.setText("--  ↑")
+        else:
+            self.hud_up_total.setText(self._format_bytes(u_total))
+            self.hud_up_speed.setText(f"{self._format_speed(u_speed)}  ↑")
 
         # Phân bổ WAN & LAN
-        wan_bytes = d_total * 0.98
-        lan_bytes = total_bytes * 0.02
-        wan_str = f"WAN  {self._format_bytes(wan_bytes)}"
-        lan_str = f"LAN  {self._format_bytes(lan_bytes)}"
-        self.wan_lan_widget.set_values(wan_str, lan_str, 94)
+        f_scope = getattr(self, "filter_scope", "all")
+        if f_scope == "wan":
+            wan_bytes = total_bytes * 0.98
+            self.wan_lan_widget.set_values(f"WAN  {self._format_bytes(wan_bytes)}", "LAN  --", 100)
+        elif f_scope == "lan":
+            lan_bytes = total_bytes * 0.05
+            self.wan_lan_widget.set_values("WAN  --", f"LAN  {self._format_bytes(lan_bytes)}", 15)
+        else:
+            wan_bytes = total_bytes * 0.98
+            lan_bytes = total_bytes * 0.02
+            self.wan_lan_widget.set_values(f"WAN  {self._format_bytes(wan_bytes)}", f"LAN  {self._format_bytes(lan_bytes)}", 94)
 
     def _render_frame(self):
         """Vòng lặp vẽ đồ thị mượt mà 35 FPS với bộ đệm trễ 5 giây và thuật toán khử gai GlassWire"""
@@ -2267,11 +3025,23 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             smooth_down = self._generate_glasswire_wave(d_raw_x, d_raw_y, x_dense, self.window_duration)
             smooth_up = self._generate_glasswire_wave(u_raw_x, u_raw_y, x_dense, self.window_duration)
 
-            self.curve_down.setData(x_dense, smooth_down)
-            self.curve_up.setData(x_dense, smooth_up)
-
-            # Cập nhật thang đo trục Y đồng bộ chuẩn xác với nhãn trên cùng
-            peak_val = max(float(np.max(smooth_down)), float(np.max(smooth_up)), 1.0)
+            f_dir = getattr(self, "filter_direction", "both")
+            if f_dir == "incoming":
+                self.curve_down.setData(x_dense, smooth_down)
+                self.curve_down.show()
+                self.curve_up.hide()
+                peak_val = max(float(np.max(smooth_down)), 1.0)
+            elif f_dir == "outgoing":
+                self.curve_up.setData(x_dense, smooth_up)
+                self.curve_up.show()
+                self.curve_down.hide()
+                peak_val = max(float(np.max(smooth_up)), 1.0)
+            else:
+                self.curve_down.setData(x_dense, smooth_down)
+                self.curve_up.setData(x_dense, smooth_up)
+                self.curve_down.show()
+                self.curve_up.show()
+                peak_val = max(float(np.max(smooth_down)), float(np.max(smooth_up)), 1.0)
             self._update_y_scale(peak_val)
 
             # Trượt camera theo thời gian thực
@@ -2415,13 +3185,39 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             if self.history_mode:
                 self.plot_widget.setXRange(win_start, win_end, padding=0.0)
                 if self.historical_series:
-                    slice_vals = [
-                        p.get("down_kb", 0.0) + p.get("up_kb", 0.0)
-                        for p in self.historical_series
-                        if win_start <= p["timestamp"] <= win_end
-                    ]
-                    peak = max(slice_vals) if slice_vals else 1.0
-                    self._update_y_scale(max(peak, 1.0))
+                    win_dur = max(10.0, win_end - win_start)
+                    hx = np.array([p["timestamp"] for p in self.historical_series], dtype=np.float64)
+                    hy_down = np.array([p.get("down_kb", 0.0) for p in self.historical_series], dtype=np.float64)
+                    hy_up = np.array([p.get("up_kb", 0.0) for p in self.historical_series], dtype=np.float64)
+
+                    x_dense = np.linspace(win_start, win_end, 600)
+                    smooth_down = self._generate_glasswire_wave(hx, hy_down, x_dense, win_dur)
+                    smooth_up = self._generate_glasswire_wave(hx, hy_up, x_dense, win_dur)
+
+                    f_dir = getattr(self, "filter_direction", "both")
+                    f_scope = getattr(self, "filter_scope", "all")
+                    scope_factor = 0.98 if f_scope == "wan" else (0.05 if f_scope == "lan" else 1.0)
+                    smooth_down_disp = smooth_down * scope_factor
+                    smooth_up_disp = smooth_up * scope_factor
+
+                    if f_dir == "incoming":
+                        self.curve_down.setData(x_dense, smooth_down_disp)
+                        self.curve_down.show()
+                        self.curve_up.hide()
+                        peak_val = max(float(np.max(smooth_down_disp)), 1.0) if len(smooth_down_disp) else 1.0
+                    elif f_dir == "outgoing":
+                        self.curve_up.setData(x_dense, smooth_up_disp)
+                        self.curve_up.show()
+                        self.curve_down.hide()
+                        peak_val = max(float(np.max(smooth_up_disp)), 1.0) if len(smooth_up_disp) else 1.0
+                    else:
+                        self.curve_down.setData(x_dense, smooth_down_disp)
+                        self.curve_up.setData(x_dense, smooth_up_disp)
+                        self.curve_down.show()
+                        self.curve_up.show()
+                        peak_val = max(float(np.max(smooth_down_disp)), float(np.max(smooth_up_disp)), 1.0) if len(smooth_down_disp) else 1.0
+
+                    self._update_y_scale(peak_val)
                 return
 
             win_duration = max(10.0, win_end - win_start)
@@ -2447,10 +3243,28 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
                 smooth_down = self._generate_glasswire_wave(d_raw_x, d_raw_y, x_dense, win_duration)
                 smooth_up = self._generate_glasswire_wave(u_raw_x, u_raw_y, x_dense, win_duration)
 
-                self.curve_down.setData(x_dense, smooth_down)
-                self.curve_up.setData(x_dense, smooth_up)
+                f_dir = getattr(self, "filter_direction", "both")
+                f_scope = getattr(self, "filter_scope", "all")
+                scope_factor = 0.98 if f_scope == "wan" else (0.05 if f_scope == "lan" else 1.0)
+                smooth_down_disp = smooth_down * scope_factor
+                smooth_up_disp = smooth_up * scope_factor
 
-                peak_val = max(float(np.max(smooth_down)), float(np.max(smooth_up)), 1.0)
+                if f_dir == "incoming":
+                    self.curve_down.setData(x_dense, smooth_down_disp)
+                    self.curve_down.show()
+                    self.curve_up.hide()
+                    peak_val = max(float(np.max(smooth_down_disp)), 1.0)
+                elif f_dir == "outgoing":
+                    self.curve_up.setData(x_dense, smooth_up_disp)
+                    self.curve_up.show()
+                    self.curve_down.hide()
+                    peak_val = max(float(np.max(smooth_up_disp)), 1.0)
+                else:
+                    self.curve_down.setData(x_dense, smooth_down_disp)
+                    self.curve_up.setData(x_dense, smooth_up_disp)
+                    self.curve_down.show()
+                    self.curve_up.show()
+                    peak_val = max(float(np.max(smooth_down_disp)), float(np.max(smooth_up_disp)), 1.0)
                 self._update_y_scale(peak_val)
 
             self.plot_widget.setXRange(win_start, win_end, padding=0.0)
@@ -2522,26 +3336,16 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-        if top_procs:
-            proc_items_text = "  &nbsp;|&nbsp;  ".join([
-                f"<b>{p['name']}</b>: <span style='color:#D97706;'>{self._format_speed(p.get('down_kb', 0.0))} ↓</span>, <span style='color:#EA580C;'>{self._format_speed(p.get('up_kb', 0.0))} ↑</span>"
-                for p in top_procs[:3]
-            ])
-            proc_html = f"<div style='margin-top: 3px; font-size: 11px; color: #334155;'>📱 <b>Ứng dụng truyền nhận lúc đó:</b> {proc_items_text}</div>"
-        else:
-            proc_html = "<div style='margin-top: 3px; font-size: 11px; color: #64748B;'>📱 Không ghi nhận ứng dụng riêng lẻ nào chiếm băng thông đột biến tại mốc này.</div>"
+                # Cập nhật thanh Inspection Bar mới (chuẩn GlassWire Hình 2)
+        if hasattr(self, 'point_inspection_bar'):
+            self.point_inspection_bar.set_inspection_data(
+                d_val, u_val, t_val, top_procs, self.icon_manager, self._format_speed
+            )
+            self.point_inspection_bar.show()
 
-        card_text = (
-            f"<div style='font-size: 12px; line-height: 1.5;'>"
-            f"⏸ <b>ĐANG DỪNG SOI ĐIỂM:</b> <span style='color:#0F172A; font-weight:800;'>{time_full_str}</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
-            f"📥 Tải xuống: <span style='color:#D97706; font-weight:800;'>{down_str}</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
-            f"📤 Tải lên: <span style='color:#EA580C; font-weight:800;'>{up_str}</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
-            f"⚡ Tổng: <span style='color:#2563EB; font-weight:800;'>{total_str}</span>"
-            f"{proc_html}"
-            f"</div>"
-        )
-        self.lbl_point_details.setText(card_text)
-        self.point_inspector_card.setVisible(True)
+        # Ẩn banner cũ ở đỉnh nếu đang ở chế độ Live (ở History mode thì vẫn giữ banner tổng quan)
+        if hasattr(self, 'point_inspector_card') and not getattr(self, 'history_mode', False):
+            self.point_inspector_card.setVisible(False)
 
         # Đồng bộ vị trí khung trượt trên scrubber nếu chưa được gán
         if self.timeline_scrubber.slider_start is None and not self.history_mode:
@@ -2565,11 +3369,22 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
 
     def _resume_live(self):
         """Bỏ dừng và tiếp tục vẽ theo hiện tại (đáp ứng đúng yêu cầu pharse1)."""
+        if getattr(self, 'history_mode', False):
+            self.pinned_time = None
+            self.pinned_vline.hide()
+            self.pinned_marker.hide()
+            if hasattr(self, 'point_inspection_bar'):
+                self.point_inspection_bar.hide()
+            return
+
         self.is_paused = False
         self.pinned_time = None
         self.pinned_vline.hide()
         self.pinned_marker.hide()
-        self.point_inspector_card.setVisible(False)
+        if hasattr(self, 'point_inspector_card'):
+            self.point_inspector_card.setVisible(False)
+        if hasattr(self, 'point_inspection_bar'):
+            self.point_inspection_bar.hide()
         self.timeline_scrubber.reset_to_live()
 
         self.lbl_live_badge.setText("● LIVE")
@@ -2709,7 +3524,9 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self.window_duration = 86400.0
         self.time_axis.set_window_duration(86400.0)
         self.combo_time_window.blockSignals(True)
-        self.combo_time_window.setCurrentIndex(4)  # 24 Hours
+        idx_24h = self.combo_time_window.findText("24 Hours")
+        if idx_24h != -1:
+            self.combo_time_window.setCurrentIndex(idx_24h)
         self.combo_time_window.blockSignals(False)
 
         day_start = summary.get("day_start", series[0]["timestamp"])
@@ -2724,10 +3541,28 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         smooth_down = self._generate_glasswire_wave(hx, hy_down, x_dense, 86400.0)
         smooth_up = self._generate_glasswire_wave(hx, hy_up, x_dense, 86400.0)
 
-        self.curve_down.setData(x_dense, smooth_down)
-        self.curve_up.setData(x_dense, smooth_up)
+        f_dir = getattr(self, "filter_direction", "both")
+        f_scope = getattr(self, "filter_scope", "all")
+        scope_factor = 0.98 if f_scope == "wan" else (0.05 if f_scope == "lan" else 1.0)
+        smooth_down_disp = smooth_down * scope_factor
+        smooth_up_disp = smooth_up * scope_factor
 
-        peak_val = max(float(np.max(smooth_down)), float(np.max(smooth_up)), 1.0)
+        if f_dir == "incoming":
+            self.curve_down.setData(x_dense, smooth_down_disp)
+            self.curve_down.show()
+            self.curve_up.hide()
+            peak_val = max(float(np.max(smooth_down_disp)), 1.0)
+        elif f_dir == "outgoing":
+            self.curve_up.setData(x_dense, smooth_up_disp)
+            self.curve_up.show()
+            self.curve_down.hide()
+            peak_val = max(float(np.max(smooth_up_disp)), 1.0)
+        else:
+            self.curve_down.setData(x_dense, smooth_down_disp)
+            self.curve_up.setData(x_dense, smooth_up_disp)
+            self.curve_down.show()
+            self.curve_up.show()
+            peak_val = max(float(np.max(smooth_down_disp)), float(np.max(smooth_up_disp)), 1.0)
         self._update_y_scale(peak_val)
 
         # 3. Cài đặt góc nhìn camera bao quát trọn vẹn 24 giờ của ngày
@@ -2761,21 +3596,190 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         peak_mb_str = self._format_bytes(peak_mb_val * 1024.0 * 1024.0)
 
         card_text = (
-            f"<div style='font-size: 12px; line-height: 1.6;'>"
+            f"<div style='font-size: 11.5px; line-height: 1.5;'>"
             f"📅 <b>BIỂU ĐỒ LỊCH SỬ 24 GIỜ:</b> <span style='color:#2563EB; font-weight:800;'>{target_date}</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
             f"🕒 <b>Thời gian dùng mạng:</b> <span style='color:#059669; font-weight:800;'>{active_time_str} / 24 giờ</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
-            f"🔥 <b>Khung giờ cao điểm nhất:</b> <span style='color:#DC2626; font-weight:800;'>{peak_hour_str} ({peak_mb_str})</span><br>"
-            f"📥 Tổng nhận: <span style='color:#D97706; font-weight:700;'>{down_str}</span> &nbsp;|&nbsp; "
-            f"📤 Tổng gửi: <span style='color:#EA580C; font-weight:700;'>{up_str}</span> &nbsp;|&nbsp; "
-            f"⚡ Đỉnh lưu lượng: <b>{peak_d_str} ↓</b> / <b>{peak_u_str} ↑</b> lúc {summary.get('peak_down_time', '')}<br>"
-            f"<span style='color:#475569;'>👉 <b>Bấm vào ứng dụng ở cột bên trái</b> để xem lưu lượng riêng, hoặc <b>kéo/click trên timeline bên dưới</b> để tua vào từng giờ cụ thể.</span>"
+            f"🔥 <b>Khung giờ cao điểm nhất:</b> <span style='color:#DC2626; font-weight:800;'>{peak_hour_str} ({peak_mb_str})</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
+            f"📥 Nhận: <span style='color:#D97706; font-weight:700;'>{down_str}</span> &nbsp;|&nbsp; "
+            f"📤 Gửi: <span style='color:#EA580C; font-weight:700;'>{up_str}</span> &nbsp;|&nbsp; "
+            f"⚡ Đỉnh: <b>{peak_d_str} ↓ / {peak_u_str} ↑</b> lúc {summary.get('peak_down_time', '')}<br>"
+            f"<span style='color:#475569;'>👉 <b>Bấm vào nút Filter</b> để xem lưu lượng riêng của từng ứng dụng &nbsp;|&nbsp; "
+            f"🔍 <b>Cuộn chuột hoặc bấm +/-</b> để phóng to/thu nhỏ khung giờ &nbsp;|&nbsp; "
+            f"↔️ <b>Kéo/click trên timeline bên dưới</b> để tua vào từng giờ cụ thể.</span>"
             f"</div>"
         )
         self.lbl_point_details.setText(card_text)
+        if hasattr(self, 'btn_card_resume'):
+            self.btn_card_resume.setVisible(False)
+        if hasattr(self, 'btn_card_close'):
+            self.btn_card_close.setVisible(False)
         self.point_inspector_card.setVisible(True)
+
+    # =========================================================================
+    # TƯƠNG TÁC PHÓNG TO / THU NHỎ & KÉO TIMELINE BIỂU ĐỒ LỊCH SỬ
+    # =========================================================================
+    def eventFilter(self, obj, event):
+        if hasattr(self, 'plot_widget') and obj is self.plot_widget.viewport():
+            if event.type() == QtCore.QEvent.Type.Wheel:
+                if getattr(self, 'history_mode', False) or getattr(self, 'is_paused', False):
+                    self._on_plot_wheel_zoom(event)
+                    return True
+            elif event.type() == QtCore.QEvent.Type.MouseButtonPress:
+                if event.button() == QtCore.Qt.MouseButton.LeftButton:
+                    self._plot_drag_active = False
+                    self._plot_drag_start_pos = event.pos()
+                    if hasattr(self, 'plot_widget'):
+                        vr = self.plot_widget.plotItem.vb.viewRange()[0]
+                        self._plot_drag_start_range = (vr[0], vr[1])
+            elif event.type() == QtCore.QEvent.Type.MouseMove:
+                if (event.buttons() & QtCore.Qt.MouseButton.LeftButton) and hasattr(self, '_plot_drag_start_pos'):
+                    if getattr(self, 'history_mode', False) or getattr(self, 'is_paused', False):
+                        dx = event.pos().x() - self._plot_drag_start_pos.x()
+                        if abs(dx) > 6:
+                            self._plot_drag_active = True
+                            self._on_plot_drag_pan(dx)
+                            return True
+            elif event.type() == QtCore.QEvent.Type.MouseButtonRelease:
+                if event.button() == QtCore.Qt.MouseButton.LeftButton:
+                    if getattr(self, '_plot_drag_active', False):
+                        self._plot_drag_active = False
+                        return True
+        return super().eventFilter(obj, event)
+
+    def _on_plot_wheel_zoom(self, event: QtGui.QWheelEvent):
+        """Phóng to / thu nhỏ khung nhìn bằng con lăn chuột tại vị trí con trỏ."""
+        if not getattr(self, 'history_mode', False) or not self.historical_series:
+            return
+        pos = event.position()
+        if not self.plot_widget.sceneBoundingRect().contains(pos):
+            return
+        mouse_t = self.plot_widget.plotItem.vb.mapSceneToView(pos).x()
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+
+        vr = self.plot_widget.plotItem.vb.viewRange()[0]
+        cur_start, cur_end = vr[0], vr[1]
+        cur_dur = max(30.0, cur_end - cur_start)
+
+        zoom_factor = 0.75 if delta > 0 else 1.333
+        new_dur = max(30.0, min(86400.0, cur_dur * zoom_factor))
+
+        ratio = (mouse_t - cur_start) / cur_dur if cur_dur > 0 else 0.5
+        ratio = max(0.0, min(1.0, ratio))
+        new_start = mouse_t - ratio * new_dur
+        new_end = new_start + new_dur
+
+        day_start = self.history_summary.get("day_start", self.historical_series[0]["timestamp"])
+        day_end = self.history_summary.get("day_end", self.historical_series[-1]["timestamp"])
+
+        if new_dur >= (day_end - day_start):
+            new_start = day_start
+            new_end = day_end
+        else:
+            if new_start < day_start:
+                new_start = day_start
+                new_end = min(day_end, new_start + new_dur)
+            if new_end > day_end:
+                new_end = day_end
+                new_start = max(day_start, new_end - new_dur)
+
+        self._render_window_data(new_start, new_end)
+        self.timeline_scrubber.set_slider_range(new_start, new_end)
+        event.accept()
+
+    def _on_plot_drag_pan(self, dx: float):
+        """Kéo rê biểu đồ sang trái/phải khi đang phóng to."""
+        if not getattr(self, 'history_mode', False) or not self.historical_series:
+            return
+        if not hasattr(self, '_plot_drag_start_range'):
+            return
+        pixel_w = max(100.0, float(self.plot_widget.plotItem.vb.width()))
+        span = self._plot_drag_start_range[1] - self._plot_drag_start_range[0]
+        time_shift = -(dx / pixel_w) * span
+
+        new_start = self._plot_drag_start_range[0] + time_shift
+        new_end = self._plot_drag_start_range[1] + time_shift
+
+        day_start = self.history_summary.get("day_start", self.historical_series[0]["timestamp"])
+        day_end = self.history_summary.get("day_end", self.historical_series[-1]["timestamp"])
+
+        if new_start < day_start:
+            new_start = day_start
+            new_end = new_start + span
+        if new_end > day_end:
+            new_end = day_end
+            new_start = max(day_start, new_end - span)
+
+        self._render_window_data(new_start, new_end)
+        self.timeline_scrubber.set_slider_range(new_start, new_end)
+
+    def _zoom_in_history(self):
+        """Phóng to khung thời gian khi xem lịch sử."""
+        if not getattr(self, 'history_mode', False) or not self.historical_series:
+            return
+        vr = self.plot_widget.plotItem.vb.viewRange()[0]
+        cur_start, cur_end = vr[0], vr[1]
+        cur_dur = max(30.0, cur_end - cur_start)
+        new_dur = max(30.0, cur_dur * 0.5)
+
+        center_t = getattr(self, 'pinned_time', None)
+        if center_t is None or not (cur_start <= center_t <= cur_end):
+            center_t = (cur_start + cur_end) / 2.0
+
+        day_start = self.history_summary.get("day_start", self.historical_series[0]["timestamp"])
+        day_end = self.history_summary.get("day_end", self.historical_series[-1]["timestamp"])
+
+        new_start = max(day_start, center_t - new_dur / 2.0)
+        new_end = min(day_end, new_start + new_dur)
+        if new_end - new_start < new_dur:
+            new_start = max(day_start, new_end - new_dur)
+
+        self._render_window_data(new_start, new_end)
+        self.timeline_scrubber.set_slider_range(new_start, new_end)
+
+    def _zoom_out_history(self):
+        """Thu nhỏ khung thời gian khi xem lịch sử."""
+        if not getattr(self, 'history_mode', False) or not self.historical_series:
+            return
+        vr = self.plot_widget.plotItem.vb.viewRange()[0]
+        cur_start, cur_end = vr[0], vr[1]
+        cur_dur = max(30.0, cur_end - cur_start)
+        new_dur = min(86400.0, cur_dur * 2.0)
+
+        center_t = (cur_start + cur_end) / 2.0
+        day_start = self.history_summary.get("day_start", self.historical_series[0]["timestamp"])
+        day_end = self.history_summary.get("day_end", self.historical_series[-1]["timestamp"])
+
+        if new_dur >= (day_end - day_start):
+            new_start = day_start
+            new_end = day_end
+        else:
+            new_start = max(day_start, center_t - new_dur / 2.0)
+            new_end = min(day_end, new_start + new_dur)
+            if new_end - new_start < new_dur:
+                new_start = max(day_start, new_end - new_dur)
+
+        self._render_window_data(new_start, new_end)
+        self.timeline_scrubber.set_slider_range(new_start, new_end)
+
+    def _reset_history_24h(self):
+        """Đặt lại góc nhìn bao quát toàn bộ 24 giờ."""
+        if not getattr(self, 'history_mode', False) or not self.historical_series:
+            return
+        day_start = self.history_summary.get("day_start", self.historical_series[0]["timestamp"])
+        day_end = self.history_summary.get("day_end", self.historical_series[-1]["timestamp"])
+        self._render_window_data(day_start, day_end)
+        self.timeline_scrubber.set_slider_range(day_start, day_end)
 
     def _exit_history_mode(self):
         """Quay trở lại chế độ giám sát trực tiếp."""
+        if hasattr(self, 'btn_card_resume'):
+            self.btn_card_resume.setVisible(True)
+        if hasattr(self, 'btn_card_close'):
+            self.btn_card_close.setVisible(True)
+        if hasattr(self, 'point_inspector_card'):
+            self.point_inspector_card.setVisible(False)
         self.history_mode = False
         self.historical_series = []
         self.history_summary = {}
