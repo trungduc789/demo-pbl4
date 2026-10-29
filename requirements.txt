@@ -1,0 +1,6 @@
+PyQt6>=6.0.0
+pyqtgraph>=0.14.0
+numpy>=2.0.0
+psutil>=7.0.0
+mysql-connector-python>=8.0.0
+pydivert>=4.0.0
