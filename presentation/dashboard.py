@@ -22,9 +22,11 @@ from presentation.glasswire_icons import (
     get_graph_toggle_icon,
     get_usage_toggle_icon,
     get_filter_icon,
+    get_fleet_icon,
 )
 from presentation.traffic_usage_view import GlassWireUsageView
 from presentation.protect_view import GlassWireProtectView
+from presentation.admin_fleet_view import AdminFleetView
 
 
 # Bảng tham số làm mịn và hiển thị riêng biệt chuẩn hóa cho từng mốc thời gian (Scale-tailored smoothing)
@@ -993,13 +995,17 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
     - Tab 4 (Network Scanner): Bảng Socket TCP (IP, Cổng, Giao thức, Trạng thái).
     """
 
-    def __init__(self, monitor_service: MonitorService):
+    def __init__(self, monitor_service: Optional[MonitorService] = None, fleet_service=None):
         super().__init__()
         self.service = monitor_service
+        self.fleet_service = fleet_service
+        self.is_admin_mode = bool(fleet_service is not None)
+        self.selected_device_uuid: Optional[str] = None
         self.window_duration = 300.0  # Mặc định 5 phút như GlassWire
         self.render_delay = 5.0       # Lookahead buffer 5 giây chống giật tuyệt đối
         self.icon_manager = ProcessIconManager()
         self.async_bridge = AsyncSignalBridge(self)
+
 
         # Thang đo trần chuẩn mực GlassWire (KB/s)
         self.CEILING_TIERS_KB = [
@@ -1175,31 +1181,147 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         header_widget = self._create_glasswire_header()
         main_layout.addWidget(header_widget)
 
-        # Trang 0: Traffic Monitor (Split-view chuẩn GlassWire)
+        # 3. Thanh Breadcrumb điều hướng khi xem máy con cụ thể (Admin Mode)
+        self.breadcrumb_bar = self._create_breadcrumb_bar()
+        self.breadcrumb_bar.setVisible(False)
+        main_layout.addWidget(self.breadcrumb_bar)
+
+        # Nếu ở chế độ Quản trị (Admin Mode): Trang 0 là Fleet Manager
+        if self.is_admin_mode:
+            self.fleet_view = AdminFleetView()
+            self.fleet_view.machine_selected.connect(self._on_machine_selected_for_control)
+            self.stacked_pages.addWidget(self.fleet_view)
+
+        # Trang Traffic Monitor (Split-view chuẩn GlassWire)
         self.page_traffic_monitor = QtWidgets.QWidget()
         self._setup_traffic_monitor_page(self.page_traffic_monitor)
         self.stacked_pages.addWidget(self.page_traffic_monitor)
 
-        # Trang 1: GlassWire Protect (WinDivert Kernel Packet Shaper)
+        # Trang GlassWire Protect (WinDivert Kernel Packet Shaper)
         self.page_protect = QtWidgets.QWidget()
         self._setup_protect_page(self.page_protect)
         self.stacked_pages.addWidget(self.page_protect)
 
-        # Trang 2: Log Analysis (MySQL Integrity & Event History)
+        # Trang Log Analysis (MySQL Integrity & Event History)
         self.page_logs = QtWidgets.QWidget()
         self._setup_logs_page(self.page_logs)
         self.stacked_pages.addWidget(self.page_logs)
 
-        # Trang 3: Network Scanner (TCP/UDP Sockets & Remote IPs)
+        # Trang Network Scanner (TCP/UDP Sockets & Remote IPs)
         self.page_scanner = QtWidgets.QWidget()
         self._setup_scanner_page(self.page_scanner)
         self.stacked_pages.addWidget(self.page_scanner)
-
 
         main_layout.addWidget(self.stacked_pages)
         self._switch_nav_page(0)
 
         self.setCentralWidget(container)
+
+    def _create_breadcrumb_bar(self) -> QtWidgets.QFrame:
+        """Tạo thanh Breadcrumb điều hướng quay lại danh sách máy trạm."""
+        bar = QtWidgets.QFrame()
+        bar.setFixedHeight(38)
+        bar.setStyleSheet("""
+            QFrame {
+                background-color: #EFF6FF;
+                border-bottom: 1px solid #BFDBFE;
+                padding: 2px 14px;
+            }
+        """)
+        layout = QtWidgets.QHBoxLayout(bar)
+        layout.setContentsMargins(14, 0, 14, 0)
+        layout.setSpacing(12)
+
+        btn_back = QtWidgets.QPushButton("⬅️ Quay lại Danh Sách Máy")
+        btn_back.setFixedHeight(26)
+        btn_back.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        btn_back.setStyleSheet("""
+            QPushButton {
+                background-color: #2563EB;
+                color: #FFFFFF;
+                font-weight: bold;
+                font-size: 11px;
+                border-radius: 13px;
+                padding: 2px 14px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #1D4ED8;
+            }
+        """)
+        btn_back.clicked.connect(self._return_to_fleet_view)
+        layout.addWidget(btn_back)
+
+        self.lbl_breadcrumb_info = QtWidgets.QLabel("Đang giám sát máy...")
+        self.lbl_breadcrumb_info.setStyleSheet("font-size: 12px; font-weight: 600; color: #1E3A8A;")
+        layout.addWidget(self.lbl_breadcrumb_info)
+        layout.addStretch()
+
+        return bar
+
+    def _on_machine_selected_for_control(self, device_uuid: str):
+        """Khi Admin click chọn 1 máy trong Fleet View: chuyển sang chế độ Remote Detail View."""
+        self.selected_device_uuid = device_uuid
+        dev_state = self.fleet_service.get_device_state(device_uuid) if self.fleet_service else None
+        hostname = dev_state.hostname if dev_state else "Unknown"
+        ip = dev_state.ip_address if dev_state else "127.0.0.1"
+
+        if hasattr(self, 'protect_view'):
+            self.protect_view.set_remote_mode(
+                device_uuid, self.fleet_service.send_remote_command if self.fleet_service else None
+            )
+
+        self.breadcrumb_bar.setVisible(True)
+        self.lbl_breadcrumb_info.setText(
+            f"Đang giám sát & can thiệp máy con: <b>{hostname}</b> ({ip}) — [UUID: {device_uuid[:8]}...]"
+        )
+
+        # Chuyển sang Tab Traffic Monitor (index 1 trong Admin Mode)
+        target_tab = 1 if self.is_admin_mode else 0
+        self._switch_nav_page(target_tab)
+
+    def _return_to_fleet_view(self):
+        """Quay lại màn hình danh sách toàn bộ máy trạm."""
+        self.selected_device_uuid = None
+        self.breadcrumb_bar.setVisible(False)
+        if hasattr(self, 'protect_view'):
+            self.protect_view.set_remote_mode(None, None)
+        self._switch_nav_page(0)
+
+    def _refresh_fleet_admin_ui(self):
+        """Cập nhật dữ liệu từ FleetManagerService lên giao diện Admin định kỳ."""
+        if not self.fleet_service or not hasattr(self, 'fleet_view'):
+            return
+        summary = self.fleet_service.get_fleet_summary()
+        devices = self.fleet_service.get_all_device_states()
+        self.fleet_view.update_fleet_data(devices, summary)
+
+        # Nếu đang giám sát một máy cụ thể thì nạp data của máy đó vào biểu đồ
+        if self.selected_device_uuid:
+            dev_state = self.fleet_service.get_device_state(self.selected_device_uuid)
+            if dev_state and dev_state.latest_telemetry:
+                telem = dev_state.latest_telemetry
+                proc_speeds = []
+                for p in telem.top_processes:
+                    proc_speeds.append({
+                        "name": p.name,
+                        "pid": p.pid,
+                        "down_kb": p.down_kbps,
+                        "up_kb": p.up_kbps,
+                        "rx_bytes": int(p.down_kbps * 1024),
+                        "tx_bytes": int(p.up_kbps * 1024),
+                        "exe": "",
+                    })
+                down_spd = telem.speeds.download_kbps
+                up_spd = telem.speeds.upload_kbps
+                self._on_new_sample(
+                    telem.timestamp,
+                    down_spd,
+                    up_spd,
+                    proc_speeds,
+                    down_spd,
+                    up_spd
+                )
 
     # =========================================================================
     # HEADER THANH ĐIỀU HƯỚNG GLASSWIRE (NAV TABS + LOGO + UPGRADE)
@@ -1214,12 +1336,21 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
 
         # Các Tab điều hướng chính
         self.nav_buttons: List[QtWidgets.QPushButton] = []
-        self.nav_tabs_info = [
-            ("Traffic\nMonitor", 0, get_traffic_monitor_icon),
-            ("Protect", 1, get_protect_icon),
-            ("Log\nAnalysis", 2, get_log_analysis_icon),
-            ("Network\nScanner", 3, get_network_scanner_icon),
-        ]
+        if self.is_admin_mode:
+            self.nav_tabs_info = [
+                ("Fleet\nManager", 0, get_fleet_icon),
+                ("Traffic\nMonitor", 1, get_traffic_monitor_icon),
+                ("Protect", 2, get_protect_icon),
+                ("Log\nAnalysis", 3, get_log_analysis_icon),
+                ("Network\nScanner", 4, get_network_scanner_icon),
+            ]
+        else:
+            self.nav_tabs_info = [
+                ("Traffic\nMonitor", 0, get_traffic_monitor_icon),
+                ("Protect", 1, get_protect_icon),
+                ("Log\nAnalysis", 2, get_log_analysis_icon),
+                ("Network\nScanner", 3, get_network_scanner_icon),
+            ]
 
         nav_container = QtWidgets.QHBoxLayout()
         nav_container.setSpacing(8)
@@ -1278,14 +1409,28 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
                     }
                 """)
 
-        if index == 1:
-            if hasattr(self, 'protect_view'):
-                self.protect_view.update_protect_table(self.latest_proc_speeds, self.app_accumulated_bytes, self.app_metadata)
-            self._refresh_policy_table()
-        elif index == 2:
-            self._on_enter_usage_history_page()
-        elif index == 3:
-            self._refresh_connections()
+        if self.is_admin_mode:
+            if index == 0:
+                self.breadcrumb_bar.setVisible(False)
+                self._refresh_fleet_admin_ui()
+            elif index == 2:  # Protect view
+                if hasattr(self, 'protect_view'):
+                    self.protect_view.update_protect_table(self.latest_proc_speeds, self.app_accumulated_bytes, self.app_metadata)
+                self._refresh_policy_table()
+            elif index == 3:  # Logs
+                self._on_enter_usage_history_page()
+            elif index == 4:  # Scanner
+                self._refresh_connections()
+        else:
+            if index == 1:
+                if hasattr(self, 'protect_view'):
+                    self.protect_view.update_protect_table(self.latest_proc_speeds, self.app_accumulated_bytes, self.app_metadata)
+                self._refresh_policy_table()
+            elif index == 2:
+                self._on_enter_usage_history_page()
+            elif index == 3:
+                self._refresh_connections()
+
 
     def _setup_traffic_monitor_page(self, parent: QtWidgets.QWidget):
         layout = QtWidgets.QHBoxLayout(parent)
@@ -2406,9 +2551,18 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
     # LOGIC CẬP NHẬT DỮ LIỆU & RENDER VÒNG LẶP
     # =========================================================================
     def _start_worker(self):
-        self.worker = HighFreqNetworkWorker(self.service)
-        self.worker.sample_ready.connect(self._on_new_sample)
-        self.worker.start()
+        if self.service:
+            self.worker = HighFreqNetworkWorker(self.service)
+            self.worker.sample_ready.connect(self._on_new_sample)
+            self.worker.start()
+
+        if self.is_admin_mode and self.fleet_service:
+            self.fleet_timer = QtCore.QTimer()
+            self.fleet_timer.setInterval(1000)
+            self.fleet_timer.timeout.connect(self._refresh_fleet_admin_ui)
+            self.fleet_timer.start()
+            QtCore.QTimer.singleShot(150, self._refresh_fleet_admin_ui)
+
 
     def _start_render_loop(self):
         self.render_timer = QtCore.QTimer()

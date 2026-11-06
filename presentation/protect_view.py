@@ -108,9 +108,11 @@ class ConnectionPillButton(QPushButton):
         self._update_style()
 
     def _toggle_status(self):
-        # Chuyển đổi trạng thái giữa allowed và blocked
+        # Chuyển đổi vòng tròn: allowed -> blocked -> throttled -> allowed
         if self.status == "allowed":
             self.status = "blocked"
+        elif self.status == "blocked":
+            self.status = "throttled"
         else:
             self.status = "allowed"
         self._update_style()
@@ -184,8 +186,22 @@ class GlassWireProtectView(QWidget):
 
         # {app_name: {"in": "allowed"|"blocked"|"throttled", "out": ..., "limit_kbps": 100.0}}
         self.app_policies: Dict[str, Dict] = {}
+        self.remote_device_uuid: Optional[str] = None
+        self.remote_commander: Optional[Any] = None
 
         self._init_ui()
+
+    def set_remote_mode(self, device_uuid: Optional[str], commander_func: Optional[Any]):
+        """Cấu hình chế độ can thiệp từ xa tới máy con cụ thể."""
+        self.remote_device_uuid = device_uuid
+        self.remote_commander = commander_func
+        if device_uuid:
+            self.lbl_driver_status.setText(f"📡 Chế độ điều khiển từ xa: Đang kết nối máy con [{device_uuid[:8]}...]")
+            self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #2563EB;")
+        else:
+            self.lbl_driver_status.setText("🛡️ WinDivert Engine: Đang bảo vệ | Kernel Throttling: Sẵn sàng")
+            self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #059669;")
+
 
     def _init_ui(self):
         main_layout = QVBoxLayout(self)
@@ -410,6 +426,17 @@ class GlassWireProtectView(QWidget):
 
     def _on_firewall_toggled(self, is_active: bool):
         self.is_firewall_active = is_active
+        if self.remote_device_uuid and self.remote_commander:
+            if not is_active:
+                self.remote_commander(self.remote_device_uuid, "UNBLOCK_ALL", "", 0.0, "both")
+                self.remote_commander(self.remote_device_uuid, "REMOVE_LIMIT", "", 0.0, "both")
+                self.lbl_driver_status.setText(f"⚠️ Remote Firewall [{self.remote_device_uuid[:8]}]: Đã TẮT toàn bộ chính sách")
+                self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #DC2626;")
+            else:
+                self.lbl_driver_status.setText(f"🛡️ Remote Firewall [{self.remote_device_uuid[:8]}]: Đã BẬT")
+                self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #059669;")
+            return
+
         if not is_active:
             try:
                 if self.service and hasattr(self.service, 'packet_shaper'):
@@ -422,6 +449,7 @@ class GlassWireProtectView(QWidget):
             self.lbl_driver_status.setText("🛡️ WinDivert Engine: Đang bảo vệ | Kernel Throttling: Sẵn sàng")
             self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #059669;")
             self._reapply_all_policies()
+
 
     def _on_mode_changed(self, idx: int):
         modes = ["Click To Block", "Click To Throttle", "Block All"]
@@ -561,68 +589,179 @@ class GlassWireProtectView(QWidget):
             self.table.setItem(row, 9, item_traffic)
 
     def _on_pill_status_changed(self, app_name: str, direction: str, new_status: str):
-        """Xử lý khi người dùng click vào nút In/Out Connection của một ứng dụng."""
+        """
+        Xử lý khi người dùng click nút In/Out Connection:
+        - allowed  -> Gỡ chặn / gỡ giới hạn cho ứng dụng
+        - blocked  -> Chặn hoàn toàn kết nối mạng (Windows Firewall + WinDivert Drop)
+        - throttled -> Giới hạn băng thông (WinDivert Token Bucket)
+        """
         if app_name not in self.app_policies:
-            self.app_policies[app_name] = {"in": "allowed", "out": "allowed", "limit_kbps": 100.0}
+            self.app_policies[app_name] = {"in": "allowed", "out": "allowed", "limit_kbps": self.default_throttle_kbps}
 
         self.app_policies[app_name][direction] = new_status
 
-        # Tương tác với WinDivert Packet Shaper
-        is_in_blocked = self.app_policies[app_name]["in"] in ("blocked", "throttled")
-        is_out_blocked = self.app_policies[app_name]["out"] in ("blocked", "throttled")
+        # Xác định trạng thái tổng hợp của ứng dụng (ưu tiên blocked > throttled > allowed)
+        in_status = self.app_policies[app_name].get("in", "allowed")
+        out_status = self.app_policies[app_name].get("out", "allowed")
 
-        if is_in_blocked and is_out_blocked:
-            target_dir = "both"
-        elif is_in_blocked:
-            target_dir = "download"
-        elif is_out_blocked:
-            target_dir = "upload"
-        else:
-            target_dir = None
+        # Lấy exe_path từ metadata nếu có
+        exe_path = ""
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 1)
+            if item and item.text().strip() == app_name:
+                break
 
-        if target_dir and self.is_firewall_active and self.service and hasattr(self.service, 'packet_shaper'):
-            limit_kb = 1.0 if new_status == "blocked" else 100.0
+        if not self.is_firewall_active or not self.service:
+            self._update_status_bar()
+            return
+
+        # Xác định hành động chính cần thực hiện
+        effective_status = self._get_effective_status(in_status, out_status)
+        effective_direction = self._get_effective_direction(in_status, out_status)
+
+        # Chế độ điều khiển máy con từ xa (Remote Machine Control)
+        if self.remote_device_uuid and self.remote_commander:
             try:
-                self.service.packet_shaper.start(
-                    target_app=app_name,
-                    limit_kbps=limit_kb,
-                    direction=target_dir
+                if effective_status == "blocked":
+                    ok, msg = self.remote_commander(
+                        self.remote_device_uuid, "BLOCK_APP", app_name, 0.0, effective_direction
+                    )
+                elif effective_status == "throttled":
+                    limit_val = self.app_policies[app_name].get("limit_kbps", self.default_throttle_kbps)
+                    try:
+                        new_lim, ok_diag = QInputDialog.getDouble(
+                            self, "Giới Hạn Băng Thông Từ Xa",
+                            f"Nhập mức giới hạn tốc độ mạng cho '{app_name}' (KB/s):",
+                            limit_val, 1.0, 102400.0, 1
+                        )
+                        if ok_diag:
+                            limit_val = new_lim
+                            self.app_policies[app_name]["limit_kbps"] = limit_val
+                    except Exception:
+                        pass
+
+                    ok, msg = self.remote_commander(
+                        self.remote_device_uuid, "THROTTLE_SET", app_name, limit_val, effective_direction
+                    )
+                else:
+                    ok, msg = self.remote_commander(
+                        self.remote_device_uuid, "UNBLOCK_APP", app_name, 0.0, effective_direction
+                    )
+                    self.remote_commander(
+                        self.remote_device_uuid, "REMOVE_LIMIT", app_name, 0.0, effective_direction
+                    )
+
+                status_color = "#DC2626" if effective_status == "blocked" else ("#D97706" if effective_status == "throttled" else "#059669")
+                self.lbl_driver_status.setText(f"📡 Lệnh gửi tới [{self.remote_device_uuid[:8]}]: {effective_status.upper()} '{app_name}'")
+                self.lbl_driver_status.setStyleSheet(f"font-size: 11px; font-weight: 600; color: {status_color};")
+            except Exception as e:
+                print(f"[Protect Remote Command Error] {e}")
+            self._update_status_bar()
+            return
+
+
+        try:
+            if effective_status == "blocked":
+                # CHẶN HOÀN TOÀN: Windows Firewall rule + WinDivert kernel drop + cắt TCP socket
+                success, msg = self.service.block_application(app_name, direction=effective_direction)
+                print(f"[Protect] BLOCK {app_name} ({effective_direction}): {msg}")
+
+            elif effective_status == "throttled":
+                # Nếu trước đó đang bị block -> gỡ block trước
+                self.service.unblock_application(app_name)
+                # GIỚI HẠN BĂNG THÔNG: WinDivert Token Bucket throttling
+                limit_kbps = self.app_policies[app_name].get("limit_kbps", self.default_throttle_kbps)
+                success, msg = self.service.apply_bandwidth_limit(
+                    app_name, limit_kbps=limit_kbps, direction=effective_direction
                 )
-                print(f"[Protect] Đã kích hoạt can thiệp WinDivert cho {app_name}: {target_dir} ({limit_kb} KB/s)")
-            except Exception as e:
-                print(f"[Protect] Lỗi áp dụng shaper: {e}")
-        elif self.service and hasattr(self.service, 'packet_shaper'):
-            try:
-                self.service.packet_shaper.stop()
-                print(f"[Protect] Đã gỡ bỏ giới hạn WinDivert cho {app_name}")
-            except Exception as e:
-                print(f"[Protect] Lỗi gỡ shaper: {e}")
+                print(f"[Protect] THROTTLE {app_name} ({effective_direction}, {limit_kbps} KB/s): {msg}")
 
-        blocked_count = sum(1 for p in self.app_policies.values() if p.get("in") != "allowed" or p.get("out") != "allowed")
+            else:
+                # CHO PHÉP: Gỡ bỏ mọi chính sách chặn và giới hạn
+                self.service.unblock_application(app_name)
+                self.service.remove_bandwidth_limit()
+                print(f"[Protect] ALLOW {app_name}: Đã gỡ bỏ mọi hạn chế mạng")
+
+        except Exception as e:
+            print(f"[Protect] Lỗi áp dụng chính sách cho {app_name}: {e}")
+
+        self._update_status_bar()
+
+    def _get_effective_status(self, in_status: str, out_status: str) -> str:
+        """Xác định trạng thái ưu tiên cao nhất: blocked > throttled > allowed."""
+        if in_status == "blocked" or out_status == "blocked":
+            return "blocked"
+        if in_status == "throttled" or out_status == "throttled":
+            return "throttled"
+        return "allowed"
+
+    def _get_effective_direction(self, in_status: str, out_status: str) -> str:
+        """Xác định hướng cần can thiệp dựa trên trạng thái In/Out."""
+        in_active = in_status in ("blocked", "throttled")
+        out_active = out_status in ("blocked", "throttled")
+        if in_active and out_active:
+            return "both"
+        elif in_active:
+            return "download"
+        elif out_active:
+            return "upload"
+        return "both"
+
+    def _update_status_bar(self):
+        """Cập nhật thanh trạng thái số tiến trình đang bị chặn/giới hạn."""
+        blocked_count = sum(
+            1 for p in self.app_policies.values()
+            if p.get("in") != "allowed" or p.get("out") != "allowed"
+        )
         self.lbl_active_blocks.setText(f"{blocked_count} tiến trình đang bị điều tiết / chặn")
 
     def unblock_all_apps(self):
-        """Cho phép tất cả ứng dụng truyền tải bình thường."""
+        """Cho phép tất cả ứng dụng truyền tải bình thường - gỡ mọi chính sách chặn và giới hạn."""
+        # 1. Gỡ chặn tất cả ứng dụng qua MonitorService (Windows Firewall + WinDivert)
+        if self.service:
+            try:
+                self.service.unblock_all_applications()
+                self.service.remove_bandwidth_limit()
+                print("[Protect] Đã gỡ bỏ TẤT CẢ chính sách chặn và giới hạn băng thông")
+            except Exception as e:
+                print(f"[Protect] Lỗi khi gỡ chặn tất cả: {e}")
+
+        # 2. Reset trạng thái nội bộ
         for app_name in self.app_policies:
             self.app_policies[app_name]["in"] = "allowed"
             self.app_policies[app_name]["out"] = "allowed"
-        if self.service:
-            self.service.unblock_all_applications()
+
         self.lbl_active_blocks.setText("0 tiến trình đang bị điều tiết / chặn")
+
+        # 3. Cập nhật giao diện - reset tất cả pill về Allowed
         for row in range(self.table.rowCount()):
-            btn_in = self.table.cellWidget(row, 2)
-            if isinstance(btn_in, ConnectionPillButton):
-                btn_in.set_status("allowed")
-            btn_out = self.table.cellWidget(row, 3)
-            if isinstance(btn_out, ConnectionPillButton):
-                btn_out.set_status("allowed")
+            for col in [2, 3]:
+                cell_widget = self.table.cellWidget(row, col)
+                if cell_widget:
+                    # Tìm ConnectionPillButton bên trong QWidget wrapper
+                    for child in cell_widget.findChildren(QPushButton):
+                        if isinstance(child, ConnectionPillButton):
+                            child.set_status("allowed")
 
     def _reapply_all_policies(self):
-        """Áp dụng lại các chính sách đã lưu khi bật lại tường lửa."""
+        """Áp dụng lại TẤT CẢ các chính sách đã lưu khi bật lại tường lửa."""
         for app_name, policy in self.app_policies.items():
-            if policy.get("in") != "allowed" or policy.get("out") != "allowed":
-                self._on_pill_status_changed(app_name, "in", policy.get("in", "allowed"))
-                break
+            in_status = policy.get("in", "allowed")
+            out_status = policy.get("out", "allowed")
+            if in_status != "allowed" or out_status != "allowed":
+                # Áp dụng lại chính sách cho từng ứng dụng
+                effective_status = self._get_effective_status(in_status, out_status)
+                effective_direction = self._get_effective_direction(in_status, out_status)
+                try:
+                    if effective_status == "blocked":
+                        self.service.block_application(app_name, direction=effective_direction)
+                        print(f"[Protect] Reapply BLOCK: {app_name} ({effective_direction})")
+                    elif effective_status == "throttled":
+                        limit_kbps = policy.get("limit_kbps", self.default_throttle_kbps)
+                        self.service.apply_bandwidth_limit(app_name, limit_kbps, effective_direction)
+                        print(f"[Protect] Reapply THROTTLE: {app_name} ({effective_direction}, {limit_kbps} KB/s)")
+                except Exception as e:
+                    print(f"[Protect] Lỗi reapply policy cho {app_name}: {e}")
 
     def _format_bytes(self, num_bytes: float) -> str:
         if num_bytes < 1024:

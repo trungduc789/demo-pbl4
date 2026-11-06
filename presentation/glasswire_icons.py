@@ -184,3 +184,20 @@ def get_firewall_shield_icon(status: str = "allowed") -> QIcon:
     </svg>
     """
     return _render_svg_to_icon(svg, 18, 18)
+
+
+def get_fleet_icon(active: bool = False) -> QIcon:
+    """Icon Fleet Manager: Quản lý đa máy trạm / mạng lưới máy tính."""
+    color = "#2563EB" if active else "#64748B"
+    svg = f"""
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+      <rect x="2" y="3" width="12" height="9" rx="1.5" fill="none" stroke="{color}" stroke-width="2"/>
+      <rect x="10" y="12" width="12" height="9" rx="1.5" fill="none" stroke="{color}" stroke-width="2"/>
+      <line x1="8" y1="12" x2="8" y2="15" stroke="{color}" stroke-width="1.8"/>
+      <line x1="16" y1="21" x2="16" y2="23" stroke="{color}" stroke-width="1.8"/>
+      <line x1="5" y1="15" x2="11" y2="15" stroke="{color}" stroke-width="1.8"/>
+      <line x1="13" y1="23" x2="19" y2="23" stroke="{color}" stroke-width="1.8"/>
+    </svg>
+    """
+    return _render_svg_to_icon(svg, 22, 22)
+

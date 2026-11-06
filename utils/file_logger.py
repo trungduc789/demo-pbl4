@@ -2,9 +2,13 @@ import os
 import threading
 from datetime import datetime
 from typing import Optional
+import sys
 
-# Thư mục logs nằm tại thư mục gốc của project
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Thư mục logs nằm tại thư mục gốc của project hoặc cạnh file .exe khi đóng gói
+if getattr(sys, "frozen", False):
+    PROJECT_ROOT = os.path.dirname(sys.executable)
+else:
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 
 class FileLogger:

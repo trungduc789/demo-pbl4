@@ -16,6 +16,16 @@ def setup_system_environment():
     # 1. Đảm bảo console Windows hỗ trợ UTF-8 (tiếng Việt có dấu) tránh lỗi UnicodeEncodeError
     if sys.platform.startswith("win"):
         os.environ["PYTHONIOENCODING"] = "utf-8"
+        if sys.stdout is None:
+            try:
+                sys.stdout = open(os.devnull, "w", encoding="utf-8")
+            except Exception:
+                pass
+        if sys.stderr is None:
+            try:
+                sys.stderr = open(os.devnull, "w", encoding="utf-8")
+            except Exception:
+                pass
         if hasattr(sys.stdout, "reconfigure"):
             try:
                 sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")

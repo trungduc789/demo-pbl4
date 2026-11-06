@@ -2,8 +2,11 @@ import sys
 
 def safe_print(*args, **kwargs):
     """
-    In an toan ra console, tu dong xu ly UnicodeEncodeError tren Windows (cp1258/cp1252/charmap).
+    In an toan ra console, tu dong xu ly UnicodeEncodeError tren Windows (cp1258/cp1252/charmap),
+    va bo qua an toan khi chay o che do khong console (noconsole/frozen).
     """
+    if sys.stdout is None:
+        return
     try:
         print(*args, **kwargs)
     except (UnicodeEncodeError, Exception):

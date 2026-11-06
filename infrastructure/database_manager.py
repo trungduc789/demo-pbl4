@@ -1241,6 +1241,251 @@ class DatabaseManager:
                 cursor.close()
         return logs
 
+    # =========================================================================
+    # CÁC HÀM QUẢN LÝ THIẾT BỊ TỪ XA PHỤC VỤ MÔ HÌNH CLIENT - SERVER
+    # =========================================================================
+
+    def upsert_remote_device(self, reg_data: Any) -> Optional[int]:
+        """Cập nhật hoặc thêm mới máy con từ xa vào bảng devices."""
+        with self._lock:
+            conn = self.ensure_connection()
+            if conn is None:
+                return None
+
+            cursor = conn.cursor()
+            try:
+                uuid_val = getattr(reg_data, "device_uuid", None) or (reg_data.get("device_uuid", "") if isinstance(reg_data, dict) else "")
+                hostname = getattr(reg_data, "hostname", None) or (reg_data.get("hostname", "Unknown") if isinstance(reg_data, dict) else "Unknown")
+                os_name = getattr(reg_data, "os_name", None) or (reg_data.get("os_name", "Unknown") if isinstance(reg_data, dict) else "Unknown")
+                os_version = getattr(reg_data, "os_version", None) or (reg_data.get("os_version", "") if isinstance(reg_data, dict) else "")
+                agent_version = getattr(reg_data, "agent_version", None) or (reg_data.get("agent_version", "1.0.0") if isinstance(reg_data, dict) else "1.0.0")
+
+                cursor.execute(
+                    "SELECT id FROM devices WHERE device_uuid = %s LIMIT 1",
+                    (uuid_val,),
+                )
+                row = cursor.fetchone()
+                if row:
+                    dev_id = int(row[0])
+                    cursor.execute(
+                        """
+                        UPDATE devices 
+                        SET hostname = %s, os = %s, os_version = %s, agent_version = %s, status = 'online', last_seen = NOW()
+                        WHERE id = %s
+                        """,
+                        (hostname, os_name, os_version, agent_version, dev_id),
+                    )
+                    conn.commit()
+                    return dev_id
+                else:
+                    cursor.execute(
+                        """
+                        INSERT INTO devices (device_uuid, hostname, os, os_version, agent_version, status, last_seen, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, 'online', NOW(), NOW(), NOW())
+                        """,
+                        (uuid_val, hostname, os_name, os_version, agent_version),
+                    )
+                    dev_id = cursor.lastrowid
+                    conn.commit()
+                    print(f"[DB] Đã đăng ký máy con từ xa mới: {hostname} (ID={dev_id}, UUID={uuid_val})")
+                    return dev_id
+            except Exception as e:
+                print(f"[DB Error] Lỗi upsert_remote_device: {e}")
+                return None
+            finally:
+                cursor.close()
+
+    def set_device_status(self, device_uuid: str, status: str = "offline") -> bool:
+        """Cập nhật trạng thái 'online' hoặc 'offline' của máy con."""
+        with self._lock:
+            conn = self.ensure_connection()
+            if conn is None:
+                return False
+
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "UPDATE devices SET status = %s, last_seen = NOW() WHERE device_uuid = %s",
+                    (status, device_uuid),
+                )
+                conn.commit()
+                return True
+            except Exception as e:
+                print(f"[DB Error] Lỗi set_device_status: {e}")
+                return False
+            finally:
+                cursor.close()
+
+    def save_remote_telemetry(self, device_id: int, telem: Any) -> bool:
+        """Lưu trữ số liệu Telemetry của máy con từ xa vào MySQL."""
+        with self._lock:
+            conn = self.ensure_connection()
+            if conn is None:
+                return False
+
+            cursor = conn.cursor()
+            try:
+                # 1. Cập nhật last_seen của device
+                cursor.execute(
+                    "UPDATE devices SET status = 'online', last_seen = NOW() WHERE id = %s",
+                    (device_id,),
+                )
+
+                # 2. Lưu card mạng mặc định nếu chưa có
+                cursor.execute(
+                    "SELECT id FROM network_interfaces WHERE device_id = %s LIMIT 1",
+                    (device_id,),
+                )
+                row = cursor.fetchone()
+                if row:
+                    iface_id = int(row[0])
+                else:
+                    cursor.execute(
+                        """
+                        INSERT INTO network_interfaces (device_id, name, interface_type, mac_address, speed, is_active, created_at, updated_at)
+                        VALUES (%s, 'Remote Adapter', 'ethernet', '', 1000, 1, NOW(), NOW())
+                        """,
+                        (device_id,),
+                    )
+                    iface_id = cursor.lastrowid
+
+                # 3. Ghi interface_traffic
+                speeds = getattr(telem, "speeds", None)
+                if speeds:
+                    total_rx = getattr(speeds, "total_down_bytes", 0)
+                    total_tx = getattr(speeds, "total_up_bytes", 0)
+                    ts_val = getattr(telem, "timestamp", time.time())
+                    rec_time = datetime.fromtimestamp(ts_val)
+                    cursor.execute(
+                        """
+                        INSERT INTO interface_traffic (interface_id, timestamp, rx_bytes, tx_bytes)
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        (iface_id, rec_time, total_rx, total_tx),
+                    )
+
+                # 4. Ghi top_processes vào processes & process_traffic
+                top_procs = getattr(telem, "top_processes", []) or []
+                ts_val = getattr(telem, "timestamp", time.time())
+                rec_time = datetime.fromtimestamp(ts_val)
+                for proc in top_procs:
+                    p_name = getattr(proc, "name", "")
+                    p_pid = getattr(proc, "pid", 0)
+                    down_kbps = getattr(proc, "down_kbps", 0.0)
+                    up_kbps = getattr(proc, "up_kbps", 0.0)
+                    if not p_name or p_pid <= 0:
+                        continue
+
+                    # Upsert process
+                    cursor.execute(
+                        "SELECT id FROM processes WHERE device_id = %s AND pid = %s AND process_name = %s LIMIT 1",
+                        (device_id, p_pid, p_name),
+                    )
+                    p_row = cursor.fetchone()
+                    if p_row:
+                        proc_id = int(p_row[0])
+                        cursor.execute("UPDATE processes SET last_seen = %s WHERE id = %s", (rec_time, proc_id))
+                    else:
+                        cursor.execute(
+                            """
+                            INSERT INTO processes (device_id, pid, process_name, executable_path, first_seen, last_seen, status)
+                            VALUES (%s, %s, %s, '', %s, %s, 'running')
+                            """,
+                            (device_id, p_pid, p_name, rec_time, rec_time),
+                        )
+                        proc_id = cursor.lastrowid
+
+                    # Lưu process traffic
+                    cursor.execute(
+                        """
+                        INSERT INTO process_traffic (process_id, timestamp, rx_bytes, tx_bytes)
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        (proc_id, rec_time, int(down_kbps * 1024), int(up_kbps * 1024)),
+                    )
+
+                conn.commit()
+                return True
+            except Exception as e:
+                print(f"[DB Error] Lỗi save_remote_telemetry: {e}")
+                return False
+            finally:
+                cursor.close()
+
+    def save_remote_policy_log(
+        self,
+        device_id: int,
+        action: str,
+        target_app: str,
+        limit_kbps: float = 0.0,
+        direction: str = "both",
+        policy_type: str = "BANDWIDTH_LIMIT",
+        status: str = "SUCCESS",
+        details: str = "",
+    ) -> bool:
+        """Ghi nhận lịch sử can thiệp an ninh mạng cho một máy con cụ thể."""
+        with self._lock:
+            conn = self.ensure_connection()
+            if conn is None:
+                return False
+
+            cursor = conn.cursor()
+            try:
+                sql = """
+                INSERT INTO policy_logs (
+                    device_id, policy_type, target_app, limit_kbps, direction, 
+                    action, throttled_packets, throttled_bytes, status, details, applied_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, 0, 0, %s, %s, NOW())
+                """
+                cursor.execute(sql, (
+                    device_id,
+                    policy_type,
+                    target_app,
+                    limit_kbps,
+                    direction,
+                    action.upper(),
+                    status,
+                    details
+                ))
+                conn.commit()
+                return True
+            except Exception as e:
+                print(f"[DB Error] Lỗi save_remote_policy_log: {e}")
+                return False
+            finally:
+                cursor.close()
+
+    def get_all_devices(self) -> List[Dict]:
+        """Truy vấn danh sách tất cả các máy đã từng đăng ký trong CSDL."""
+        devices = []
+        with self._lock:
+            conn = self.ensure_connection()
+            if conn is None:
+                return devices
+
+            cursor = conn.cursor(dictionary=True)
+            try:
+                cursor.execute(
+                    """
+                    SELECT id, device_uuid, hostname, os, os_version, agent_version, 
+                           status, last_seen, created_at
+                    FROM devices
+                    ORDER BY status ASC, last_seen DESC
+                    """
+                )
+                rows = cursor.fetchall()
+                for r in rows:
+                    if isinstance(r.get("last_seen"), datetime):
+                        r["last_seen_str"] = r["last_seen"].strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        r["last_seen_str"] = str(r.get("last_seen") or "")
+                    devices.append(r)
+            except Exception as e:
+                print(f"[DB Error] Lỗi get_all_devices: {e}")
+            finally:
+                cursor.close()
+        return devices
+
     def close(self):
         with self._lock:
             if self.connection is not None and self.connection.is_connected():

@@ -64,43 +64,69 @@ class WinDivertPacketShaper:
         except Exception:
             return False
 
-    def _find_pids_for_name(self, app_name: str) -> Set[int]:
+    ALIAS_MAP = {
+        "google chrome": "chrome",
+        "microsoft edge": "msedge",
+        "brave browser": "brave",
+        "riot client": "riotclientux",
+        "windows explorer": "explorer",
+        "discord": "discord",
+        "telegram": "telegram",
+        "zalo": "zalo",
+    }
+
+    def _resolve_target_name_and_exe(self, app_name: str, provided_exe: str = "") -> Tuple[str, str, Set[int]]:
+        """Phân giải tên hiển thị thân thiện sang tên file .exe thật, đường dẫn thực thi và danh sách PID."""
         if not app_name:
-            return set()
-        target_lower = app_name.lower()
-        target_base = target_lower.replace(".exe", "").strip()
-        found = set()
+            return "", "", set()
+
+        raw_lower = app_name.lower().strip()
+        clean = raw_lower.replace(".exe", "").strip()
+        alias = self.ALIAS_MAP.get(clean, clean)
+        
+        found_pids = set()
+        found_exe = provided_exe if (provided_exe and os.path.exists(provided_exe)) else ""
+        canonical_name = ""
+
         for p in psutil.process_iter(['pid', 'name', 'exe']):
             try:
                 p_name = (p.info.get('name') or "").lower()
-                p_exe = (p.info.get('exe') or "").lower()
-                if p_name == target_lower or p_name.replace(".exe", "") == target_base:
-                    found.add(p.info['pid'])
-                elif target_base and (target_base in p_name or target_base in p_exe):
-                    found.add(p.info['pid'])
+                p_exe = p.info.get('exe') or ""
+                p_exe_lower = p_exe.lower()
+                p_base = p_name.replace(".exe", "")
+
+                is_match = (
+                    p_name == raw_lower or 
+                    p_name == f"{alias}.exe" or 
+                    p_base == clean or 
+                    p_base == alias or 
+                    (alias and (alias in p_name or alias in p_exe_lower))
+                )
+
+                if is_match:
+                    found_pids.add(p.info['pid'])
+                    if not found_exe and p_exe and os.path.exists(p_exe):
+                        found_exe = p_exe
+                    if not canonical_name:
+                        canonical_name = p.info.get('name') or ""
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
-        return found
+
+        if not canonical_name:
+            canonical_name = f"{alias}.exe" if not raw_lower.endswith(".exe") else app_name
+
+        return canonical_name, found_exe, found_pids
+
+    def _find_pids_for_name(self, app_name: str) -> Set[int]:
+        _, _, pids = self._resolve_target_name_and_exe(app_name)
+        return pids
 
     def _find_target_pids(self) -> Set[int]:
         """Tìm tất cả PID thuộc ứng dụng mục tiêu (kể cả tiến trình con)."""
         if not self.target_app:
             return set()
-        target_lower = self.target_app.lower()
-        target_base = target_lower.replace(".exe", "").strip()
-
-        found = set()
-        for p in psutil.process_iter(['pid', 'name', 'exe']):
-            try:
-                p_name = (p.info.get('name') or "").lower()
-                p_exe = (p.info.get('exe') or "").lower()
-                if p_name == target_lower or p_name.replace(".exe", "") == target_base:
-                    found.add(p.info['pid'])
-                elif target_base and (target_base in p_name or target_base in p_exe):
-                    found.add(p.info['pid'])
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        return found
+        _, _, pids = self._resolve_target_name_and_exe(self.target_app)
+        return pids
 
     def _update_target_ports(self):
         """Quét và cập nhật danh sách local port thuộc tiến trình mục tiêu."""
@@ -120,7 +146,7 @@ class WinDivertPacketShaper:
         now = time.time()
         new_ports = set()
 
-        # Quét cổng trực tiếp theo PID để đạt tốc độ tối đa (< 2ms)
+        # Quét cổng trực tiếp theo PID cho target (đang bị bóp băng thông)
         for pid in found_pids:
             try:
                 proc = psutil.Process(pid)
@@ -132,23 +158,25 @@ class WinDivertPacketShaper:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
-        # Quét bổ sung toàn hệ thống để không sót socket nào của target_pids
-        try:
-            for conn in psutil.net_connections(kind='inet'):
-                if conn.pid in found_pids and conn.laddr:
-                    port = conn.laddr.port
-                    new_ports.add(port)
-                    self._port_last_seen[port] = now
-        except Exception:
-            pass
+        # Quét cổng cho tất cả các PID bị chặn hoàn toàn (blocked_pids)
+        new_blocked_ports = set()
+        for pid in all_blocked_pids:
+            try:
+                proc = psutil.Process(pid)
+                for conn in proc.net_connections(kind='all'):
+                    if conn.laddr:
+                        new_blocked_ports.add(conn.laddr.port)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
 
-        # Giữ lại các cổng đã thấy trong vòng 120 giây (tránh mất cổng khi kết nối Keep-Alive nhàn rỗi)
+        # Giữ lại các cổng đã thấy trong vòng 120 giây
         expired_ports = [p for p, t in self._port_last_seen.items() if now - t > 120.0]
         for p in expired_ports:
             del self._port_last_seen[p]
 
         with self._lock:
             self.target_ports = set(self._port_last_seen.keys())
+            self.blocked_ports = new_blocked_ports
 
     def _port_monitor_loop(self):
         """Luồng chạy ngầm quét cổng mới mở của tiến trình mục tiêu tần số cao (50ms)."""
@@ -405,32 +433,38 @@ class WinDivertPacketShaper:
     def block_app(self, app_name: str, direction: str = "both", exe_path: str = "") -> Tuple[bool, str]:
         """
         Chặn hoàn toàn quyền truy cập mạng của ứng dụng:
-        1. Thêm quy tắc Windows Defender Firewall (Inbound & Outbound) cho file .exe.
-        2. Kích hoạt WinDivert Kernel Dropper: Hủy bỏ (Drop) ngay lập tức mọi gói tin gửi/nhận.
-        3. Cắt đứt các kết nối socket TCP đang mở.
+        1. Kiểm tra quyền Administrator (bắt buộc cho Windows Firewall & WinDivert).
+        2. Thêm quy tắc Windows Defender Firewall (Inbound & Outbound) cho file .exe.
+        3. Kích hoạt WinDivert Kernel Dropper: Hủy bỏ (Drop) ngay lập tức mọi gói tin gửi/nhận.
+        4. Cắt đứt các kết nối socket TCP đang mở.
         """
-        target = app_name if app_name.lower().endswith(".exe") else f"{app_name}.exe"
+        if not self.is_admin():
+            err_msg = (
+                f"Không thể chặn '{app_name}' vì ứng dụng chưa chạy với quyền Administrator!\n\n"
+                "Hệ điều hành Windows yêu cầu quyền 'Run as administrator' để có thể cấu hình "
+                "Windows Defender Firewall và driver WinDivert."
+            )
+            print(f"[PacketShaper Admin Error] {err_msg}")
+            return False, err_msg
+
+        canonical_name, real_exe, pids = self._resolve_target_name_and_exe(app_name, exe_path)
+        target = canonical_name
         target_key = target.lower()
 
         # 1. Thêm vào danh sách chặn
         with self._lock:
-            self.blocked_apps[target_key] = {"direction": direction.lower(), "exe": exe_path}
-            self.target_app = target
-            self.is_blocked = True
-            self.limit_kbps = 0.0
-
-        pids = self._find_pids_for_name(target_key)
-        with self._lock:
+            self.blocked_apps[target_key] = {"direction": direction.lower(), "exe": real_exe}
             self.blocked_pids.update(pids)
+            self.is_blocked = True
 
         # 2. Cắt các socket đang kết nối
         self._terminate_app_sockets(pids)
 
-        # 3. Kích hoạt Windows Defender Firewall
-        fw_ok = self._apply_windows_firewall_rule(target, exe_path, action="block")
+        # 3. Kích hoạt Windows Defender Firewall (với exe thực tế)
+        fw_ok = self._apply_windows_firewall_rule(target, real_exe, action="block")
 
         # 4. Kích hoạt luồng WinDivert để drop các gói tin tại driver
-        if self.is_admin() and not self.is_active:
+        if not self.is_active:
             self.is_active = True
             self._stop_event.clear()
             self._update_target_ports()
@@ -442,8 +476,10 @@ class WinDivertPacketShaper:
                 target=self._capture_loop, daemon=True, name="PacketShaper-Capture"
             )
             self._capture_thread.start()
+        else:
+            self._update_target_ports()
 
-        msg = f"Đã kích hoạt chặn hoàn toàn truy cập mạng cho ứng dụng '{target}' thành công."
+        msg = f"Đã kích hoạt chặn hoàn toàn truy cập mạng cho ứng dụng '{target}' ({len(pids)} tiến trình, Firewall: {'Bật' if fw_ok else 'WinDivert'})."
         print(f"[PacketShaper] {msg}")
         return True, msg
 
