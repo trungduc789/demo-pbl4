@@ -86,7 +86,9 @@ def main():
     parser.add_argument("--no-etw", action="store_true", help="Vô hiệu hóa ETW Consumer")
     parser.add_argument("--no-elevate", action="store_true", help="Bỏ qua tự động yêu cầu nâng quyền Administrator (UAC)")
     parser.add_argument("--headless", action="store_true", help="Chạy ở chế độ dòng lệnh thuần túy không hiển thị System Tray/GUI")
-    parser.add_argument("--show-window", action="store_true", help="Tự động mở cửa sổ Trạng thái ngay khi khởi chạy")
+    parser.add_argument("--mini", action="store_true", help="Chỉ mở hộp thoại mini trạng thái kết nối thay vì giao diện đầy đủ")
+    parser.add_argument("--hide", action="store_true", help="Khởi động ẩn xuống khay hệ thống (System Tray)")
+    parser.add_argument("--show-window", action="store_true", help="Mở cửa sổ trạng thái mini ngay khi khởi chạy")
     args = parser.parse_args()
 
     # 1. Khởi tạo môi trường UTF-8
@@ -104,24 +106,24 @@ def main():
     enable_etw = False if args.no_etw else cfg.get("enable_etw", True)
     show_toast = cfg.get("show_toast_notifications", True)
 
-    print("=" * 70)
+    mode_str = "Headless Daemon" if args.headless else ("Mini Status Box" if args.mini else "Full GlassWire Dashboard")
+    print("=" * 75)
     print("    NETWORK TRAFFIC MONITOR & PACKET SHAPER - CLIENT AGENT")
-    print("=" * 70)
+    print("=" * 75)
     print(f"[*] Máy chủ Admin đích: {server_host}:{server_port}")
     print(f"[*] ETW Kernel Monitor: {'Bật' if enable_etw else 'Tắt'}")
     print(f"[*] Đặc quyền Administrator: {'Đã có' if is_admin() else 'Chưa có (hạn chế WinDivert)'}")
-    print(f"[*] Chế độ hoạt động: {'Headless Daemon' if args.headless else 'System Tray App'}\n")
-
-    # 4. Khởi tạo Client Agent Service
-    agent = ClientAgentService(
-        server_host=server_host,
-        server_port=server_port,
-        enable_etw=enable_etw,
-    )
-    agent.show_toast_notifications = show_toast
+    print(f"[*] Chế độ hoạt động: {mode_str}\n")
 
     if args.headless:
         # Chế độ chạy ngầm dòng lệnh không GUI
+        agent = ClientAgentService(
+            server_host=server_host,
+            server_port=server_port,
+            enable_etw=enable_etw,
+        )
+        agent.show_toast_notifications = show_toast
+
         def signal_handler(sig, frame):
             print("\n[*] Đang dừng Agent Service...")
             agent.stop()
@@ -140,36 +142,77 @@ def main():
         finally:
             agent.stop()
     else:
-        # Chế độ System Tray + GUI
+        # Chế độ GUI (Hỗ trợ Full Dashboard hoặc Mini Status Window)
         from PyQt6 import QtWidgets, QtCore
+        from presentation.styles import setup_application_theme
+        from presentation.dashboard import BandwidthDashboard
         from presentation.client_status_window import ClientStatusWindow
         from presentation.client_tray import ClientTrayManager
+        from application.monitor_service import MonitorService
 
         app = QtWidgets.QApplication.instance()
         if app is None:
             app = QtWidgets.QApplication(sys.argv)
+        setup_application_theme(app)
 
-        # Giữ ứng dụng chạy ngầm khi người dùng đóng cửa sổ cấu hình
+        # Giữ ứng dụng chạy ngầm trong khay khi đóng cửa sổ
         app.setQuitOnLastWindowClosed(False)
 
-        # Cửa sổ Trạng thái & Khay hệ thống
-        status_window = ClientStatusWindow(agent)
-        tray_manager = ClientTrayManager(agent, status_window)
+        monitor_svc = None
+        main_dashboard = None
 
-        # Khởi động agent
+        if args.mini:
+            # Chế độ chỉ mở hộp thoại mini
+            agent = ClientAgentService(
+                server_host=server_host,
+                server_port=server_port,
+                enable_etw=enable_etw,
+            )
+            agent.show_toast_notifications = show_toast
+            status_window = ClientStatusWindow(agent)
+            tray_manager = ClientTrayManager(agent, status_window)
+            if not args.hide:
+                status_window.show()
+        else:
+            # Chế độ Giao diện đầy đủ chuẩn GlassWire
+            monitor_svc = MonitorService()
+            agent = ClientAgentService(
+                server_host=server_host,
+                server_port=server_port,
+                enable_etw=enable_etw,
+                monitor_service=monitor_svc,
+            )
+            agent.show_toast_notifications = show_toast
+
+            main_dashboard = BandwidthDashboard(
+                monitor_service=monitor_svc,
+                agent_service=agent,
+            )
+            main_dashboard._hide_to_tray_on_close = True
+            main_dashboard.setWindowTitle(f"Network Traffic Monitor - Client [{agent.registration_data.hostname}]")
+
+            status_window = ClientStatusWindow(agent)
+            tray_manager = ClientTrayManager(agent, status_window, main_window=main_dashboard)
+
+            if args.show_window:
+                status_window.show()
+
+            if not args.hide:
+                main_dashboard.show()
+
+        # Khởi động agent kết nối tới máy chủ
         agent.start()
 
-        # Dừng agent an toàn khi thoát app
+        # Dừng an toàn khi thoát app
         app.aboutToQuit.connect(agent.stop)
+        if monitor_svc is not None:
+            app.aboutToQuit.connect(monitor_svc.stop)
 
         # Hỗ trợ nhận diện tín hiệu Ctrl+C từ terminal trong Qt
         sig_timer = QtCore.QTimer()
         sig_timer.setInterval(500)
         sig_timer.timeout.connect(lambda: None)
         sig_timer.start()
-
-        if args.show_window:
-            status_window.show()
 
         sys.exit(app.exec())
 

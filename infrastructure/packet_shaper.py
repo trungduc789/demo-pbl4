@@ -129,11 +129,11 @@ class WinDivertPacketShaper:
         return pids
 
     def _update_target_ports(self):
-        """Quét và cập nhật danh sách local port thuộc tiến trình mục tiêu."""
-        if not self.target_app:
+        """Quét và cập nhật danh sách local port thuộc tiến trình mục tiêu hoặc ứng dụng bị chặn."""
+        if not self.target_app and not self.blocked_apps:
             return
 
-        found_pids = self._find_target_pids()
+        found_pids = self._find_target_pids() if self.target_app else set()
         # Tìm PIDs cho tất cả các app bị chặn
         all_blocked_pids = set()
         for b_name in list(self.blocked_apps.keys()):
@@ -285,48 +285,55 @@ class WinDivertPacketShaper:
 
                     try:
                         is_target = False
+                        is_drop = False
                         with self._lock:
                             ports = self.target_ports
                             pids = self.target_pids
+                            blocked_ports = self.blocked_ports
+                            blocked_pids = self.blocked_pids
+                            has_blocked = bool(self.blocked_apps)
 
                         if packet.is_outbound:
-                            if packet.src_port in ports:
+                            if packet.src_port in blocked_ports:
+                                is_drop = True
+                            elif packet.src_port in ports:
                                 if self.direction in ("upload", "both"):
                                     is_target = True
                             else:
-                                # Nhận diện tức thì: cổng outbound mới có thuộc target_pids không?
-                                # Ngăn ngừa 100% tình trạng vài trăm gói tin đầu bị lọt trước khi luồng quét phát hiện
-                                try:
-                                    for pid in pids:
-                                        try:
-                                            for conn in psutil.Process(pid).net_connections():
-                                                if conn.laddr and conn.laddr.port == packet.src_port:
-                                                    with self._lock:
-                                                        self.target_ports.add(packet.src_port)
-                                                        self._port_last_seen[packet.src_port] = time.time()
-                                                    if self.direction in ("upload", "both"):
-                                                        is_target = True
+                                # Nhận diện tức thì qua PID của target hoặc blocked app
+                                all_watched = pids | blocked_pids
+                                if all_watched:
+                                    try:
+                                        for pid in all_watched:
+                                            try:
+                                                for conn in psutil.Process(pid).net_connections():
+                                                    if conn.laddr and conn.laddr.port == packet.src_port:
+                                                        with self._lock:
+                                                            if pid in blocked_pids:
+                                                                self.blocked_ports.add(packet.src_port)
+                                                                is_drop = True
+                                                            if pid in pids:
+                                                                self.target_ports.add(packet.src_port)
+                                                                self._port_last_seen[packet.src_port] = time.time()
+                                                                if self.direction in ("upload", "both"):
+                                                                    is_target = True
+                                                        break
+                                                if is_target or is_drop:
                                                     break
-                                            if is_target:
-                                                break
-                                        except Exception:
-                                            pass
-                                except Exception:
-                                    pass
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
                         elif packet.is_inbound:
-                            if packet.dst_port in ports:
+                            if packet.dst_port in blocked_ports:
+                                is_drop = True
+                            elif packet.dst_port in ports:
                                 if self.direction in ("download", "both"):
                                     is_target = True
 
                         # 1. Kiểm tra nếu gói tin thuộc về ứng dụng bị CHẶN HOÀN TOÀN (BLOCK)
-                        is_drop = False
-                        with self._lock:
-                            if self.is_blocked and is_target:
-                                is_drop = True
-                            elif packet.is_outbound and packet.src_port in self.blocked_ports:
-                                is_drop = True
-                            elif packet.is_inbound and packet.dst_port in self.blocked_ports:
-                                is_drop = True
+                        if not is_drop and has_blocked and is_target and self.is_blocked:
+                            is_drop = True
 
                         if is_drop:
                             # DROP GÓI TIN NGAY TẠI KERNEL DRIVER! KHÔNG GỬI LẠI!
@@ -373,7 +380,11 @@ class WinDivertPacketShaper:
                 except Exception:
                     pass
 
-        prog_param = f'program="{exe_path}"' if exe_path and os.path.exists(exe_path) else ''
+        if not exe_path or not os.path.exists(exe_path):
+            print(f"[Firewall Rule Warning] Chưa có đường dẫn .exe tuyệt đối của '{app_name}', WinDivert Kernel Dropper sẽ đảm nhiệm chặn toàn bộ gói tin.")
+            return False
+
+        prog_param = f'program="{exe_path}"'
         cmd_out = f'netsh advfirewall firewall add rule name="{rule_name}_Out" dir=out action={action} {prog_param} enable=yes'
         cmd_in = f'netsh advfirewall firewall add rule name="{rule_name}_In" dir=in action={action} {prog_param} enable=yes'
         try:

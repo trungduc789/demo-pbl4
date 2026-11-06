@@ -176,10 +176,11 @@ class GlassWireProtectView(QWidget):
     """
     policy_changed = QtCore.pyqtSignal(str, str, str, float)  # app, direction, action, limit_kbps
 
-    def __init__(self, monitor_service, icon_manager=None):
+    def __init__(self, monitor_service=None, icon_manager=None, fleet_service=None):
         super().__init__()
         self.service = monitor_service
         self.icon_manager = icon_manager
+        self.fleet_service = fleet_service
         self.is_firewall_active = True
         self.firewall_mode = "Click To Block"
         self.default_throttle_kbps = 100.0
@@ -191,13 +192,33 @@ class GlassWireProtectView(QWidget):
 
         self._init_ui()
 
+    def set_fleet_service(self, fleet_service):
+        """Kích hoạt dịch vụ quản trị Fleet và thanh chọn máy con trên giao diện Protect."""
+        self.fleet_service = fleet_service
+        if hasattr(self, "device_selector_widget"):
+            self.device_selector_widget.setVisible(bool(fleet_service is not None))
+            self.refresh_fleet_devices_dropdown()
+
     def set_remote_mode(self, device_uuid: Optional[str], commander_func: Optional[Any]):
         """Cấu hình chế độ can thiệp từ xa tới máy con cụ thể."""
         self.remote_device_uuid = device_uuid
         self.remote_commander = commander_func
         if device_uuid:
-            self.lbl_driver_status.setText(f"📡 Chế độ điều khiển từ xa: Đang kết nối máy con [{device_uuid[:8]}...]")
+            dev_state = self.fleet_service.get_device_state(device_uuid) if self.fleet_service else None
+            hname = dev_state.hostname if dev_state else device_uuid[:8]
+            ip = dev_state.ip_address if dev_state else "127.0.0.1"
+            self.lbl_driver_status.setText(f"📡 Đang can thiệp máy con: {hname} ({ip}) [UUID: {device_uuid[:8]}...] (Sẵn sàng gửi lệnh)")
             self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #2563EB;")
+
+            # Đồng bộ lại chính sách đã áp dụng trên máy này
+            if dev_state and dev_state.applied_policies:
+                for app_k, pol in dev_state.applied_policies.items():
+                    act = pol.get("action")
+                    if act == "BLOCK_APP":
+                        self.app_policies[app_k] = {"in": "blocked", "out": "blocked"}
+                    elif act == "THROTTLE_SET":
+                        lim = pol.get("limit_kbps", 100.0)
+                        self.app_policies[app_k] = {"in": "throttled", "out": "throttled", "limit_kbps": lim}
         else:
             self.lbl_driver_status.setText("🛡️ WinDivert Engine: Đang bảo vệ | Kernel Throttling: Sẵn sàng")
             self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #059669;")
@@ -314,6 +335,64 @@ class GlassWireProtectView(QWidget):
         main_layout.addWidget(top_bar)
 
         # ---------------------------------------------------------------------
+        # 1.5. THANH CHỌN MÁY CON CHO CHẾ ĐỘ QUẢN TRỊ ADMIN (FLEET DEVICE SELECTOR)
+        # ---------------------------------------------------------------------
+        self.device_selector_widget = QFrame()
+        self.device_selector_widget.setStyleSheet("""
+            QFrame {
+                background-color: #EFF6FF;
+                border: 1px solid #BFDBFE;
+                border-radius: 8px;
+                padding: 4px 10px;
+            }
+        """)
+        dsw_layout = QHBoxLayout(self.device_selector_widget)
+        dsw_layout.setContentsMargins(8, 4, 8, 4)
+        dsw_layout.setSpacing(10)
+
+        lbl_target = QLabel("🎯 Máy con mục tiêu can thiệp:")
+        lbl_target.setStyleSheet("font-size: 12px; font-weight: bold; color: #1E40AF;")
+        dsw_layout.addWidget(lbl_target)
+
+        self.combo_target_device = QComboBox()
+        self.combo_target_device.setFixedHeight(30)
+        self.combo_target_device.setStyleSheet("""
+            QComboBox {
+                font-size: 12px;
+                font-weight: 600;
+                padding: 2px 10px;
+                border: 1px solid #93C5FD;
+                border-radius: 6px;
+                background-color: #FFFFFF;
+                color: #1E3A8A;
+                min-width: 280px;
+            }
+        """)
+        self.combo_target_device.currentIndexChanged.connect(self._on_device_combo_changed)
+        dsw_layout.addWidget(self.combo_target_device, stretch=1)
+
+        self.btn_refresh_devices = QPushButton("🔄 Quét lại danh sách máy")
+        self.btn_refresh_devices.setFixedHeight(28)
+        self.btn_refresh_devices.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.btn_refresh_devices.setStyleSheet("""
+            QPushButton {
+                background-color: #DBEAFE;
+                color: #1E40AF;
+                font-size: 11px;
+                font-weight: bold;
+                border-radius: 5px;
+                padding: 2px 12px;
+                border: none;
+            }
+            QPushButton:hover { background-color: #BFDBFE; }
+        """)
+        self.btn_refresh_devices.clicked.connect(self.refresh_fleet_devices_dropdown)
+        dsw_layout.addWidget(self.btn_refresh_devices)
+
+        main_layout.addWidget(self.device_selector_widget)
+        self.device_selector_widget.setVisible(bool(self.fleet_service is not None))
+
+        # ---------------------------------------------------------------------
         # 2. TIÊU ĐỀ NHÓM ACTIVE APPS
         # ---------------------------------------------------------------------
         group_bar = QHBoxLayout()
@@ -327,6 +406,27 @@ class GlassWireProtectView(QWidget):
         self.lbl_app_count.setStyleSheet("font-size: 12px; color: #64748B; font-weight: 500;")
         group_bar.addWidget(self.lbl_app_count)
         group_bar.addStretch()
+
+        # Nút chặn ứng dụng theo tên tùy chọn
+        btn_block_custom = QPushButton("➕ Chặn Theo Tên (.exe)")
+        btn_block_custom.setFixedHeight(24)
+        btn_block_custom.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        btn_block_custom.setStyleSheet("""
+            QPushButton {
+                background-color: #FEF2F2;
+                color: #DC2626;
+                font-size: 11px;
+                font-weight: 600;
+                border: 1px solid #FECACA;
+                border-radius: 4px;
+                padding: 2px 10px;
+            }
+            QPushButton:hover {
+                background-color: #FEE2E2;
+            }
+        """)
+        btn_block_custom.clicked.connect(self._prompt_block_custom_app)
+        group_bar.addWidget(btn_block_custom)
 
         # Nút bỏ chặn tất cả
         btn_unblock_all = QPushButton("Cho Phép Tất Cả")
@@ -611,16 +711,16 @@ class GlassWireProtectView(QWidget):
             if item and item.text().strip() == app_name:
                 break
 
-        if not self.is_firewall_active or not self.service:
-            self._update_status_bar()
-            return
-
-        # Xác định hành động chính cần thực hiện
-        effective_status = self._get_effective_status(in_status, out_status)
-        effective_direction = self._get_effective_direction(in_status, out_status)
-
         # Chế độ điều khiển máy con từ xa (Remote Machine Control)
+        # QUAN TRỌNG: Phải kiểm tra remote mode TRƯỚC khi check self.service,
+        # vì trong Admin mode self.service = None nhưng remote_commander vẫn hoạt động.
         if self.remote_device_uuid and self.remote_commander:
+            # --- Xác định hành động chính cần thực hiện ---
+            in_status = self.app_policies[app_name].get("in", "allowed")
+            out_status = self.app_policies[app_name].get("out", "allowed")
+            effective_status = self._get_effective_status(in_status, out_status)
+            effective_direction = self._get_effective_direction(in_status, out_status)
+
             try:
                 if effective_status == "blocked":
                     ok, msg = self.remote_commander(
@@ -639,7 +739,6 @@ class GlassWireProtectView(QWidget):
                             self.app_policies[app_name]["limit_kbps"] = limit_val
                     except Exception:
                         pass
-
                     ok, msg = self.remote_commander(
                         self.remote_device_uuid, "THROTTLE_SET", app_name, limit_val, effective_direction
                     )
@@ -658,6 +757,15 @@ class GlassWireProtectView(QWidget):
                 print(f"[Protect Remote Command Error] {e}")
             self._update_status_bar()
             return
+
+        # --- Chế độ cục bộ: kiểm tra firewall và service ---
+        if not self.is_firewall_active or not self.service:
+            self._update_status_bar()
+            return
+
+        # Xác định hành động chính cần thực hiện
+        effective_status = self._get_effective_status(in_status, out_status)
+        effective_direction = self._get_effective_direction(in_status, out_status)
 
 
         try:
@@ -717,8 +825,18 @@ class GlassWireProtectView(QWidget):
 
     def unblock_all_apps(self):
         """Cho phép tất cả ứng dụng truyền tải bình thường - gỡ mọi chính sách chặn và giới hạn."""
-        # 1. Gỡ chặn tất cả ứng dụng qua MonitorService (Windows Firewall + WinDivert)
-        if self.service:
+        # 1a. Nếu đang ở chế độ Admin điều khiển từ xa -> gửi lệnh cho máy con
+        if self.remote_device_uuid and self.remote_commander:
+            try:
+                self.remote_commander(self.remote_device_uuid, "UNBLOCK_ALL", "", 0.0, "both")
+                self.remote_commander(self.remote_device_uuid, "REMOVE_LIMIT", "", 0.0, "both")
+                self.lbl_driver_status.setText(f"📡 Đã gỡ TẤT CẢ chặn trên máy [{self.remote_device_uuid[:8]}]")
+                self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #059669;")
+                print(f"[Protect Remote] UNBLOCK_ALL gửi tới {self.remote_device_uuid}")
+            except Exception as e:
+                print(f"[Protect Remote] Lỗi gửi UNBLOCK_ALL: {e}")
+        # 1b. Chế độ cục bộ: gỡ chặn qua MonitorService
+        elif self.service:
             try:
                 self.service.unblock_all_applications()
                 self.service.remove_bandwidth_limit()
@@ -743,7 +861,88 @@ class GlassWireProtectView(QWidget):
                         if isinstance(child, ConnectionPillButton):
                             child.set_status("allowed")
 
+
+    def refresh_fleet_devices_dropdown(self):
+        """Làm mới danh sách máy con trong combo_target_device từ FleetManagerService."""
+        if not self.fleet_service or not hasattr(self, "combo_target_device"):
+            return
+
+        self.combo_target_device.blockSignals(True)
+        self.combo_target_device.clear()
+        self.combo_target_device.addItem("— Chọn máy con mục tiêu —", None)
+
+        try:
+            devices = self.fleet_service.get_all_device_states()
+            for dev in devices:
+                uid = getattr(dev, "device_uuid", "")
+                hostname = getattr(dev, "hostname", "Unknown")
+                ip = getattr(dev, "ip_address", "")
+                status = getattr(dev, "status", "offline")
+                badge = "🟢" if status == "online" else "○"
+                label = f"{badge}  {hostname}  ({ip})  [{uid[:8]}...]"
+                self.combo_target_device.addItem(label, uid)
+
+                # Tự động chọn máy đang được set_remote_mode
+                if uid == self.remote_device_uuid:
+                    self.combo_target_device.setCurrentIndex(self.combo_target_device.count() - 1)
+        except Exception as e:
+            print(f"[Protect] Lỗi refresh fleet devices: {e}")
+
+        self.combo_target_device.blockSignals(False)
+
+    def _on_device_combo_changed(self, index: int):
+        """Khi Admin chọn máy con từ dropdown -> tự động set_remote_mode về máy đó."""
+        if not self.fleet_service or not hasattr(self, "combo_target_device"):
+            return
+
+        uid = self.combo_target_device.itemData(index)
+        if uid:
+            commander = getattr(self.fleet_service, "send_remote_command", None)
+            self.set_remote_mode(uid, commander)
+        else:
+            # Người dùng chọn "— Chọn máy con mục tiêu —"
+            self.set_remote_mode(None, None)
+
+    def _prompt_block_custom_app(self):
+        """Hiển thị dialog nhập tên .exe để chặn thủ công (không cần app xuất hiện trong traffic table)."""
+        from PyQt6.QtWidgets import QInputDialog
+        app_name, ok = QInputDialog.getText(
+            self, "Chặn Ứng Dụng Theo Tên",
+            "Nhập tên tiến trình (.exe) cần chặn:\n(Ví dụ: chrome.exe, discord.exe, steam.exe)",
+        )
+        if not ok or not app_name.strip():
+            return
+
+        app_name = app_name.strip()
+
+        # Khởi tạo policy mặc định nếu chưa có
+        if app_name not in self.app_policies:
+            self.app_policies[app_name] = {"in": "blocked", "out": "blocked", "limit_kbps": self.default_throttle_kbps}
+        else:
+            self.app_policies[app_name]["in"] = "blocked"
+            self.app_policies[app_name]["out"] = "blocked"
+
+        # Nếu đang ở chế độ remote -> gửi lệnh cho máy con
+        if self.remote_device_uuid and self.remote_commander:
+            try:
+                ok_cmd, msg = self.remote_commander(self.remote_device_uuid, "BLOCK_APP", app_name, 0.0, "both")
+                self.lbl_driver_status.setText(f"📡 Lệnh BLOCK gửi tới [{self.remote_device_uuid[:8]}]: '{app_name}'")
+                self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #DC2626;")
+                print(f"[Protect Remote] BLOCK_APP '{app_name}': {msg}")
+            except Exception as e:
+                print(f"[Protect Remote] Lỗi BLOCK_APP '{app_name}': {e}")
+        elif self.service and self.is_firewall_active:
+            try:
+                success, msg = self.service.block_application(app_name, direction="both")
+                self.lbl_driver_status.setText(f"🛡️ Đã chặn '{app_name}': {msg}")
+                print(f"[Protect] BLOCK '{app_name}': {msg}")
+            except Exception as e:
+                print(f"[Protect] Lỗi BLOCK '{app_name}': {e}")
+
+        self._update_status_bar()
+
     def _reapply_all_policies(self):
+
         """Áp dụng lại TẤT CẢ các chính sách đã lưu khi bật lại tường lửa."""
         for app_name, policy in self.app_policies.items():
             in_status = policy.get("in", "allowed")

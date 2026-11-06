@@ -995,11 +995,13 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
     - Tab 4 (Network Scanner): Bảng Socket TCP (IP, Cổng, Giao thức, Trạng thái).
     """
 
-    def __init__(self, monitor_service: Optional[MonitorService] = None, fleet_service=None):
+    def __init__(self, monitor_service: Optional[MonitorService] = None, fleet_service=None, agent_service=None):
         super().__init__()
         self.service = monitor_service
         self.fleet_service = fleet_service
+        self.agent_service = agent_service
         self.is_admin_mode = bool(fleet_service is not None)
+        self.is_client_mode = bool(agent_service is not None)
         self.selected_device_uuid: Optional[str] = None
         self.window_duration = 300.0  # Mặc định 5 phút như GlassWire
         self.render_delay = 5.0       # Lookahead buffer 5 giây chống giật tuyệt đối
@@ -1071,6 +1073,20 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self._init_ui()
         self._start_worker()
         self._start_render_loop()
+
+        if self.is_client_mode and self.agent_service:
+            original_policy_cb = getattr(self.agent_service, "on_policy_applied_locally", None)
+            def _on_policy_with_ui_refresh(action, app_name, status, limit_kbps):
+                if original_policy_cb:
+                    try:
+                        original_policy_cb(action, app_name, status, limit_kbps)
+                    except Exception:
+                        pass
+                try:
+                    self.async_bridge.post_event(self._on_remote_policy_updated)
+                except Exception:
+                    pass
+            self.agent_service.on_policy_applied_locally = _on_policy_with_ui_refresh
 
     def _init_ui(self):
         self.setWindowTitle("Traffic Monitor & Network Packet Shaper")
@@ -1190,6 +1206,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         if self.is_admin_mode:
             self.fleet_view = AdminFleetView()
             self.fleet_view.machine_selected.connect(self._on_machine_selected_for_control)
+            self.fleet_view.machine_protect_requested.connect(self._on_machine_protect_requested)
             self.stacked_pages.addWidget(self.fleet_view)
 
         # Trang Traffic Monitor (Split-view chuẩn GlassWire)
@@ -1288,6 +1305,28 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             self.protect_view.set_remote_mode(None, None)
         self._switch_nav_page(0)
 
+    def _on_machine_protect_requested(self, device_uuid: str):
+        """Admin click nút 🛡️ Chặn / QoS trong Fleet View: chuyển thẳng đến tab Protect với máy đó."""
+        self.selected_device_uuid = device_uuid
+        dev_state = self.fleet_service.get_device_state(device_uuid) if self.fleet_service else None
+        hostname = dev_state.hostname if dev_state else "Unknown"
+        ip = dev_state.ip_address if dev_state else "127.0.0.1"
+
+        # Cấu hình protect_view ở chế độ remote
+        if hasattr(self, 'protect_view'):
+            self.protect_view.set_remote_mode(
+                device_uuid, self.fleet_service.send_remote_command if self.fleet_service else None
+            )
+
+        self.breadcrumb_bar.setVisible(True)
+        self.lbl_breadcrumb_info.setText(
+            f"🛡️ Đang can thiệp Protect máy con: <b>{hostname}</b> ({ip}) — [UUID: {device_uuid[:8]}...]"
+        )
+
+        # Tìm index của tab Protect (index 2 trong admin mode: 0=Fleet, 1=Traffic, 2=Protect)
+        protect_tab_index = 2 if self.is_admin_mode else 1
+        self._switch_nav_page(protect_tab_index)
+
     def _refresh_fleet_admin_ui(self):
         """Cập nhật dữ liệu từ FleetManagerService lên giao diện Admin định kỳ."""
         if not self.fleet_service or not hasattr(self, 'fleet_view'):
@@ -1369,7 +1408,78 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         layout.addLayout(nav_container)
         layout.addStretch()
 
+        if self.is_client_mode and self.agent_service:
+            self.client_status_btn = QtWidgets.QPushButton()
+            self.client_status_btn.setFixedHeight(30)
+            self.client_status_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            self.client_status_btn.setToolTip("Nhấn để mở cửa sổ chi tiết kết nối Máy chủ Admin")
+            self.client_status_btn.clicked.connect(self._open_client_status_dialog)
+            layout.addWidget(self.client_status_btn)
+            self._update_client_status_indicator()
+
+            # Timer kiểm tra định kỳ trạng thái kết nối
+            self.client_status_timer = QtCore.QTimer(self)
+            self.client_status_timer.setInterval(1000)
+            self.client_status_timer.timeout.connect(self._update_client_status_indicator)
+            self.client_status_timer.start()
+
         return header
+
+    def _update_client_status_indicator(self):
+        if not hasattr(self, "client_status_btn") or not self.agent_service:
+            return
+        is_conn = self.agent_service.net_client.is_connected()
+        srv_host = self.agent_service.server_host
+        srv_port = self.agent_service.server_port
+        if is_conn:
+            self.client_status_btn.setText(f"🟢 Admin: {srv_host}:{srv_port} (Online)")
+            self.client_status_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #ECFDF5;
+                    color: #059669;
+                    font-weight: bold;
+                    border: 1px solid #A7F3D0;
+                    border-radius: 15px;
+                    padding: 3px 12px;
+                    font-size: 11px;
+                }
+                QPushButton:hover {
+                    background-color: #D1FAE5;
+                }
+            """)
+        else:
+            self.client_status_btn.setText(f"🔴 Mất kết nối Admin ({srv_host}:{srv_port})")
+            self.client_status_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #FEF2F2;
+                    color: #DC2626;
+                    font-weight: bold;
+                    border: 1px solid #FECACA;
+                    border-radius: 15px;
+                    padding: 3px 12px;
+                    font-size: 11px;
+                }
+                QPushButton:hover {
+                    background-color: #FEE2E2;
+                }
+            """)
+
+    def _open_client_status_dialog(self):
+        if not self.agent_service:
+            return
+        from presentation.client_status_window import ClientStatusWindow
+        if not hasattr(self, "_client_status_dialog") or self._client_status_dialog is None:
+            self._client_status_dialog = ClientStatusWindow(self.agent_service)
+        self._client_status_dialog.show()
+        self._client_status_dialog.raise_()
+        self._client_status_dialog.activateWindow()
+
+    def _on_remote_policy_updated(self):
+        if hasattr(self, "protect_view"):
+            self.protect_view.update_protect_table(
+                self.latest_proc_speeds, self.app_accumulated_bytes, self.app_metadata
+            )
+        self._refresh_policy_table()
 
     def _switch_nav_page(self, index: int):
         """Chuyển trang hiển thị và áp dụng giao diện nút bấm GlassWire"""
@@ -2190,7 +2300,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         layout.setSpacing(0)
 
         # Giao diện GlassWire Protect phong cách chuẩn xác
-        self.protect_view = GlassWireProtectView(self.service, self.icon_manager)
+        self.protect_view = GlassWireProtectView(self.service, self.icon_manager, fleet_service=getattr(self, 'fleet_service', None))
         layout.addWidget(self.protect_view)
 
         # Các widget dự phòng giữ nguyên để tương thích ngược 100%
@@ -4751,9 +4861,24 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         )
 
     def closeEvent(self, event):
-        """Dừng ứng dụng: Tự động dừng WinDivert Packet Shaper, dừng worker và luồng DB."""
-        self.render_timer.stop()
-        self.conn_timer.stop()
-        self.worker.stop()
-        self.service.stop()
+        """Dừng ứng dụng hoặc thu nhỏ về khay hệ thống."""
+        if getattr(self, "_hide_to_tray_on_close", False):
+            event.ignore()
+            self.hide()
+            return
+
+        if hasattr(self, "client_status_timer") and self.client_status_timer.isActive():
+            self.client_status_timer.stop()
+        if hasattr(self, "fleet_timer") and self.fleet_timer.isActive():
+            self.fleet_timer.stop()
+        if hasattr(self, "render_timer") and self.render_timer.isActive():
+            self.render_timer.stop()
+        if hasattr(self, "conn_timer") and self.conn_timer.isActive():
+            self.conn_timer.stop()
+        if hasattr(self, "worker") and self.worker:
+            self.worker.stop()
+        if self.service:
+            self.service.stop()
+        if self.is_client_mode and self.agent_service:
+            self.agent_service.stop()
         event.accept()

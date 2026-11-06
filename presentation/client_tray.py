@@ -67,10 +67,11 @@ class ClientTrayManager(QtCore.QObject):
     sig_toast = QtCore.pyqtSignal(str, str, int)       # (title, message, icon_type_int)
     sig_conn_state = QtCore.pyqtSignal(bool)           # (is_connected)
 
-    def __init__(self, agent_service, status_window, parent=None):
+    def __init__(self, agent_service, status_window, main_window=None, parent=None):
         super().__init__(parent)
         self.agent = agent_service
         self.status_window = status_window
+        self.main_window = main_window
         self.app = QApplication.instance()
         self._is_connected_cache = False
         self._alert_until = 0.0
@@ -149,12 +150,23 @@ class ClientTrayManager(QtCore.QObject):
 
         self.menu.addSeparator()
 
-        # Mở cửa sổ Dashboard/Status
-        self.act_open = self.menu.addAction("📊 Mở Bảng Trạng Thái & Cấu Hình...")
+        self.menu.addSeparator()
+
+        # Mở cửa sổ GlassWire Dashboard
+        if self.main_window:
+            self.act_open_dash = self.menu.addAction("🌐 Mở Giao Diện GlassWire...")
+            self.act_open_dash.triggered.connect(self.show_main_window)
+            f_dash = self.act_open_dash.font()
+            f_dash.setBold(True)
+            self.act_open_dash.setFont(f_dash)
+
+        # Mở cửa sổ Cấu hình/Status
+        self.act_open = self.menu.addAction("⚙ Cấu Hình Kết Nối Admin...")
         self.act_open.triggered.connect(self.show_status_window)
-        f_open = self.act_open.font()
-        f_open.setBold(True)
-        self.act_open.setFont(f_open)
+        if not self.main_window:
+            f_open = self.act_open.font()
+            f_open.setBold(True)
+            self.act_open.setFont(f_open)
 
         self.menu.addSeparator()
 
@@ -177,13 +189,19 @@ class ClientTrayManager(QtCore.QObject):
     def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason):
         """Xử lý khi người dùng click chuột vào biểu tượng khay hệ thống."""
         if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
-            if self.status_window.isVisible():
-                if self.status_window.isMinimized():
-                    self.status_window.showNormal()
-                self.status_window.raise_()
-                self.status_window.activateWindow()
+            if self.main_window:
+                self.show_main_window()
             else:
                 self.show_status_window()
+
+    def show_main_window(self):
+        """Mở và đưa cửa sổ chính GlassWire lên hàng đầu."""
+        if self.main_window:
+            if self.main_window.isMinimized():
+                self.main_window.showNormal()
+            self.main_window.show()
+            self.main_window.raise_()
+            self.main_window.activateWindow()
 
     def show_status_window(self):
         """Mở và đưa cửa sổ cấu hình trạng thái lên hàng đầu."""

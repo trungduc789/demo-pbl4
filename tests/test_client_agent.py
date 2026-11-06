@@ -113,6 +113,50 @@ class TestClientAgentService(unittest.TestCase):
             agent.stop()
             server.stop()
 
+    def test_client_agent_shared_monitor_service_and_dashboard_client_mode(self):
+        """Kiểm tra việc chia sẻ tài nguyên MonitorService với ClientAgentService và kích hoạt Client Mode trên Dashboard."""
+        from unittest.mock import MagicMock
+        from models.network_sample import BandwidthSpeed
+        from presentation.dashboard import BandwidthDashboard
+
+        mock_monitor = MagicMock()
+        mock_monitor.packet_shaper = MagicMock()
+        mock_monitor.collector = MagicMock()
+        mock_monitor.calculator = MagicMock()
+        mock_monitor.etw_consumer = MagicMock()
+        mock_monitor.latest_speed = BandwidthSpeed(download_speed_kb=120.0, upload_speed_kb=45.0)
+        mock_monitor.latest_proc_speeds = [
+            {"pid": 1234, "name": "chrome.exe", "down_kb": 100.0, "up_kb": 20.0, "exe": "C:\\chrome.exe"}
+        ]
+
+        agent = ClientAgentService(
+            server_host=self.TEST_HOST,
+            server_port=self.TEST_PORT,
+            enable_etw=False,
+            monitor_service=mock_monitor,
+        )
+
+        self.assertIs(agent.packet_shaper, mock_monitor.packet_shaper)
+        self.assertIs(agent.collector, mock_monitor.collector)
+        self.assertIs(agent.calculator, mock_monitor.calculator)
+        self.assertIs(agent.etw_consumer, mock_monitor.etw_consumer)
+
+        # Kiểm tra BandwidthDashboard ở chế độ client_mode
+        from PyQt6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        dashboard = BandwidthDashboard(
+            monitor_service=mock_monitor,
+            agent_service=agent,
+        )
+        self.assertTrue(dashboard.is_client_mode)
+        self.assertFalse(dashboard.is_admin_mode)
+        self.assertTrue(hasattr(dashboard, "client_status_btn"))
+        dashboard.close()
+        agent.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

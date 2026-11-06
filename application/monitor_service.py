@@ -30,6 +30,7 @@ class MonitorService:
         self.sample_count = 0
 
         # Lưu trữ chỉ số mới nhất
+        self.latest_speed: Optional[BandwidthSpeed] = None
         self.latest_proc_speeds: List[Dict] = []
         self.latest_total_proc_down: float = 0.0
         self.latest_total_proc_up: float = 0.0
@@ -157,6 +158,7 @@ class MonitorService:
                 pass
 
 
+        self.latest_speed = speed
         self.upload_history.append(speed.upload_speed_kb)
         self.download_history.append(speed.download_speed_kb)
         return speed, self.latest_proc_speeds, self.latest_total_proc_down, self.latest_total_proc_up

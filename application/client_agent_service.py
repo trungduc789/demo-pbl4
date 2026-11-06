@@ -48,25 +48,33 @@ class ClientAgentService:
         server_port: int = SERVER_DEFAULT_PORT,
         update_interval: float = UPDATE_INTERVAL,
         enable_etw: bool = True,
+        monitor_service: Optional[Any] = None,
     ):
         self.server_host = server_host
         self.server_port = server_port
         self.update_interval = update_interval
         self.enable_etw = enable_etw
+        self.monitor_service = monitor_service
 
-        # 1. Khởi tạo các module hạ tầng kỹ thuật
-        self.collector = NetworkCollector()
-        self.calculator = BandwidthCalculator()
-        self.packet_shaper = WinDivertPacketShaper()
-        self.etw_consumer: Optional[ETWNetworkConsumer] = None
+        # 1. Khởi tạo các module hạ tầng kỹ thuật (hoặc dùng chung từ monitor_service)
+        if self.monitor_service is not None:
+            self.collector = getattr(self.monitor_service, "collector", NetworkCollector())
+            self.calculator = getattr(self.monitor_service, "calculator", BandwidthCalculator())
+            self.packet_shaper = getattr(self.monitor_service, "packet_shaper", WinDivertPacketShaper())
+            self.etw_consumer = getattr(self.monitor_service, "etw_consumer", None)
+        else:
+            self.collector = NetworkCollector()
+            self.calculator = BandwidthCalculator()
+            self.packet_shaper = WinDivertPacketShaper()
+            self.etw_consumer: Optional[ETWNetworkConsumer] = None
 
-        if self.enable_etw:
-            try:
-                self.etw_consumer = ETWNetworkConsumer()
-                self.etw_consumer.start()
-            except Exception as e:
-                print(f"[ClientAgent Warning] Không thể khởi động ETW Consumer: {e}")
-                self.etw_consumer = None
+            if self.enable_etw:
+                try:
+                    self.etw_consumer = ETWNetworkConsumer()
+                    self.etw_consumer.start()
+                except Exception as e:
+                    print(f"[ClientAgent Warning] Không thể khởi động ETW Consumer: {e}")
+                    self.etw_consumer = None
 
         # 2. Định danh máy cố định (Đồng bộ với DatabaseManager.get_or_create_device)
         self.device_uuid, self.registration_data = self._generate_device_info()
@@ -174,8 +182,8 @@ class ClientAgentService:
         # Dừng mạng
         self.net_client.stop()
 
-        # Dừng ETW Consumer
-        if self.etw_consumer:
+        # Dừng ETW Consumer nếu là tự tạo
+        if self.etw_consumer and self.monitor_service is None:
             try:
                 self.etw_consumer.stop()
             except Exception:
@@ -208,9 +216,26 @@ class ClientAgentService:
                 self.total_tx_bytes = curr_sample.bytes_sent
                 self.total_rx_bytes = curr_sample.bytes_recv
 
-                # 1. Thu thập tiến trình mạng từ ETW Consumer
+                # 1. Thu thập tiến trình mạng
                 top_procs: List[ProcessMetricData] = []
-                if self.etw_consumer:
+                if self.monitor_service is not None:
+                    # Tận dụng dữ liệu mẫu vừa được MonitorService thu thập mà không làm gián đoạn ETW
+                    latest_sp = getattr(self.monitor_service, "latest_speed", None)
+                    if latest_sp is not None:
+                        speed = latest_sp
+
+                    raw_proc_speeds = getattr(self.monitor_service, "latest_proc_speeds", [])
+                    for p in raw_proc_speeds[:15]:
+                        top_procs.append(
+                            ProcessMetricData(
+                                name=p.get("name", "Unknown"),
+                                pid=p.get("pid", 0),
+                                down_kbps=round(float(p.get("down_kb", 0.0)), 2),
+                                up_kbps=round(float(p.get("up_kb", 0.0)), 2),
+                                connections_count=0,
+                            )
+                        )
+                elif self.etw_consumer:
                     try:
                         etw_samples = self.etw_consumer.flush_and_aggregate()
                         if etw_samples:

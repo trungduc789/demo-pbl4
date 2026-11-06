@@ -20,6 +20,8 @@ class AdminFleetView(QWidget):
 
     # Tín hiệu khi Admin chọn 1 máy để can thiệp: phát ra (device_uuid)
     machine_selected = QtCore.pyqtSignal(str)
+    # Tín hiệu khi Admin muốn chuyển thẳng đến tab Protect cho 1 máy: phát ra (device_uuid)
+    machine_protect_requested = QtCore.pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -341,6 +343,11 @@ class AdminFleetView(QWidget):
             self.tbl_devices.setItem(row, 6, policy_item)
 
             # Cột 7: Nút bấm Hành Động
+            action_widget = QWidget()
+            action_layout = QHBoxLayout(action_widget)
+            action_layout.setContentsMargins(2, 2, 2, 2)
+            action_layout.setSpacing(4)
+
             btn_view = QPushButton("Xem & Điều khiển ➔")
             btn_view.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
             btn_view.setFixedHeight(26)
@@ -359,7 +366,29 @@ class AdminFleetView(QWidget):
                 }
             """)
             btn_view.clicked.connect(lambda checked, uid=uuid_val: self.machine_selected.emit(uid))
-            self.tbl_devices.setCellWidget(row, 7, btn_view)
+            action_layout.addWidget(btn_view)
+
+            btn_protect = QPushButton("🛡️ Chặn / QoS")
+            btn_protect.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            btn_protect.setFixedHeight(26)
+            btn_protect.setStyleSheet("""
+                QPushButton {
+                    background-color: #DC2626;
+                    color: #FFFFFF;
+                    font-size: 11px;
+                    font-weight: bold;
+                    border-radius: 6px;
+                    padding: 2px 10px;
+                    border: none;
+                }
+                QPushButton:hover {
+                    background-color: #B91C1C;
+                }
+            """)
+            btn_protect.clicked.connect(lambda checked, uid=uuid_val: self.machine_protect_requested.emit(uid))
+            action_layout.addWidget(btn_protect)
+
+            self.tbl_devices.setCellWidget(row, 7, action_widget)
 
     def _on_table_row_double_clicked(self, row: int, col: int):
         """Khi double click vào dòng nào đó thì mở ngay máy đó."""
