@@ -292,9 +292,9 @@ class ClientTrayManager(QtCore.QObject):
         self._update_icon()
 
         # 2. Cập nhật tốc độ
-        shaper = self.agent.packet_shaper
-        down_kb = shaper.current_down_kbps if shaper.is_active else 0.0
-        up_kb = shaper.current_up_kbps if shaper.is_active else 0.0
+        # Lấy tốc độ thời gian thực của máy con
+        down_kb = getattr(self.agent, "latest_down_kbps", 0.0)
+        up_kb = getattr(self.agent, "latest_up_kbps", 0.0)
         pol_count = len(self.agent.active_policies)
 
         # 3. Cập nhật menu items

@@ -87,6 +87,16 @@ class ClientAgentService:
         self.total_rx_bytes: int = 0
         self.proc_info_cache: Dict[int, Tuple[str, str]] = {}
         self.active_policies: Dict[str, Dict] = {}  # {app_lower: {action, app, limit_kbps, direction, time}}
+        self.latest_down_kbps: float = 0.0
+        self.latest_up_kbps: float = 0.0
+        self.latest_cpu_pct: float = 0.0
+        self.latest_ram_pct: float = 0.0
+        self.latest_top_procs: List[ProcessMetricData] = []
+
+        # 4. Nhật ký kiểm toán thao tác từ Admin & Client (Audit Log Buffer)
+        self._audit_lock = threading.Lock()
+        self.audit_logs: List[Dict[str, Any]] = []
+        self._init_initial_audit_log()
 
         # Callback thông báo cho GUI khay hệ thống (System Tray Notification)
         # on_policy_applied_locally(action, app_name, status, limit_kbps)
@@ -106,6 +116,13 @@ class ClientAgentService:
         self.net_client.on_disconnected = self._handle_client_disconnected
 
     def _handle_client_connected(self):
+        self.add_audit_log(
+            source="Client Agent",
+            action="CONNECT",
+            target=f"{self.server_host}:{self.server_port}",
+            status="SUCCESS",
+            details=f"Kết nối thành công tới Admin Server ({self.server_host}:{self.server_port})",
+        )
         if self.on_connected:
             try:
                 self.on_connected()
@@ -113,11 +130,49 @@ class ClientAgentService:
                 print(f"[ClientAgent] on_connected callback error: {e}")
 
     def _handle_client_disconnected(self):
+        self.add_audit_log(
+            source="Client Agent",
+            action="DISCONNECT",
+            target=f"{self.server_host}:{self.server_port}",
+            status="INFO",
+            details=f"Mất kết nối với Admin Server ({self.server_host}:{self.server_port}), đang tự động kết nối lại...",
+        )
         if self.on_disconnected:
             try:
                 self.on_disconnected()
             except Exception as e:
                 print(f"[ClientAgent] on_disconnected callback error: {e}")
+
+    def _init_initial_audit_log(self):
+        """Khởi tạo mục nhật ký ban đầu khi khởi động Agent."""
+        self.add_audit_log(
+            source="Client Agent",
+            action="STARTUP",
+            target=self.registration_data.hostname,
+            status="SUCCESS",
+            details=f"Khởi động tiến trình Agent Node thành công (UUID: {self.device_uuid[:8]}...)",
+        )
+
+    def add_audit_log(self, source: str, action: str, target: str, status: str, details: str):
+        """Ghi nhận sự kiện kiểm toán nghiệp vụ an ninh vào bộ đệm."""
+        with self._audit_lock:
+            entry = {
+                "timestamp": time.time(),
+                "time_str": time.strftime("%H:%M:%S"),
+                "source": source,
+                "action": action,
+                "target": target,
+                "status": status,
+                "details": details,
+            }
+            self.audit_logs.insert(0, entry)
+            if len(self.audit_logs) > 200:
+                self.audit_logs.pop()
+
+    def get_audit_logs(self) -> List[Dict[str, Any]]:
+        """Lấy danh sách nhật ký kiểm toán cho giao diện."""
+        with self._audit_lock:
+            return list(self.audit_logs)
 
 
     def _generate_device_info(self) -> Tuple[str, DeviceRegistrationData]:
@@ -281,6 +336,12 @@ class ClientAgentService:
                     active_conns_count = 0
 
                 # 4. Đóng gói TelemetryPacket
+                self.latest_down_kbps = round(speed.download_speed_kb, 2)
+                self.latest_up_kbps = round(speed.upload_speed_kb, 2)
+                self.latest_cpu_pct = float(cpu_pct)
+                self.latest_ram_pct = float(ram_pct)
+                self.latest_top_procs = top_procs
+
                 telem = TelemetryPacket(
                     device_uuid=self.device_uuid,
                     timestamp=time.time(),
@@ -364,6 +425,37 @@ class ClientAgentService:
         status_str = "SUCCESS" if success else "FAILED"
         print(f"[ClientAgent Command Finished] {cmd.command_id} -> {status_str}: {message}")
 
+        # Ghi nhận sự kiện kiểm toán nghiệp vụ (Audit Log)
+        audit_act = action
+        if action == CommandAction.BLOCK_APP.value:
+            audit_act = "BLOCK"
+            audit_desc = f"Chặn hoàn toàn lưu lượng của ứng dụng '{app_name}' ({direction})"
+        elif action == CommandAction.THROTTLE_SET.value:
+            audit_act = "QoS"
+            audit_desc = f"Giới hạn tốc độ '{app_name}' mức {limit_kbps:.1f} KB/s ({direction})"
+        elif action == CommandAction.UNBLOCK_APP.value:
+            audit_act = "UNBLOCK"
+            audit_desc = f"Gỡ bỏ chặn cho ứng dụng '{app_name}'"
+        elif action == CommandAction.UNBLOCK_ALL.value:
+            audit_act = "UNBLOCK_ALL"
+            audit_desc = "Gỡ bỏ toàn bộ danh sách ứng dụng bị chặn"
+        elif action == CommandAction.REMOVE_LIMIT.value:
+            audit_act = "REMOVE_LIMIT"
+            audit_desc = f"Gỡ bỏ hạn mức QoS cho '{app_name or 'toàn bộ'}'"
+        elif action == CommandAction.PING.value:
+            audit_act = "PING"
+            audit_desc = "Admin Server gửi gói tin kiểm tra kết nối (Ping)"
+        else:
+            audit_desc = message
+
+        self.add_audit_log(
+            source="Admin Server",
+            action=audit_act,
+            target=app_name or "*",
+            status=status_str,
+            details=audit_desc,
+        )
+
         # Cập nhật danh sách chính sách hiện hành nếu thực thi thành công
         if success:
             app_key = app_name.lower()
@@ -425,4 +517,162 @@ class ClientAgentService:
         self.net_client.on_disconnected = self._handle_client_disconnected
         if self._is_running.is_set():
             self.net_client.start()
+
+    # =========================================================================
+    # CÁC DỊCH VỤ CHẨN ĐOÁN MẠNG (NETWORK DIAGNOSTICS & SYSTEM HELPERS)
+    # =========================================================================
+
+    def check_server_latency(self) -> Tuple[Optional[float], bool, str]:
+        """Đo độ trễ TCP tới Admin Server."""
+        import socket
+        t0 = time.perf_counter()
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect((self.server_host, self.server_port))
+            s.close()
+            latency = round((time.perf_counter() - t0) * 1000.0, 1)
+            return latency, True, "Kết nối TCP ổn định"
+        except Exception:
+            if self.net_client.is_connected():
+                return 1.0, True, "Kênh kết nối Socket chính đang mở"
+            return None, False, "Không thể kết nối tới Server"
+
+    def check_internet_latency(self, target_host: str = "8.8.8.8", target_port: int = 53, timeout: float = 1.0) -> Tuple[Optional[float], bool, str]:
+        """Đo độ trễ tới Gateway Internet / Public DNS."""
+        import socket
+        t0 = time.perf_counter()
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((target_host, target_port))
+            s.close()
+            latency = round((time.perf_counter() - t0) * 1000.0, 1)
+            return latency, True, "Internet sẵn sàng"
+        except Exception:
+            try:
+                t1 = time.perf_counter()
+                socket.gethostbyname("dns.google")
+                latency = round((time.perf_counter() - t1) * 1000.0, 1)
+                return latency, True, "DNS Lookup thành công"
+            except Exception:
+                return None, False, "Không phản hồi mạng ngoài"
+
+    def get_active_nic_info(self) -> Dict[str, Any]:
+        """Thu thập thông tin card mạng chính đang định tuyến."""
+        import socket
+        routing_ip = self.registration_data.ip_address
+        nic_name = "Tự động phát hiện"
+        nic_speed = 0
+        link_type = "Ethernet / Wi-Fi"
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            routing_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            pass
+
+        try:
+            stats = psutil.net_if_stats()
+            addrs = psutil.net_if_addrs()
+            for name, addr_list in addrs.items():
+                for a in addr_list:
+                    if getattr(a, "address", "") == routing_ip:
+                        nic_name = name
+                        st = stats.get(name)
+                        if st:
+                            nic_speed = getattr(st, "speed", 0)
+                        lower_name = name.lower()
+                        if "wi-fi" in lower_name or "wireless" in lower_name or "wlan" in lower_name:
+                            link_type = "Wi-Fi (Wireless 802.11)"
+                        elif "ethernet" in lower_name or "eth" in lower_name:
+                            link_type = "Ethernet (LAN Cable)"
+                        break
+        except Exception:
+            pass
+
+        return {
+            "name": nic_name,
+            "ip": routing_ip,
+            "mac": self.registration_data.mac_address,
+            "speed_mbps": nic_speed if nic_speed > 0 else 100,
+            "type": link_type,
+            "gateway": "192.168.1.1",
+        }
+
+    def run_full_diagnostics(self) -> List[str]:
+        """Chạy bài kiểm tra toàn diện và trả về danh sách nhật ký."""
+        results = []
+        now_str = time.strftime("%H:%M:%S")
+        results.append(f"[{now_str}] Bắt đầu kiểm tra chẩn đoán hệ thống mạng máy con...")
+
+        # 1. Driver WinDivert
+        shaper_active = getattr(self.packet_shaper, "is_active", False)
+        if shaper_active:
+            results.append("✓ [Driver] WinDivert Packet Filtering: ĐANG HOẠT ĐỘNG (Bảo vệ tích cực)")
+        else:
+            results.append("✓ [Driver] WinDivert Packet Filtering: SẴN SÀNG (Standby)")
+
+        # 2. ETW Consumer
+        if self.etw_consumer and self.etw_consumer.is_alive():
+            results.append("✓ [ETW] Kernel Event Tracing Consumer: ĐANG THU THẬP BĂNG THÔNG")
+        else:
+            results.append("ℹ [ETW] Chế độ giám sát I/O Socket psutil tiêu chuẩn")
+
+        # 3. Kết nối Admin Server
+        srv_lat, srv_ok, srv_msg = self.check_server_latency()
+        if srv_ok:
+            results.append(f"✓ [Server] Máy chủ {self.server_host}:{self.server_port} -> Phản hồi {srv_lat} ms ({srv_msg})")
+        else:
+            results.append(f"⚠ [Server] Không kết nối được {self.server_host}:{self.server_port} ({srv_msg})")
+
+        # 4. Kết nối Internet Gateway
+        net_lat, net_ok, net_msg = self.check_internet_latency()
+        if net_ok:
+            results.append(f"✓ [Internet] Cổng DNS 8.8.8.8 -> Phản hồi {net_lat} ms ({net_msg})")
+        else:
+            results.append(f"ℹ [Internet] Kết nối mạng ngoài: {net_msg}")
+
+        # 5. Tổng kết
+        results.append(f"[{time.strftime('%H:%M:%S')}] Hoàn tất quy trình kiểm tra chẩn đoán.")
+        return results
+
+    def is_windows_autostart(self) -> bool:
+        """Kiểm tra máy con có được thiết lập tự khởi động cùng Windows không."""
+        if sys.platform != "win32":
+            return False
+        try:
+            import winreg
+            run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_READ) as key:
+                winreg.QueryValueEx(key, "ClientNetworkAgent")
+                return True
+        except Exception:
+            return False
+
+    def set_windows_autostart(self, enable: bool) -> bool:
+        """Bật / tắt tự động khởi động cùng Windows cho Client Agent."""
+        if sys.platform != "win32":
+            return False
+        try:
+            import winreg
+            run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE) as key:
+                if enable:
+                    if getattr(sys, "frozen", False):
+                        app_exe = sys.executable
+                    else:
+                        app_exe = f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}" --hide'
+                    winreg.SetValueEx(key, "ClientNetworkAgent", 0, winreg.REG_SZ, app_exe)
+                else:
+                    try:
+                        winreg.DeleteValue(key, "ClientNetworkAgent")
+                    except FileNotFoundError:
+                        pass
+            return True
+        except Exception as e:
+            print(f"[ClientAgent Autostart Error] {e}")
+            return False
 

@@ -80,19 +80,18 @@ def load_config() -> dict:
 
 
 def main():
+    # 1. Khởi tạo môi trường UTF-8 và hệ thống trước tiên
+    setup_system_environment()
+
     parser = argparse.ArgumentParser(description="Network Traffic Monitor & Packet Shaper - Client Agent")
     parser.add_argument("--server", type=str, default=None, help="Địa chỉ IP của máy chủ Admin (Server)")
     parser.add_argument("--port", type=int, default=None, help="Cổng TCP của máy chủ Admin")
     parser.add_argument("--no-etw", action="store_true", help="Vô hiệu hóa ETW Consumer")
     parser.add_argument("--no-elevate", action="store_true", help="Bỏ qua tự động yêu cầu nâng quyền Administrator (UAC)")
     parser.add_argument("--headless", action="store_true", help="Chạy ở chế độ dòng lệnh thuần túy không hiển thị System Tray/GUI")
-    parser.add_argument("--mini", action="store_true", help="Chỉ mở hộp thoại mini trạng thái kết nối thay vì giao diện đầy đủ")
-    parser.add_argument("--hide", action="store_true", help="Khởi động ẩn xuống khay hệ thống (System Tray)")
-    parser.add_argument("--show-window", action="store_true", help="Mở cửa sổ trạng thái mini ngay khi khởi chạy")
+    parser.add_argument("--hide", action="store_true", help="Khởi động ẩn hoàn toàn xuống khay hệ thống (System Tray)")
+    parser.add_argument("--full-gui", action="store_true", help="Mở giao diện GlassWire Dashboard đầy đủ (chế độ độc lập cũ)")
     args = parser.parse_args()
-
-    # 1. Khởi tạo môi trường UTF-8
-    setup_system_environment()
 
     # 2. Kiểm tra và yêu cầu quyền Admin nếu cần (trên Windows)
     if not args.no_elevate and not args.headless:
@@ -106,7 +105,7 @@ def main():
     enable_etw = False if args.no_etw else cfg.get("enable_etw", True)
     show_toast = cfg.get("show_toast_notifications", True)
 
-    mode_str = "Headless Daemon" if args.headless else ("Mini Status Box" if args.mini else "Full GlassWire Dashboard")
+    mode_str = "Headless Daemon" if args.headless else ("Full GlassWire Dashboard" if args.full_gui else "Client Network Agent (System Tray + Status Window)")
     print("=" * 75)
     print("    NETWORK TRAFFIC MONITOR & PACKET SHAPER - CLIENT AGENT")
     print("=" * 75)
@@ -161,8 +160,8 @@ def main():
         monitor_svc = None
         main_dashboard = None
 
-        if args.mini:
-            # Chế độ chỉ mở hộp thoại mini
+        if not args.full_gui:
+            # Chế độ Agent chuẩn (System Tray + Client Status Window) - Hướng 1
             agent = ClientAgentService(
                 server_host=server_host,
                 server_port=server_port,
@@ -170,11 +169,11 @@ def main():
             )
             agent.show_toast_notifications = show_toast
             status_window = ClientStatusWindow(agent)
-            tray_manager = ClientTrayManager(agent, status_window)
+            tray_manager = ClientTrayManager(agent, status_window, main_window=None)
             if not args.hide:
                 status_window.show()
         else:
-            # Chế độ Giao diện đầy đủ chuẩn GlassWire
+            # Chế độ Giao diện đầy đủ chuẩn GlassWire (Chế độ quản trị cũ)
             monitor_svc = MonitorService()
             agent = ClientAgentService(
                 server_host=server_host,
@@ -193,9 +192,6 @@ def main():
 
             status_window = ClientStatusWindow(agent)
             tray_manager = ClientTrayManager(agent, status_window, main_window=main_dashboard)
-
-            if args.show_window:
-                status_window.show()
 
             if not args.hide:
                 main_dashboard.show()
