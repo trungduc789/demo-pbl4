@@ -21,7 +21,7 @@ Thiết kế chuẩn xác 100% theo giao diện GlassWire Protect (Firewall):
 - Tích hợp trực tiếp với WinDivert Kernel Packet Shaper của đồ án.
 """
 
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Any
 import psutil
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtWidgets import (

@@ -31,14 +31,14 @@ from presentation.dashboard import BandwidthDashboard
 
 
 def main():
+    # 1. Khởi tạo môi trường hệ thống và mã hóa UTF-8
+    setup_system_environment()
+
     parser = argparse.ArgumentParser(description="Network Traffic Monitor - Centralized Admin Dashboard")
     parser.add_argument("--host", type=str, default=SERVER_DEFAULT_HOST, help="Địa chỉ IP lắng nghe (mặc định 0.0.0.0)")
     parser.add_argument("--port", type=int, default=SERVER_DEFAULT_PORT, help="Cổng TCP nhận kết nối từ các máy con")
     parser.add_argument("--no-db", action="store_true", help="Vô hiệu hóa lưu MySQL (dùng khi kiểm thử không có XAMPP/MySQL)")
     args = parser.parse_args()
-
-    # 1. Khởi tạo môi trường hệ thống và mã hóa UTF-8
-    setup_system_environment()
 
     print("=" * 75)
     print("    NETWORK TRAFFIC MONITOR & PACKET SHAPER - ADMIN DASHBOARD")
