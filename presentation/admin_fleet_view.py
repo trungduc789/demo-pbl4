@@ -131,6 +131,7 @@ class AdminFleetView(QWidget):
             "Tải Xuống ↓", "Tải Lên ↑", "Chính Sách Áp Dụng", "Hành Động"
         ])
         self.tbl_devices.verticalHeader().setVisible(False)
+        self.tbl_devices.verticalHeader().setDefaultSectionSize(48)
         self.tbl_devices.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tbl_devices.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.tbl_devices.setShowGrid(False)
@@ -143,17 +144,17 @@ class AdminFleetView(QWidget):
                 font-size: 12px;
             }
             QHeaderView::section {
-                background-color: #F1F5F9;
+                background-color: #F8FAFC;
                 color: #475569;
-                font-weight: bold;
+                font-weight: 700;
                 font-size: 11px;
-                padding: 8px;
+                padding: 10px 8px;
                 border: none;
-                border-bottom: 1px solid #E2E8F0;
+                border-bottom: 2px solid #E2E8F0;
             }
             QTableWidget::item {
                 padding: 6px 8px;
-                border-bottom: 1px solid #F8FAFC;
+                border-bottom: 1px solid #F1F5F9;
             }
             QTableWidget::item:selected {
                 background-color: #EFF6FF;
@@ -161,16 +162,30 @@ class AdminFleetView(QWidget):
             }
         """)
 
-        # Cấu hình kích thước các cột
+        # Cấu hình kích thước các cột cân đối, thoáng đãng
         header = self.tbl_devices.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.tbl_devices.setColumnWidth(0, 110)   # Trạng Thái
+
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)  # Tên Máy & UUID co giãn linh hoạt
+
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.tbl_devices.setColumnWidth(2, 130)   # Địa Chỉ IP
+
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.tbl_devices.setColumnWidth(3, 145)   # Hệ Điều Hành
+
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self.tbl_devices.setColumnWidth(4, 110)   # Tải Xuống
+
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.tbl_devices.setColumnWidth(5, 110)   # Tải Lên
+
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        self.tbl_devices.setColumnWidth(6, 140)   # Chính Sách Áp Dụng
+
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
+        self.tbl_devices.setColumnWidth(7, 245)   # Hành Động (Đủ chỗ cho 2 nút bấm)
 
         self.tbl_devices.cellDoubleClicked.connect(self._on_table_row_double_clicked)
         layout.addWidget(self.tbl_devices, stretch=1)
@@ -262,6 +277,7 @@ class AdminFleetView(QWidget):
         self.tbl_devices.setRowCount(len(devices))
 
         for row, dev in enumerate(devices):
+            self.tbl_devices.setRowHeight(row, 48)
             uuid_val = getattr(dev, 'device_uuid', '')
             status = getattr(dev, 'status', 'offline')
             hostname = getattr(dev, 'hostname', 'Unknown')
@@ -286,6 +302,7 @@ class AdminFleetView(QWidget):
             short_uuid = uuid_val[:8] + "..." if len(uuid_val) > 8 else uuid_val
             name_item = QTableWidgetItem(f"💻  {hostname}  ({short_uuid})")
             name_item.setFont(QtGui.QFont("Segoe UI", 10, QtGui.QFont.Weight.Bold))
+            name_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft)
             name_item.setData(QtCore.Qt.ItemDataRole.UserRole, uuid_val)
             self.tbl_devices.setItem(row, 1, name_item)
 
@@ -345,12 +362,12 @@ class AdminFleetView(QWidget):
             # Cột 7: Nút bấm Hành Động
             action_widget = QWidget()
             action_layout = QHBoxLayout(action_widget)
-            action_layout.setContentsMargins(2, 2, 2, 2)
-            action_layout.setSpacing(4)
+            action_layout.setContentsMargins(6, 6, 6, 6)
+            action_layout.setSpacing(8)
 
-            btn_view = QPushButton("Xem & Điều khiển ➔")
+            btn_view = QPushButton("Xem Chi Tiết ➔")
             btn_view.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-            btn_view.setFixedHeight(26)
+            btn_view.setFixedHeight(30)
             btn_view.setStyleSheet("""
                 QPushButton {
                     background-color: #2563EB;
@@ -358,7 +375,7 @@ class AdminFleetView(QWidget):
                     font-size: 11px;
                     font-weight: bold;
                     border-radius: 6px;
-                    padding: 2px 10px;
+                    padding: 4px 10px;
                     border: none;
                 }
                 QPushButton:hover {
@@ -370,7 +387,7 @@ class AdminFleetView(QWidget):
 
             btn_protect = QPushButton("🛡️ Chặn / QoS")
             btn_protect.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-            btn_protect.setFixedHeight(26)
+            btn_protect.setFixedHeight(30)
             btn_protect.setStyleSheet("""
                 QPushButton {
                     background-color: #DC2626;
@@ -378,7 +395,7 @@ class AdminFleetView(QWidget):
                     font-size: 11px;
                     font-weight: bold;
                     border-radius: 6px;
-                    padding: 2px 10px;
+                    padding: 4px 10px;
                     border: none;
                 }
                 QPushButton:hover {

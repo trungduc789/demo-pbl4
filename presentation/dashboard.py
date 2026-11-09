@@ -1234,6 +1234,53 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
 
         self.setCentralWidget(container)
 
+    def _get_db_manager(self):
+        """Lấy DatabaseManager từ MonitorService hoặc FleetManagerService an toàn."""
+        if self.service and hasattr(self.service, "db_manager") and self.service.db_manager:
+            return self.service.db_manager
+        if self.fleet_service and hasattr(self.fleet_service, "db") and self.fleet_service.db:
+            return self.fleet_service.db
+        return None
+
+    def _get_active_collector(self):
+        """Lấy NetworkCollector để quét socket và thông số card mạng."""
+        if self.service and hasattr(self.service, "collector") and self.service.collector:
+            return self.service.collector
+        if not hasattr(self, "_shared_collector") or self._shared_collector is None:
+            from infrastructure.network_collector import NetworkCollector
+            self._shared_collector = NetworkCollector()
+        return self._shared_collector
+
+    def _get_active_connections(self) -> List[Dict]:
+        """Lấy danh sách socket TCP kèm thông tin tiến trình an toàn cho cả Admin và Standalone."""
+        if self.service and hasattr(self.service, "get_connections"):
+            try:
+                conns = self.service.get_connections()
+                if conns:
+                    return conns
+            except Exception:
+                pass
+        try:
+            collector = self._get_active_collector()
+            raw_conns = collector.collect_tcp_connections()
+            enriched = []
+            for conn in raw_conns:
+                pid = conn.pid or 0
+                p_info = collector.get_process_info(pid)
+                p_name = p_info.name if p_info else ("System" if pid == 0 else f"PID {pid}")
+                enriched.append({
+                    "pid": pid,
+                    "process_name": p_name,
+                    "protocol": conn.protocol,
+                    "local_addr": f"{conn.local_ip}:{conn.local_port}" if conn.local_port else conn.local_ip,
+                    "remote_addr": f"{conn.remote_ip}:{conn.remote_port}" if conn.remote_ip and conn.remote_port else ("*" if conn.state == "LISTEN" else "-"),
+                    "state": conn.state
+                })
+            return enriched
+        except Exception as e:
+            print(f"[Dashboard Connections Error] {e}")
+            return []
+
     def _create_breadcrumb_bar(self) -> QtWidgets.QFrame:
         """Tạo thanh Breadcrumb điều hướng quay lại danh sách máy trạm."""
         bar = QtWidgets.QFrame()
@@ -1335,6 +1382,12 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         devices = self.fleet_service.get_all_device_states()
         self.fleet_view.update_fleet_data(devices, summary)
 
+        # Tự động chọn máy đầu tiên nếu chưa chọn máy nào
+        if not self.selected_device_uuid and devices:
+            online_devs = [d for d in devices if d.status == "online"]
+            target_dev = online_devs[0] if online_devs else devices[0]
+            self.selected_device_uuid = target_dev.device_uuid
+
         # Nếu đang giám sát một máy cụ thể thì nạp data của máy đó vào biểu đồ
         if self.selected_device_uuid:
             dev_state = self.fleet_service.get_device_state(self.selected_device_uuid)
@@ -1351,6 +1404,8 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
                         "tx_bytes": int(p.up_kbps * 1024),
                         "exe": "",
                     })
+                    if p.name not in self.app_metadata:
+                        self.app_metadata[p.name] = {"exe": "", "pid": p.pid}
                 down_spd = telem.speeds.download_kbps
                 up_spd = telem.speeds.upload_kbps
                 self._on_new_sample(
@@ -2230,7 +2285,8 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         try:
             win_down, win_up, win_app_bytes = self._compute_window_traffic()
             tot_win_bytes = win_down + win_up
-            active_conns = self.service.collector.collect_tcp_connections()
+            collector = self._get_active_collector()
+            active_conns = collector.collect_tcp_connections() if collector else []
             self.usage_view.update_usage_data(
                 win_app_bytes,
                 active_conns,
@@ -2407,13 +2463,6 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         fb_layout.addWidget(self.btn_load_usage_history)
 
         fb_layout.addStretch()
-
-        btn_refresh_db = QtWidgets.QPushButton("🔄 Kiểm Tra CSDL")
-        btn_refresh_db.setFixedHeight(28)
-        btn_refresh_db.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        btn_refresh_db.setStyleSheet("background-color: #F1F5F9; color: #334155; font-size: 11px; font-weight: 600; padding: 2px 10px; border: 1px solid #CBD5E1; border-radius: 5px;")
-        btn_refresh_db.clicked.connect(self._verify_database)
-        fb_layout.addWidget(btn_refresh_db)
 
         layout.addWidget(filter_bar)
 
@@ -3587,7 +3636,8 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             try:
                 from datetime import datetime as _dt
                 dt_obj = _dt.fromtimestamp(t_val)
-                db_procs = self.service.get_processes_around_time(dt_obj, tolerance_seconds=5.0)
+                db_mgr = self._get_db_manager()
+                db_procs = db_mgr.get_processes_around_time(dt_obj, tolerance_seconds=5.0) if db_mgr else []
                 if db_procs:
                     top_procs = [
                         {
@@ -3699,9 +3749,14 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
 
     def _populate_history_dates(self):
         """Truy vấn danh sách các ngày có dữ liệu đo trong CSDL và nạp vào ComboBox thanh công cụ."""
+        db_mgr = self._get_db_manager()
+        if not db_mgr:
+            today_str = time.strftime("%Y-%m-%d")
+            self._apply_history_dates([today_str])
+            return
         def bg():
             try:
-                dates = self.service.get_recorded_dates()
+                dates = db_mgr.get_recorded_dates()
                 self.async_bridge.run_on_main(self._apply_history_dates, dates)
             except Exception as e:
                 print(f"[UI History Dates Error] {e}")
@@ -3748,11 +3803,18 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self.btn_load_history.setEnabled(False)
         self.btn_load_history.setText("Đang tải...")
 
+        db_mgr = self._get_db_manager()
+        if not db_mgr:
+            self.btn_load_history.setEnabled(True)
+            self.btn_load_history.setText("🔍 Tải Biểu Đồ")
+            QtWidgets.QMessageBox.warning(self, "CSDL Chưa Bật", "CSDL MySQL chưa kết nối để tải lại lịch sử ngày cũ.")
+            return
+
         def bg():
             try:
-                series = self.service.get_daily_traffic_series(target_date)
-                summary = self.service.get_daily_summary(target_date, series=series)
-                top_procs = self.service.get_top_processes_for_date(target_date, limit=30)
+                series = db_mgr.get_daily_traffic_series(target_date)
+                summary = db_mgr.get_daily_summary(target_date, series=series)
+                top_procs = db_mgr.get_top_processes_for_date(target_date, limit=30)
                 self.async_bridge.run_on_main(self._apply_history_series, series, target_date, summary, top_procs)
             except Exception as e:
                 print(f"[UI Load History Error] {e}")
@@ -4097,9 +4159,14 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
 
     def _populate_usage_history_dates(self):
         """Nạp danh sách ngày có dữ liệu vào thanh chọn của trang Usage History."""
+        db_mgr = self._get_db_manager()
+        if not db_mgr:
+            today_str = time.strftime("%Y-%m-%d")
+            self._apply_usage_history_dates([today_str])
+            return
         def bg():
             try:
-                dates = self.service.get_recorded_dates()
+                dates = db_mgr.get_recorded_dates()
                 self.async_bridge.run_on_main(self._apply_usage_history_dates, dates)
             except Exception as e:
                 print(f"[UI Usage Dates Error] {e}")
@@ -4137,12 +4204,28 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self.btn_load_usage_history.setEnabled(False)
         self.btn_load_usage_history.setText("Đang tải...")
 
+        db_mgr = self._get_db_manager()
+        if not db_mgr:
+            self.btn_load_usage_history.setEnabled(True)
+            self.btn_load_usage_history.setText("🔍 Tải Lịch Sử")
+            summary = {
+                "total_rx_bytes": 0,
+                "total_tx_bytes": 0,
+                "peak_download_speed": 0,
+                "peak_upload_speed": 0,
+                "sample_count": 0,
+                "earliest_time": None,
+                "latest_time": None
+            }
+            self._apply_usage_history_page(summary, [], [], [], date_str)
+            return
+
         def bg():
             try:
-                series = self.service.get_daily_traffic_series(date_str)
-                summary = self.service.get_daily_summary(date_str, series=series)
-                top_procs = self.service.get_top_processes_for_date(date_str, limit=20)
-                logs = self.service.get_detailed_traffic_logs(date_str, limit=100)
+                series = db_mgr.get_daily_traffic_series(date_str)
+                summary = db_mgr.get_daily_summary(date_str, series=series)
+                top_procs = db_mgr.get_top_processes_for_date(date_str, limit=20)
+                logs = db_mgr.get_detailed_traffic_logs(date_str, limit=100)
                 self.async_bridge.run_on_main(self._apply_usage_history_page, summary, series, top_procs, logs, date_str)
             except Exception as e:
                 print(f"[UI Usage Page Error] {e}")
@@ -4374,7 +4457,8 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             try:
                 from datetime import datetime as _dt
                 dt_obj = _dt.fromtimestamp(t_val)
-                db_procs = self.service.get_processes_around_time(dt_obj, tolerance_seconds=5.0)
+                db_mgr = self._get_db_manager()
+                db_procs = db_mgr.get_processes_around_time(dt_obj, tolerance_seconds=5.0) if db_mgr else []
                 self.async_bridge.run_on_main(self._apply_hist_point_procs, time_full_str, d_str, u_str, tot_str, db_procs)
             except Exception as e:
                 print(f"[UI Hist Point Procs Error] {e}")
@@ -4544,10 +4628,10 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
 
     def _refresh_connections(self):
         """Làm mới danh sách kết nối TCP"""
-        if self.stacked_pages.currentIndex() != 3:
+        if hasattr(self, "page_scanner") and self.stacked_pages.currentWidget() != self.page_scanner:
             return
         try:
-            conns = self.service.get_connections()
+            conns = self._get_active_connections()
             self.conn_table.setRowCount(len(conns))
 
             for row_idx, conn in enumerate(conns):
@@ -4584,9 +4668,24 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
 
     def _verify_database(self):
         """Kiểm tra CSDL MySQL bất đồng bộ"""
+        db_mgr = self._get_db_manager()
+        if not db_mgr:
+            stats = {
+                "connected": False,
+                "devices": 0,
+                "network_interfaces": 0,
+                "interface_traffic": 0,
+                "processes": 0,
+                "process_traffic": 0,
+                "network_connections": 0,
+            }
+            self.db_stats_card.setText("⚠️ CSDL MySQL chưa kết nối (đang chạy với cờ --no-db hoặc chưa khởi động MySQL).")
+            return
+
         def bg_worker():
             try:
-                stats, history = self.service.get_database_verification()
+                stats = db_mgr.get_database_stats()
+                history = db_mgr.get_recent_history(limit=15)
                 self.async_bridge.run_on_main(self._apply_database_verification, stats, history)
             except Exception as e:
                 self.async_bridge.run_on_main(self.db_stats_card.setText, f"⚠️ Lỗi khi truy vấn CSDL: {e}")
