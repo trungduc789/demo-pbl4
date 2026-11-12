@@ -12,9 +12,12 @@ from typing import Dict, List, Optional, Any
 
 class MessageType(str, Enum):
     """Phân loại các loại gói tin truyền thông trong hệ thống."""
-    REGISTER = "REGISTER"                # Client đăng ký thông tin máy với Server
+    CHALLENGE = "CHALLENGE"              # Server gửi nonce ngẫu nhiên yêu cầu xác thực
+    REGISTER = "REGISTER"                # Client đăng ký thông tin máy + HMAC xác thực
+    REGISTER_OK = "REGISTER_OK"          # Server xác nhận đăng ký thành công (Mutual Auth)
     HEARTBEAT = "HEARTBEAT"              # Giữ kết nối (Keep-Alive)
     TELEMETRY = "TELEMETRY"              # Số liệu đo đạc thời gian thực từ Client gửi lên
+    TELEMETRY_ACK = "TELEMETRY_ACK"      # Server xác nhận đã tiếp nhận Telemetry thành công
     COMMAND = "COMMAND"                  # Lệnh can thiệp từ Admin gửi xuống Client
     COMMAND_RESULT = "COMMAND_RESULT"    # Báo cáo kết quả thực thi lệnh từ Client về Admin
     DISCONNECT = "DISCONNECT"            # Thông báo ngắt kết nối chủ động

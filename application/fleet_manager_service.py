@@ -7,6 +7,7 @@ Dịch vụ Quản lý Đội ngũ Máy con (Fleet Manager Service - Application
 
 import time
 import threading
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Callable
@@ -255,7 +256,7 @@ class FleetManagerService:
             if state.status != "online":
                 return False, f"Máy con '{state.hostname}' hiện đang Offline, không thể nhận lệnh."
 
-        cmd_id = f"CMD-{int(time.time() * 1000)}"
+        cmd_id = f"CMD-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
         cmd = CommandPacket(
             command_id=cmd_id,
             target_device_uuid=device_uuid,

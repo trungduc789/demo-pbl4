@@ -85,19 +85,36 @@ class MonitorService:
             # Đồng bộ chính xác tốc độ cho ứng dụng đang được bóp băng thông bởi PacketShaper
             if hasattr(self, 'packet_shaper') and self.packet_shaper and self.packet_shaper.is_active:
                 shaper_status = self.packet_shaper.get_status()
-                target_app = (shaper_status.get("target_app") or "").lower()
-                target_base = target_app.replace(".exe", "").strip()
-                shaper_down = shaper_status.get("current_down_kbps", 0.0)
-                shaper_up = shaper_status.get("current_up_kbps", 0.0)
-                shaper_dir = shaper_status.get("direction", "both")
+                throttled_dict = shaper_status.get("throttled_apps", {})
+                if throttled_dict:
+                    for app_k, app_info in throttled_dict.items():
+                        t_name = (app_info.get("target_app") or app_k).lower()
+                        t_base = t_name.replace(".exe", "").strip()
+                        s_down = app_info.get("current_down_kbps", 0.0)
+                        s_up = app_info.get("current_up_kbps", 0.0)
+                        s_dir = app_info.get("direction", "both")
 
-                for p in proc_speeds:
-                    p_name = p.get("name", "").lower()
-                    if p_name == target_app or p_name.replace(".exe", "") == target_base or (target_base and target_base in p_name):
-                        if shaper_dir in ("download", "both"):
-                            p["down_kb"] = shaper_down
-                        if shaper_dir in ("upload", "both"):
-                            p["up_kb"] = shaper_up
+                        for p in proc_speeds:
+                            p_name = p.get("name", "").lower()
+                            if p_name == t_name or p_name.replace(".exe", "") == t_base or (t_base and t_base in p_name):
+                                if s_dir in ("download", "both"):
+                                    p["down_kb"] = s_down
+                                if s_dir in ("upload", "both"):
+                                    p["up_kb"] = s_up
+                else:
+                    target_app = (shaper_status.get("target_app") or "").lower()
+                    target_base = target_app.replace(".exe", "").strip()
+                    shaper_down = shaper_status.get("current_down_kbps", 0.0)
+                    shaper_up = shaper_status.get("current_up_kbps", 0.0)
+                    shaper_dir = shaper_status.get("direction", "both")
+
+                    for p in proc_speeds:
+                        p_name = p.get("name", "").lower()
+                        if p_name == target_app or p_name.replace(".exe", "") == target_base or (target_base and target_base in p_name):
+                            if s_dir in ("download", "both"):
+                                p["down_kb"] = shaper_down
+                            if s_dir in ("upload", "both"):
+                                p["up_kb"] = shaper_up
 
             # Sắp xếp tiến trình có lưu lượng mạng lớn nhất lên trên
             proc_speeds.sort(key=lambda x: (x["down_kb"] + x["up_kb"]), reverse=True)
