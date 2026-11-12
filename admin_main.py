@@ -6,7 +6,7 @@ Quản lý tập trung toàn bộ đội ngũ máy trạm:
 - Can thiệp Firewall (Block/Unblock) và Giới hạn tốc độ (QoS Throttling) từ xa.
 
 Sử dụng:
-    python admin_main.py [--host 0.0.0.0] [--port 9988] [--no-db]
+    python admin_main.py [--host 0.0.0.0] [--port 9988]
 """
 
 import sys
@@ -37,21 +37,18 @@ def main():
     parser = argparse.ArgumentParser(description="Network Traffic Monitor - Centralized Admin Dashboard")
     parser.add_argument("--host", type=str, default=SERVER_DEFAULT_HOST, help="Địa chỉ IP lắng nghe (mặc định 0.0.0.0)")
     parser.add_argument("--port", type=int, default=SERVER_DEFAULT_PORT, help="Cổng TCP nhận kết nối từ các máy con")
-    parser.add_argument("--no-db", action="store_true", help="Vô hiệu hóa lưu MySQL (dùng khi kiểm thử không có XAMPP/MySQL)")
     args = parser.parse_args()
 
     print("=" * 75)
     print("    NETWORK TRAFFIC MONITOR & PACKET SHAPER - ADMIN DASHBOARD")
     print("=" * 75)
     print(f"[*] Máy chủ quản trị đang lắng nghe tại: {args.host}:{args.port}")
-    print(f"[*] CSDL MySQL tập trung: {'Tắt' if args.no_db else 'Bật'}")
     print("[*] Đang khởi tạo giao diện quản trị Admin...\n")
 
     # 2. Khởi tạo dịch vụ FleetManagerService
     fleet_service = FleetManagerService(
         host=args.host,
         port=args.port,
-        enable_db=not args.no_db,
     )
     fleet_service.start()
 

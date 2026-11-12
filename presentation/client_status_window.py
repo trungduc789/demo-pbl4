@@ -1,7 +1,7 @@
 """
 Cửa sổ Quản lý & Trạng thái Máy Con (Client Status & Configuration Window - Presentation Layer):
-- Tab 1: Giám sát lưu lượng trực tiếp (Đồ thị sóng Bezier 60s, Card tốc độ Rx/Tx, CPU/RAM, Top tiến trình).
-- Tab 2: Chính sách an ninh hiện hành & Nhật ký kiểm toán thao tác từ xa (Audit Log).
+- Tab 1: Giám sát lưu lượng trực tiếp (Đồ thị sóng Bezier 60s, Card tốc độ Rx/Tx, CPU/RAM, Top tiến trình kèm nút Tự vệ cục bộ).
+- Tab 2: Chính sách an ninh 2 lớp (🔒 Admin Enforced & 🔓 Local Self-Protect) + Nhật ký kiểm toán (Audit Log).
 - Tab 3: Chẩn đoán kết nối mạng & đo độ trễ tới Admin Server và Internet Gateway.
 - Tab 4: Cấu hình kết nối Server & Thông tin định danh phần cứng máy con.
 """
@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QSpinBox, QCheckBox, QTableWidget, QTableWidgetItem,
     QTabWidget, QHeaderView, QFrame, QMessageBox, QApplication, QTextEdit,
-    QProgressBar
+    QProgressBar, QInputDialog, QAbstractItemView
 )
 
 
@@ -74,13 +74,7 @@ class TrafficSparklineWidget(QWidget):
         self.up_points: List[float] = [0.0] * max_points
         self.smooth_max: float = 20.0
         self.setFixedHeight(135)
-        self.setStyleSheet("""
-            QWidget {
-                background-color: #FFFFFF;
-                border: 1px solid #E2E8F0;
-                border-radius: 8px;
-            }
-        """)
+        self.setStyleSheet("background-color: transparent; border: none;")
 
     def add_sample(self, down_kb: float, up_kb: float):
         """Thêm một điểm dữ liệu mới vào chuỗi thời gian."""
@@ -159,7 +153,7 @@ class TrafficSparklineWidget(QWidget):
             painter.setPen(QtGui.QPen(QtGui.QColor("#F59E0B"), 2.0))
             painter.drawPath(path_down)
 
-        # 4. Vẽ đường sóng Tải lên (Upload - Rose #E11D48)
+        # 4. Vẽ vùng sóng Tải lên (Upload - Rose #E11D48)
         path_up = self._build_smooth_path(self.up_points, max_v, w, bottom_y)
         if not path_up.isEmpty():
             path_up_fill = QtGui.QPainterPath(path_up)
@@ -168,32 +162,33 @@ class TrafficSparklineWidget(QWidget):
             path_up_fill.closeSubpath()
 
             grad_up = QtGui.QLinearGradient(0, 10, 0, bottom_y)
-            grad_up.setColorAt(0.0, QtGui.QColor(225, 29, 72, 70))
+            grad_up.setColorAt(0.0, QtGui.QColor(225, 29, 72, 85))
+            grad_up.setColorAt(0.5, QtGui.QColor(225, 29, 72, 30))
             grad_up.setColorAt(1.0, QtGui.QColor(225, 29, 72, 5))
             painter.fillPath(path_up_fill, grad_up)
 
             painter.setPen(QtGui.QPen(QtGui.QColor("#E11D48"), 1.8))
             painter.drawPath(path_up)
 
-        # 5. Đường cơ sở (Baseline)
+        # 5. Vẽ đường cơ sở và trục thời gian
         painter.setPen(QtGui.QPen(QtGui.QColor("#E2E8F0"), 1))
         painter.drawLine(0, int(bottom_y), w, int(bottom_y))
 
-        # 6. Trục thời gian và nhãn đỉnh tốc độ
-        painter.setFont(QtGui.QFont("Segoe UI", 8))
+        font = QtGui.QFont("Segoe UI", 8)
+        painter.setFont(font)
         painter.setPen(QtGui.QColor("#94A3B8"))
-
         painter.drawText(8, h - 6, "60s trước")
-        painter.drawText(w // 2 - 12, h - 6, "30s")
-        painter.drawText(w - 76, h - 6, "Hiện tại (Live)")
+        painter.drawText(int(w / 2) - 24, h - 6, "30s trước")
+        painter.drawText(w - 48, h - 6, "Hiện tại")
 
+        # 6. Hiển thị nhãn đỉnh tốc độ góc trên phải
         peak_val = max(max(self.down_points), max(self.up_points))
         peak_text = f"Đỉnh: {format_speed(peak_val)}"
         painter.drawText(w - 110, 16, peak_text)
 
 
 # =============================================================================
-# CỬA SỔ CHÍNH: CLIENT STATUS WINDOW (4 TABS)
+# CỬA SỔ CHÍNH: CLIENT STATUS WINDOW (4 TABS + 2-TIER SECURITY CONTROL)
 # =============================================================================
 class ClientStatusWindow(QMainWindow):
     """Cửa sổ điều khiển và giám sát trung tâm của Agent máy con."""
@@ -201,6 +196,11 @@ class ClientStatusWindow(QMainWindow):
     def __init__(self, agent_service, parent=None):
         super().__init__(parent)
         self.agent = agent_service
+        self._live_row_order: List[str] = []
+        self._live_row_map: Dict[str, int] = {}
+        self._live_action_buttons: Dict[str, QPushButton] = {}
+        self._last_policies_snapshot: Optional[List[tuple]] = None
+
         self._init_ui()
 
         # Timer định kỳ cập nhật trạng thái giao diện (chu kỳ 1 giây)
@@ -211,18 +211,23 @@ class ClientStatusWindow(QMainWindow):
 
     def _init_ui(self):
         self.setWindowTitle("Client Agent - Network Monitor & Protect")
-        self.resize(740, 580)
-        self.setMinimumSize(660, 500)
+        self.resize(780, 610)
+        self.setMinimumSize(680, 520)
         self.setStyleSheet("""
             QMainWindow, QWidget {
                 background-color: #FFFFFF;
                 color: #1E293B;
                 font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
             }
+            QLabel, QCheckBox {
+                border: none;
+                background: transparent;
+                padding: 0px;
+            }
             QTabWidget::pane {
-                border: 1px solid #E2E8F0;
+                border: none;
+                border-top: 1px solid #E2E8F0;
                 background-color: #FFFFFF;
-                border-radius: 8px;
             }
             QTabBar::tab {
                 background-color: #F8FAFC;
@@ -314,10 +319,7 @@ class ClientStatusWindow(QMainWindow):
         title_box.addWidget(lbl_ver)
         title_box.addStretch()
 
-        sub = QLabel("Tiến trình giám sát và tiếp nhận chính sách an ninh mạng tập trung")
-        sub.setStyleSheet("font-size: 11px; color: #64748B;")
         header_left.addLayout(title_box)
-        header_left.addWidget(sub)
         header.addLayout(header_left)
         header.addStretch()
 
@@ -368,16 +370,23 @@ class ClientStatusWindow(QMainWindow):
 
         # Sparkline Box (Left - 60s)
         spark_frame = QFrame()
-        spark_frame.setStyleSheet("background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px; padding: 10px;")
+        spark_frame.setObjectName("sparkFrame")
+        spark_frame.setStyleSheet("""
+            QFrame#sparkFrame {
+                background-color: #FFFFFF;
+                border: 1px solid #E2E8F0;
+                border-radius: 8px;
+            }
+        """)
         sl = QVBoxLayout(spark_frame)
-        sl.setContentsMargins(10, 8, 10, 8)
-        sl.setSpacing(8)
+        sl.setContentsMargins(12, 10, 12, 10)
+        sl.setSpacing(6)
 
         sl_header = QHBoxLayout()
         sl_title = QLabel("Diễn Biến Lưu Lượng 60 Giây")
-        sl_title.setStyleSheet("font-size: 11px; font-weight: bold; color: #334155;")
+        sl_title.setStyleSheet("font-size: 11px; font-weight: bold; color: #334155; border: none; background: transparent;")
         sl_legend = QLabel("Vàng: Tải xuống  |  Đỏ: Tải lên")
-        sl_legend.setStyleSheet("font-size: 10px; color: #64748B; font-weight: 600;")
+        sl_legend.setStyleSheet("font-size: 10px; color: #64748B; font-weight: 600; border: none; background: transparent;")
         sl_header.addWidget(sl_title)
         sl_header.addStretch()
         sl_header.addWidget(sl_legend)
@@ -389,9 +398,16 @@ class ClientStatusWindow(QMainWindow):
 
         # Hardware Metrics Box (Right) - Cân đối cùng chiều cao
         metrics_frame = QFrame()
-        metrics_frame.setStyleSheet("background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px; padding: 12px;")
+        metrics_frame.setObjectName("metricsFrame")
+        metrics_frame.setStyleSheet("""
+            QFrame#metricsFrame {
+                background-color: #FFFFFF;
+                border: 1px solid #E2E8F0;
+                border-radius: 8px;
+            }
+        """)
         ml = QVBoxLayout(metrics_frame)
-        ml.setContentsMargins(12, 10, 12, 10)
+        ml.setContentsMargins(14, 12, 14, 12)
         ml.setSpacing(8)
 
         # CPU Metric
@@ -471,17 +487,29 @@ class ClientStatusWindow(QMainWindow):
         l.addLayout(mid_row)
 
         # Top Active Processes Table
-        lbl_tbl_title = QLabel("Tiến Trình Đang Sử Dụng Băng Thông:")
+        lbl_tbl_title = QLabel("Tiến Trình Đang Sử Dụng Băng Thông (Hỗ Trợ Tự Vệ Cục Bộ):")
         lbl_tbl_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #334155; margin-top: 2px;")
         l.addWidget(lbl_tbl_title)
 
         self.tbl_live_procs = QTableWidget()
-        self.tbl_live_procs.setColumnCount(4)
+        self.tbl_live_procs.setColumnCount(5)
         self.tbl_live_procs.setHorizontalHeaderLabels([
-            "Ứng Dụng", "PID", "Tốc Độ Tải Xuống (Rx)", "Tốc Độ Tải Lên (Tx)"
+            "Ứng Dụng", "PID", "Tốc Độ Tải Xuống (Rx)", "Tốc Độ Tải Lên (Tx)", "Bảo Vệ / Trạng Thái"
         ])
         self.tbl_live_procs.verticalHeader().setVisible(False)
-        self.tbl_live_procs.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.tbl_live_procs.verticalHeader().setDefaultSectionSize(34)
+        self.tbl_live_procs.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_live_procs.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        header = self.tbl_live_procs.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.tbl_live_procs.setColumnWidth(1, 75)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.tbl_live_procs.setColumnWidth(2, 140)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.tbl_live_procs.setColumnWidth(3, 140)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self.tbl_live_procs.setColumnWidth(4, 155)
         l.addWidget(self.tbl_live_procs, stretch=1)
 
         return tab
@@ -489,28 +517,29 @@ class ClientStatusWindow(QMainWindow):
     def _create_metric_card(self, title: str, value: str, color: str) -> QFrame:
         """Tạo thẻ hiển thị chỉ số tốc độ nổi bật."""
         card = QFrame()
+        card.setObjectName("metricCard")
         card.setStyleSheet(f"""
-            QFrame {{
+            QFrame#metricCard {{
                 background-color: #FFFFFF;
                 border: 1px solid #E2E8F0;
                 border-left: 4px solid {color};
                 border-radius: 8px;
-                padding: 8px 14px;
             }}
         """)
         l = QVBoxLayout(card)
+        l.setContentsMargins(14, 10, 14, 10)
         l.setSpacing(2)
         lbl_t = QLabel(title)
-        lbl_t.setStyleSheet("font-size: 10px; font-weight: bold; color: #64748B;")
+        lbl_t.setStyleSheet("font-size: 10px; font-weight: bold; color: #64748B; border: none; background: transparent;")
         lbl_v = QLabel(value)
-        lbl_v.setStyleSheet(f"font-size: 19px; font-weight: 800; color: {color};")
+        lbl_v.setStyleSheet(f"font-size: 19px; font-weight: 800; color: {color}; border: none; background: transparent;")
         card.lbl_val = lbl_v
         l.addWidget(lbl_t)
         l.addWidget(lbl_v)
         return card
 
     # =========================================================================
-    # TAB 2: CHÍNH SÁCH AN NINH & NHẬT KÝ (SECURITY & AUDIT)
+    # TAB 2: CHÍNH SÁCH AN NINH 2 LỚP & NHẬT KÝ (2-TIER SECURITY & AUDIT)
     # =========================================================================
     def _create_policy_tab(self) -> QWidget:
         tab = QWidget()
@@ -518,33 +547,94 @@ class ClientStatusWindow(QMainWindow):
         l.setContentsMargins(16, 14, 16, 14)
         l.setSpacing(10)
 
-        # Banner thông báo chế độ chỉ xem
-        banner = QFrame()
-        banner.setStyleSheet("background-color: #FEF3C7; border: 1px solid #FCD34D; border-radius: 8px; padding: 8px 12px;")
-        b_lay = QHBoxLayout(banner)
-        b_lay.setContentsMargins(4, 2, 4, 2)
-        lbl_txt = QLabel("Chế độ Chỉ Xem: Chính sách an ninh (Firewall & QoS) được quản trị tập trung từ xa bởi Admin Server.")
-        lbl_txt.setStyleSheet("font-size: 11px; color: #92400E; font-weight: 600;")
-        lbl_txt.setWordWrap(True)
-        b_lay.addWidget(lbl_txt)
-        l.addWidget(banner)
-
-        # Section 1: Active Enforcement Policies Table
+        # Thanh công cụ tự vệ cục bộ cho người dùng máy con
+        ctrl_bar = QHBoxLayout()
         lbl_sec1 = QLabel("Chính Sách Đang Thực Thi Trên Máy Này:")
         lbl_sec1.setStyleSheet("font-size: 12px; font-weight: bold; color: #334155;")
-        l.addWidget(lbl_sec1)
+        ctrl_bar.addWidget(lbl_sec1)
+        ctrl_bar.addStretch()
 
+        self.btn_local_block = QPushButton("🚫 Tự Chặn Ứng Dụng")
+        self.btn_local_block.setFixedHeight(26)
+        self.btn_local_block.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.btn_local_block.setStyleSheet("""
+            QPushButton {
+                background-color: #FEF2F2;
+                color: #DC2626;
+                font-size: 11px;
+                font-weight: bold;
+                border: 1px solid #FECACA;
+                border-radius: 5px;
+                padding: 2px 10px;
+            }
+            QPushButton:hover { background-color: #FEE2E2; }
+        """)
+        self.btn_local_block.clicked.connect(self._on_prompt_local_block)
+        ctrl_bar.addWidget(self.btn_local_block)
+
+        self.btn_local_qos = QPushButton("⚡ Tự Giới Hạn (QoS)")
+        self.btn_local_qos.setFixedHeight(26)
+        self.btn_local_qos.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.btn_local_qos.setStyleSheet("""
+            QPushButton {
+                background-color: #FFFBEB;
+                color: #D97706;
+                font-size: 11px;
+                font-weight: bold;
+                border: 1px solid #FDE68A;
+                border-radius: 5px;
+                padding: 2px 10px;
+            }
+            QPushButton:hover { background-color: #FEF3C7; }
+        """)
+        self.btn_local_qos.clicked.connect(self._on_prompt_local_qos)
+        ctrl_bar.addWidget(self.btn_local_qos)
+
+        self.btn_clear_local = QPushButton("🔓 Gỡ Lệnh Cục Bộ")
+        self.btn_clear_local.setFixedHeight(26)
+        self.btn_clear_local.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_local.setStyleSheet("""
+            QPushButton {
+                background-color: #EFF6FF;
+                color: #2563EB;
+                font-size: 11px;
+                font-weight: bold;
+                border: 1px solid #BFDBFE;
+                border-radius: 5px;
+                padding: 2px 10px;
+            }
+            QPushButton:hover { background-color: #DBEAFE; }
+        """)
+        self.btn_clear_local.clicked.connect(self._on_clear_all_local_policies)
+        ctrl_bar.addWidget(self.btn_clear_local)
+
+        l.addLayout(ctrl_bar)
+
+        # Bảng chính sách 6 cột phân biệt rõ Nguồn Cấp & Quyền Gỡ Bỏ
         self.tbl_policies = QTableWidget()
-        self.tbl_policies.setColumnCount(5)
+        self.tbl_policies.setColumnCount(6)
         self.tbl_policies.setHorizontalHeaderLabels([
-            "Ứng Dụng", "Hành Động Can Thiệp", "Hạn Mức Băng Thông", "Chiều Áp Dụng", "Thời Điểm"
+            "Ứng Dụng", "Nguồn Cấp", "Hành Động", "Hạn Mức", "Thời Điểm", "Thao Tác"
         ])
         self.tbl_policies.verticalHeader().setVisible(False)
-        self.tbl_policies.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.tbl_policies.verticalHeader().setDefaultSectionSize(36)
+        self.tbl_policies.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        pol_header = self.tbl_policies.horizontalHeader()
+        pol_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        pol_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.tbl_policies.setColumnWidth(1, 135)
+        pol_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.tbl_policies.setColumnWidth(2, 145)
+        pol_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.tbl_policies.setColumnWidth(3, 95)
+        pol_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self.tbl_policies.setColumnWidth(4, 85)
+        pol_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.tbl_policies.setColumnWidth(5, 135)
         l.addWidget(self.tbl_policies, stretch=1)
 
-        # Section 2: Admin Action & Audit Log Table
-        lbl_sec2 = QLabel("Nhật Ký Lệnh Điều Khiển Từ Admin (Audit Log):")
+        # Section 2: Admin & Local Action Audit Log Table
+        lbl_sec2 = QLabel("Nhật Ký Kiểm Toán An Ninh (Admin & Local Audit Log):")
         lbl_sec2.setStyleSheet("font-size: 12px; font-weight: bold; color: #334155; margin-top: 4px;")
         l.addWidget(lbl_sec2)
 
@@ -554,6 +644,7 @@ class ClientStatusWindow(QMainWindow):
             "Thời Điểm", "Nguồn Gửi", "Lệnh / Thao Tác", "Đối Tượng", "Chi Tiết Tác Động"
         ])
         self.tbl_audit.verticalHeader().setVisible(False)
+        self.tbl_audit.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.tbl_audit.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.tbl_audit.horizontalHeader().resizeSection(0, 80)
         self.tbl_audit.horizontalHeader().resizeSection(1, 95)
@@ -563,6 +654,127 @@ class ClientStatusWindow(QMainWindow):
         l.addWidget(self.tbl_audit, stretch=1)
 
         return tab
+
+    # =========================================================================
+    # XỬ LÝ TỰ VỆ CỤC BỘ (LOCAL SELF-PROTECTION HANDLERS)
+    # =========================================================================
+    def _get_candidate_app_names(self) -> List[str]:
+        """Lấy danh sách tên các tiến trình đang hoạt động để gợi ý cho người dùng chọn."""
+        names = []
+        for p in getattr(self.agent, "latest_top_procs", []):
+            n = str(getattr(p, "name", "")).strip()
+            if n and n not in names:
+                names.append(n)
+        for n in ["chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "discord.exe", "steam.exe", "Zalo.exe"]:
+            if n not in names:
+                names.append(n)
+        return names
+
+    def _on_prompt_local_block(self):
+        """Hộp thoại cho phép người dùng máy con tự chặn một ứng dụng cục bộ."""
+        candidates = self._get_candidate_app_names()
+        app_name, ok = QInputDialog.getItem(
+            self,
+            "Tự Chặn Ứng Dụng Cục Bộ",
+            "Chọn hoặc nhập tên tiến trình (.exe) muốn chặn trên máy này:",
+            candidates,
+            0,
+            True,
+        )
+        if not ok or not app_name.strip():
+            return
+        self._execute_local_block(app_name.strip())
+
+    def _on_prompt_local_qos(self):
+        """Hộp thoại cho phép người dùng máy con tự giới hạn băng thông (QoS) cục bộ."""
+        candidates = self._get_candidate_app_names()
+        app_name, ok = QInputDialog.getItem(
+            self,
+            "Tự Giới Hạn Băng Thông (QoS)",
+            "Chọn hoặc nhập tên tiến trình (.exe) cần giới hạn tốc độ:",
+            candidates,
+            0,
+            True,
+        )
+        if not ok or not app_name.strip():
+            return
+        app_name = app_name.strip()
+
+        if hasattr(self.agent, "is_locked_by_admin") and self.agent.is_locked_by_admin(app_name):
+            QMessageBox.warning(
+                self,
+                "🔒 Bị Khóa Bởi Admin Server",
+                f"Ứng dụng '{app_name}' đang chịu chính sách bắt buộc từ Admin Server.\n"
+                "Máy con không được phép thay đổi hoặc ghi đè chính sách của Quản trị viên!",
+            )
+            return
+
+        limit_kbps, ok_lim = QInputDialog.getDouble(
+            self,
+            "Nhập Hạn Mức Tốc Độ",
+            f"Nhập mức trần băng thông tối đa cho '{app_name}' (KB/s):",
+            150.0,
+            1.0,
+            102400.0,
+            1,
+        )
+        if not ok_lim:
+            return
+
+        if hasattr(self.agent, "apply_local_policy"):
+            ok_exec, msg = self.agent.apply_local_policy(app_name, action="THROTTLE", limit_kbps=limit_kbps)
+            if not ok_exec:
+                QMessageBox.warning(self, "Không Thể Áp Dụng", msg)
+            self._last_policies_snapshot = None
+            self._refresh_ui()
+
+    def _execute_local_block(self, app_name: str):
+        """Thực thi chặn cục bộ cho `app_name`."""
+        if not hasattr(self.agent, "apply_local_policy"):
+            return
+        ok, msg = self.agent.apply_local_policy(app_name, action="BLOCK")
+        if not ok:
+            QMessageBox.warning(self, "Không Thể Chặn", msg)
+        self._last_policies_snapshot = None
+        self._refresh_ui()
+
+    def _execute_local_unblock(self, app_name: str):
+        """Thực thi gỡ bỏ chính sách cục bộ (hoặc báo lỗi nếu bị Admin khóa)."""
+        if not hasattr(self.agent, "remove_local_policy"):
+            return
+        ok, msg = self.agent.remove_local_policy(app_name)
+        if not ok:
+            QMessageBox.warning(self, "🔒 Bị Khóa Bởi Admin Server", msg)
+        self._last_policies_snapshot = None
+        self._refresh_ui()
+
+    def _on_clear_all_local_policies(self):
+        """Gỡ toàn bộ các lệnh cục bộ, giữ nguyên các lệnh của Admin."""
+        if not hasattr(self.agent, "clear_all_local_policies"):
+            return
+        removed, kept_admin = self.agent.clear_all_local_policies()
+        self._last_policies_snapshot = None
+        self._refresh_ui()
+        if kept_admin > 0:
+            QMessageBox.information(
+                self,
+                "Đã Gỡ Chính Sách Cục Bộ",
+                f"Đã gỡ {removed} chính sách cục bộ.\n"
+                f"🔒 Giữ nguyên {kept_admin} chính sách bắt buộc từ Admin Server.",
+            )
+
+    def _on_live_proc_action_clicked(self, app_name: str):
+        """Xử lý khi người dùng bấm nút hành động ngay trên bảng Tiến trình (Tab 1)."""
+        pol = self.agent.get_policy_for_app(app_name) if hasattr(self.agent, "get_policy_for_app") else None
+        if pol:
+            is_admin_locked = pol.get("locked_by_admin", pol.get("source", "ADMIN") == "ADMIN")
+            if is_admin_locked:
+                # Gọi remove_local_policy để tự động ghi nhận DENIED vào Audit Log và báo cảnh báo
+                self._execute_local_unblock(app_name)
+            else:
+                self._execute_local_unblock(app_name)
+        else:
+            self._execute_local_block(app_name)
 
     # =========================================================================
     # TAB 3: CHẨN ĐOÁN MẠNG & PING (NETWORK DIAGNOSTICS)
@@ -579,62 +791,66 @@ class ClientStatusWindow(QMainWindow):
 
         # Card Server Latency
         self.card_srv_lat = QFrame()
+        self.card_srv_lat.setObjectName("cardSrvLat")
         self.card_srv_lat.setStyleSheet("""
-            QFrame {
+            QFrame#cardSrvLat {
                 background-color: #FFFFFF;
                 border: 1px solid #E2E8F0;
                 border-left: 4px solid #10B981;
                 border-radius: 8px;
-                padding: 10px 14px;
             }
         """)
         csl = QVBoxLayout(self.card_srv_lat)
+        csl.setContentsMargins(14, 10, 14, 10)
         csl.setSpacing(2)
         lbl_csl_t = QLabel("ĐỘ TRỄ TỚI ADMIN SERVER")
-        lbl_csl_t.setStyleSheet("font-size: 10px; font-weight: bold; color: #64748B;")
+        lbl_csl_t.setStyleSheet("font-size: 10px; font-weight: bold; color: #64748B; border: none; background: transparent;")
         self.lbl_srv_lat_val = QLabel("-- ms")
-        self.lbl_srv_lat_val.setStyleSheet("font-size: 18px; font-weight: 800; color: #059669;")
-        self.lbl_srv_status = QLabel("Kiểm tra định kỳ")
-        self.lbl_srv_status.setStyleSheet("font-size: 10px; color: #64748B;")
+        self.lbl_srv_lat_val.setStyleSheet("font-size: 18px; font-weight: 800; color: #059669; border: none; background: transparent;")
         csl.addWidget(lbl_csl_t)
         csl.addWidget(self.lbl_srv_lat_val)
-        csl.addWidget(self.lbl_srv_status)
         cards.addWidget(self.card_srv_lat)
 
         # Card Internet Latency
         self.card_net_lat = QFrame()
+        self.card_net_lat.setObjectName("cardNetLat")
         self.card_net_lat.setStyleSheet("""
-            QFrame {
+            QFrame#cardNetLat {
                 background-color: #FFFFFF;
                 border: 1px solid #E2E8F0;
                 border-left: 4px solid #2563EB;
                 border-radius: 8px;
-                padding: 10px 14px;
             }
         """)
         cnl = QVBoxLayout(self.card_net_lat)
+        cnl.setContentsMargins(14, 10, 14, 10)
         cnl.setSpacing(2)
         lbl_cnl_t = QLabel("ĐỘ TRỄ INTERNET (DNS 8.8.8.8)")
-        lbl_cnl_t.setStyleSheet("font-size: 10px; font-weight: bold; color: #64748B;")
+        lbl_cnl_t.setStyleSheet("font-size: 10px; font-weight: bold; color: #64748B; border: none; background: transparent;")
         self.lbl_net_lat_val = QLabel("-- ms")
-        self.lbl_net_lat_val.setStyleSheet("font-size: 18px; font-weight: 800; color: #2563EB;")
-        self.lbl_net_status = QLabel("Kiểm tra định kỳ")
-        self.lbl_net_status.setStyleSheet("font-size: 10px; color: #64748B;")
+        self.lbl_net_lat_val.setStyleSheet("font-size: 18px; font-weight: 800; color: #2563EB; border: none; background: transparent;")
         cnl.addWidget(lbl_cnl_t)
         cnl.addWidget(self.lbl_net_lat_val)
-        cnl.addWidget(self.lbl_net_status)
         cards.addWidget(self.card_net_lat)
 
         l.addLayout(cards)
 
         # Active Network Adapter Details
         nic_frame = QFrame()
-        nic_frame.setStyleSheet("background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px; padding: 12px;")
+        nic_frame.setObjectName("nicFrame")
+        nic_frame.setStyleSheet("""
+            QFrame#nicFrame {
+                background-color: #FFFFFF;
+                border: 1px solid #E2E8F0;
+                border-radius: 8px;
+            }
+        """)
         nl = QVBoxLayout(nic_frame)
+        nl.setContentsMargins(14, 10, 14, 10)
         nl.setSpacing(6)
 
         nl_title = QLabel("Thông Số Card Mạng Đang Sử Dụng (Active Interface):")
-        nl_title.setStyleSheet("font-size: 11px; font-weight: bold; color: #334155;")
+        nl_title.setStyleSheet("font-size: 11px; font-weight: bold; color: #334155; border: none; background: transparent;")
         nl.addWidget(nl_title)
 
         nic_grid = QHBoxLayout()
@@ -642,7 +858,7 @@ class ClientStatusWindow(QMainWindow):
         self.lbl_nic_speed = QLabel("Tốc độ: -- Mbps")
         self.lbl_nic_type = QLabel("Loại: --")
         for lbl in (self.lbl_nic_name, self.lbl_nic_speed, self.lbl_nic_type):
-            lbl.setStyleSheet("font-size: 11px; color: #475569;")
+            lbl.setStyleSheet("font-size: 11px; color: #475569; border: none; background: transparent;")
             nic_grid.addWidget(lbl)
         nl.addLayout(nic_grid)
         l.addWidget(nic_frame)
@@ -675,9 +891,6 @@ class ClientStatusWindow(QMainWindow):
                 line-height: 1.5;
             }
         """)
-        self.txt_diag_log.setHtml(
-            "<div style='color: #64748B;'>[Hệ Thống] Nhấn nút <b>'Chạy Kiểm Tra Ngay'</b> ở trên để bắt đầu quy trình chẩn đoán kết nối mạng...</div>"
-        )
         l.addWidget(self.txt_diag_log, stretch=1)
 
         # Cập nhật thông số card mạng ban đầu
@@ -688,10 +901,11 @@ class ClientStatusWindow(QMainWindow):
     def _update_nic_info(self):
         """Lấy thông số card mạng từ tầng nghiệp vụ."""
         try:
-            nic = self.agent.get_active_nic_info()
-            self.lbl_nic_name.setText(f"Tên: {nic.get('name', 'N/A')}")
-            self.lbl_nic_speed.setText(f"Tốc độ: {nic.get('speed_mbps', 0)} Mbps")
-            self.lbl_nic_type.setText(f"Loại: {nic.get('type', 'N/A')}")
+            if hasattr(self.agent, "get_active_nic_info"):
+                nic = self.agent.get_active_nic_info()
+                self.lbl_nic_name.setText(f"Tên: {nic.get('name', 'N/A')}")
+                self.lbl_nic_speed.setText(f"Tốc độ: {nic.get('speed_mbps', 0)} Mbps")
+                self.lbl_nic_type.setText(f"Loại: {nic.get('type', 'N/A')}")
         except Exception:
             pass
 
@@ -734,23 +948,31 @@ class ClientStatusWindow(QMainWindow):
 
         # Group 1: Server Connection Settings
         grp_conn = QFrame()
-        grp_conn.setStyleSheet("background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px; padding: 12px;")
+        grp_conn.setObjectName("grpConn")
+        grp_conn.setStyleSheet("""
+            QFrame#grpConn {
+                background-color: #FFFFFF;
+                border: 1px solid #E2E8F0;
+                border-radius: 8px;
+            }
+        """)
         cl = QVBoxLayout(grp_conn)
-        cl.setSpacing(8)
+        cl.setContentsMargins(14, 12, 14, 12)
+        cl.setSpacing(10)
 
         lbl_c_title = QLabel("Cài Đặt Kết Nối Máy Chủ Quản Trị (Admin Server):")
-        lbl_c_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #0F172A;")
+        lbl_c_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #0F172A; border: none; background: transparent;")
         cl.addWidget(lbl_c_title)
 
         f_row = QHBoxLayout()
         f_row.setSpacing(12)
 
         lbl_ip = QLabel("Địa chỉ IP Server:")
-        lbl_ip.setStyleSheet("font-size: 12px; font-weight: 600; color: #475569;")
+        lbl_ip.setStyleSheet("font-size: 12px; font-weight: 600; color: #475569; border: none; background: transparent;")
         self.txt_server_ip = QLineEdit(self.agent.server_host)
 
         lbl_port = QLabel("Cổng TCP:")
-        lbl_port.setStyleSheet("font-size: 12px; font-weight: 600; color: #475569;")
+        lbl_port.setStyleSheet("font-size: 12px; font-weight: 600; color: #475569; border: none; background: transparent;")
         self.spin_port = QSpinBox()
         self.spin_port.setRange(1, 65535)
         self.spin_port.setValue(self.agent.server_port)
@@ -766,7 +988,8 @@ class ClientStatusWindow(QMainWindow):
         cl.addWidget(self.chk_toast)
 
         self.chk_autostart = QCheckBox("Tự động khởi động cùng Windows (Chạy ngầm dưới khay hệ thống System Tray)")
-        self.chk_autostart.setChecked(self.agent.is_windows_autostart())
+        autostart_fn = getattr(self.agent, "is_windows_autostart", None)
+        self.chk_autostart.setChecked(bool(autostart_fn()) if callable(autostart_fn) else False)
         cl.addWidget(self.chk_autostart)
 
         btn_row = QHBoxLayout()
@@ -781,12 +1004,20 @@ class ClientStatusWindow(QMainWindow):
 
         # Group 2: Device Identification
         grp_dev = QFrame()
-        grp_dev.setStyleSheet("background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px; padding: 12px;")
+        grp_dev.setObjectName("grpDev")
+        grp_dev.setStyleSheet("""
+            QFrame#grpDev {
+                background-color: #FFFFFF;
+                border: 1px solid #E2E8F0;
+                border-radius: 8px;
+            }
+        """)
         dl = QVBoxLayout(grp_dev)
+        dl.setContentsMargins(14, 12, 14, 12)
         dl.setSpacing(6)
 
         lbl_d_title = QLabel("Thông Tin Định Danh Thiết Bị (Device Specifications):")
-        lbl_d_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #0F172A;")
+        lbl_d_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #0F172A; border: none; background: transparent;")
         dl.addWidget(lbl_d_title)
 
         reg = self.agent.registration_data
@@ -802,9 +1033,9 @@ class ClientStatusWindow(QMainWindow):
         for label_text, val_text in specs:
             row = QHBoxLayout()
             lbl_k = QLabel(label_text)
-            lbl_k.setStyleSheet("font-size: 11px; font-weight: bold; color: #64748B; min-width: 130px;")
+            lbl_k.setStyleSheet("font-size: 11px; font-weight: bold; color: #64748B; min-width: 130px; border: none; background: transparent;")
             lbl_v = QLabel(val_text)
-            lbl_v.setStyleSheet("font-size: 11px; color: #0F172A;")
+            lbl_v.setStyleSheet("font-size: 11px; color: #0F172A; border: none; background: transparent;")
             row.addWidget(lbl_k)
             row.addWidget(lbl_v, stretch=1)
             dl.addLayout(row)
@@ -831,7 +1062,8 @@ class ClientStatusWindow(QMainWindow):
             return
 
         enable_autostart = self.chk_autostart.isChecked()
-        self.agent.set_windows_autostart(enable_autostart)
+        if hasattr(self.agent, "set_windows_autostart"):
+            self.agent.set_windows_autostart(enable_autostart)
 
         cfg = {
             "server_host": new_host,
@@ -856,6 +1088,212 @@ class ClientStatusWindow(QMainWindow):
     # =========================================================================
     # CẬP NHẬT GIAO DIỆN ĐỊNH KỲ (REFRESH LOOP)
     # =========================================================================
+    def _style_live_action_button(self, btn: QPushButton, app_name: str):
+        """Cập nhật giao diện nút Bảo Vệ trên bảng tiến trình theo trạng thái chính sách 2 lớp."""
+        pol = self.agent.get_policy_for_app(app_name) if hasattr(self.agent, "get_policy_for_app") else None
+        if pol:
+            is_admin = pol.get("locked_by_admin", pol.get("source", "ADMIN") == "ADMIN")
+            act = pol.get("action", "BLOCK")
+            if is_admin:
+                label = "🔒 Admin Chặn" if act == "BLOCK" else f"🔒 Admin QoS ({pol.get('limit_kbps', 0):.0f}K)"
+                btn.setText(label)
+                btn.setToolTip("Chính sách bắt buộc từ Admin Server - Không thể tự gỡ tại máy con")
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #FEF2F2;
+                        color: #991B1B;
+                        font-size: 11px;
+                        font-weight: bold;
+                        border: 1px solid #FCA5A5;
+                        border-radius: 5px;
+                        padding: 2px 8px;
+                    }
+                    QPushButton:hover { background-color: #FEE2E2; }
+                """)
+            else:
+                label = "🔓 Bỏ Chặn (Local)" if act == "BLOCK" else "🔓 Gỡ QoS (Local)"
+                btn.setText(label)
+                btn.setToolTip("Chính sách tự vệ cục bộ - Nhấn để gỡ bỏ")
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #EFF6FF;
+                        color: #1D4ED8;
+                        font-size: 11px;
+                        font-weight: bold;
+                        border: 1px solid #93C5FD;
+                        border-radius: 5px;
+                        padding: 2px 8px;
+                    }
+                    QPushButton:hover { background-color: #DBEAFE; }
+                """)
+        else:
+            btn.setText("🛡️ Tự Chặn")
+            btn.setToolTip(f"Chặn cục bộ kết nối mạng của '{app_name}'")
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #F8FAFC;
+                    color: #475569;
+                    font-size: 11px;
+                    font-weight: 600;
+                    border: 1px solid #CBD5E1;
+                    border-radius: 5px;
+                    padding: 2px 8px;
+                }
+                QPushButton:hover {
+                    background-color: #FEF2F2;
+                    color: #DC2626;
+                    border-color: #FECACA;
+                }
+            """)
+
+    def _update_live_procs_table(self, top_procs: list):
+        """Cập nhật bảng tiến trình Tab 1 giữ nguyên vị trí dòng để không bị nhảy loạn khi bấm nút."""
+        proc_map: Dict[str, Any] = {}
+        for p in top_procs:
+            name = str(getattr(p, "name", "Unknown"))
+            if name and name not in proc_map:
+                proc_map[name] = p
+
+        # Cập nhật các dòng đã có
+        for row, name in enumerate(self._live_row_order):
+            p = proc_map.get(name)
+            down_val = getattr(p, "down_kbps", 0.0) if p else 0.0
+            up_val = getattr(p, "up_kbps", 0.0) if p else 0.0
+            pid_val = getattr(p, "pid", None) if p else None
+
+            if pid_val is not None:
+                it_pid = self.tbl_live_procs.item(row, 1)
+                if it_pid:
+                    it_pid.setText(str(pid_val))
+
+            it_down = self.tbl_live_procs.item(row, 2)
+            if it_down:
+                it_down.setText(format_speed(down_val))
+
+            it_up = self.tbl_live_procs.item(row, 3)
+            if it_up:
+                it_up.setText(format_speed(up_val))
+
+            btn = self._live_action_buttons.get(name)
+            if btn:
+                self._style_live_action_button(btn, name)
+
+        # Thêm dòng mới vào cuối bảng nếu chưa có
+        for name, p in proc_map.items():
+            if name not in self._live_row_map:
+                row = self.tbl_live_procs.rowCount()
+                self.tbl_live_procs.insertRow(row)
+                self._live_row_order.append(name)
+                self._live_row_map[name] = row
+
+                item_name = QTableWidgetItem(name)
+                item_name.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+                item_pid = QTableWidgetItem(str(getattr(p, "pid", 0)))
+                item_pid.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                item_down = QTableWidgetItem(format_speed(getattr(p, "down_kbps", 0.0)))
+                item_down.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+                item_up = QTableWidgetItem(format_speed(getattr(p, "up_kbps", 0.0)))
+                item_up.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+                self.tbl_live_procs.setItem(row, 0, item_name)
+                self.tbl_live_procs.setItem(row, 1, item_pid)
+                self.tbl_live_procs.setItem(row, 2, item_down)
+                self.tbl_live_procs.setItem(row, 3, item_up)
+
+                btn_act = QPushButton()
+                btn_act.setFixedHeight(24)
+                btn_act.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+                self._style_live_action_button(btn_act, name)
+                btn_act.clicked.connect(lambda _checked=False, n=name: self._on_live_proc_action_clicked(n))
+
+                box = QWidget()
+                lay = QHBoxLayout(box)
+                lay.setContentsMargins(4, 2, 4, 2)
+                lay.addWidget(btn_act)
+                self.tbl_live_procs.setCellWidget(row, 4, box)
+                self._live_action_buttons[name] = btn_act
+
+    def _refresh_policies_table(self):
+        """Cập nhật bảng chính sách Tab 2 (chỉ vẽ lại khi danh sách chính sách thực sự thay đổi)."""
+        policies = list(self.agent.active_policies.values())
+        snapshot = [
+            (
+                pol.get("app", ""),
+                pol.get("source", "ADMIN"),
+                bool(pol.get("locked_by_admin", pol.get("source", "ADMIN") == "ADMIN")),
+                pol.get("action", ""),
+                float(pol.get("limit_kbps", 0.0)),
+                pol.get("direction", "both"),
+                int(pol.get("time", 0)),
+            )
+            for pol in policies
+        ]
+        if snapshot == self._last_policies_snapshot:
+            return
+        self._last_policies_snapshot = snapshot
+
+        self.tbl_policies.setRowCount(len(policies))
+        for r, pol in enumerate(policies):
+            app_name = pol.get("app", "")
+            is_admin = pol.get("locked_by_admin", pol.get("source", "ADMIN") == "ADMIN")
+            act = pol.get("action", "")
+            act_label = "CHẶN TOÀN BỘ (BLOCK)" if act == "BLOCK" else "BÓP BĂNG THÔNG (QoS)"
+            limit_str = f"{pol.get('limit_kbps', 0):.1f} KB/s" if act == "THROTTLE" else "0 KB/s"
+            t_str = time.strftime("%H:%M:%S", time.localtime(pol.get("time", time.time())))
+
+            it_app = QTableWidgetItem(app_name)
+            it_app.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+
+            src_text = "🔒 Admin Server" if is_admin else "🔓 Cục Bộ (Máy Con)"
+            it_src = QTableWidgetItem(src_text)
+            it_src.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+            it_src.setForeground(QtGui.QBrush(QtGui.QColor("#DC2626" if is_admin else "#2563EB")))
+
+            self.tbl_policies.setItem(r, 0, it_app)
+            self.tbl_policies.setItem(r, 1, it_src)
+            self.tbl_policies.setItem(r, 2, QTableWidgetItem(act_label))
+            self.tbl_policies.setItem(r, 3, QTableWidgetItem(limit_str))
+            self.tbl_policies.setItem(r, 4, QTableWidgetItem(t_str))
+
+            btn_op = QPushButton()
+            btn_op.setFixedHeight(24)
+            btn_op.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            if is_admin:
+                btn_op.setText("🔒 Khóa Bởi Admin")
+                btn_op.setStyleSheet("""
+                    QPushButton {
+                        background-color: #FEF2F2;
+                        color: #991B1B;
+                        font-size: 11px;
+                        font-weight: bold;
+                        border: 1px solid #FCA5A5;
+                        border-radius: 5px;
+                        padding: 2px 8px;
+                    }
+                    QPushButton:hover { background-color: #FEE2E2; }
+                """)
+            else:
+                btn_op.setText("🔓 Gỡ Bỏ")
+                btn_op.setStyleSheet("""
+                    QPushButton {
+                        background-color: #EFF6FF;
+                        color: #1D4ED8;
+                        font-size: 11px;
+                        font-weight: bold;
+                        border: 1px solid #93C5FD;
+                        border-radius: 5px;
+                        padding: 2px 8px;
+                    }
+                    QPushButton:hover { background-color: #DBEAFE; }
+                """)
+            btn_op.clicked.connect(lambda _checked=False, n=app_name: self._execute_local_unblock(n))
+
+            box_op = QWidget()
+            lay_op = QHBoxLayout(box_op)
+            lay_op.setContentsMargins(4, 2, 4, 2)
+            lay_op.addWidget(btn_op)
+            self.tbl_policies.setCellWidget(r, 5, box_op)
+
     def _refresh_ui(self):
         """Cập nhật dữ liệu thời gian thực cho cả 4 tab."""
         # 1. Trạng thái kết nối
@@ -883,14 +1321,14 @@ class ClientStatusWindow(QMainWindow):
             """)
 
         # 2. Cập nhật Tab 1: Số liệu Live & Sparkline
-        down_kb = self.agent.latest_down_kbps
-        up_kb = self.agent.latest_up_kbps
+        down_kb = getattr(self.agent, "latest_down_kbps", 0.0)
+        up_kb = getattr(self.agent, "latest_up_kbps", 0.0)
         self.card_down.lbl_val.setText(format_speed(down_kb))
         self.card_up.lbl_val.setText(format_speed(up_kb))
         self.sparkline.add_sample(down_kb, up_kb)
 
-        cpu_val = self.agent.latest_cpu_pct
-        ram_val = self.agent.latest_ram_pct
+        cpu_val = getattr(self.agent, "latest_cpu_pct", 0.0)
+        ram_val = getattr(self.agent, "latest_ram_pct", 0.0)
         self.lbl_cpu.setText(f"{cpu_val:.1f}%")
         self.bar_cpu.setValue(int(cpu_val))
 
@@ -900,40 +1338,16 @@ class ClientStatusWindow(QMainWindow):
         self.lbl_total_down.setText(f"Tổng tải xuống: {format_bytes(self.agent.total_rx_bytes)}")
         self.lbl_total_up.setText(f"Tổng tải lên: {format_bytes(self.agent.total_tx_bytes)}")
 
-        # Bảng top tiến trình mạng
+        # Bảng top tiến trình mạng (Cố định dòng + hỗ trợ nút Tự vệ cục bộ)
         top_procs = getattr(self.agent, "latest_top_procs", [])
-        self.tbl_live_procs.setRowCount(len(top_procs))
-        for r, p in enumerate(top_procs):
-            item_name = QTableWidgetItem(str(getattr(p, "name", "Unknown")))
-            item_pid = QTableWidgetItem(str(getattr(p, "pid", 0)))
-            item_pid.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            item_down = QTableWidgetItem(format_speed(getattr(p, "down_kbps", 0.0)))
-            item_down.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-            item_up = QTableWidgetItem(format_speed(getattr(p, "up_kbps", 0.0)))
-            item_up.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        self._update_live_procs_table(top_procs)
 
-            self.tbl_live_procs.setItem(r, 0, item_name)
-            self.tbl_live_procs.setItem(r, 1, item_pid)
-            self.tbl_live_procs.setItem(r, 2, item_down)
-            self.tbl_live_procs.setItem(r, 3, item_up)
-
-        # 3. Cập nhật Tab 2: Chính sách hiện hành & Nhật ký kiểm toán
-        policies = list(self.agent.active_policies.values())
-        self.tbl_policies.setRowCount(len(policies))
-        for r, pol in enumerate(policies):
-            act = pol.get("action", "")
-            act_label = "CHẶN TOÀN BỘ (BLOCK)" if act == "BLOCK" else "BÓP BĂNG THÔNG (QoS)"
-            limit_str = f"{pol.get('limit_kbps', 0):.1f} KB/s" if act == "THROTTLE" else "0 KB/s"
-            t_str = time.strftime("%H:%M:%S", time.localtime(pol.get("time", time.time())))
-
-            self.tbl_policies.setItem(r, 0, QTableWidgetItem(pol.get("app", "")))
-            self.tbl_policies.setItem(r, 1, QTableWidgetItem(act_label))
-            self.tbl_policies.setItem(r, 2, QTableWidgetItem(limit_str))
-            self.tbl_policies.setItem(r, 3, QTableWidgetItem(pol.get("direction", "both")))
-            self.tbl_policies.setItem(r, 4, QTableWidgetItem(t_str))
+        # 3. Cập nhật Tab 2: Chính sách 2 lớp & Nhật ký kiểm toán
+        self._refresh_policies_table()
 
         # Bảng Nhật ký kiểm toán (Audit Logs)
-        audit_logs = self.agent.get_audit_logs()
+        audit_fn = getattr(self.agent, "get_audit_logs", None)
+        audit_logs = audit_fn() if callable(audit_fn) else []
         self.tbl_audit.setRowCount(min(len(audit_logs), 50))
         for r, entry in enumerate(audit_logs[:50]):
             self.tbl_audit.setItem(r, 0, QTableWidgetItem(entry.get("time_str", "")))
@@ -942,26 +1356,24 @@ class ClientStatusWindow(QMainWindow):
             self.tbl_audit.setItem(r, 3, QTableWidgetItem(entry.get("target", "")))
             self.tbl_audit.setItem(r, 4, QTableWidgetItem(entry.get("details", "")))
 
-        # 4. Cập nhật Tab 3: Thẻ độ trễ (nếu đang ở tab 2)
-        if self.tab_widget.currentIndex() == 2:
-            # Server Latency
-            srv_lat, srv_ok, _ = self.agent.check_server_latency()
+        # 4. Cập nhật Tab 3: Thẻ độ trễ (đo bất đồng bộ trên luồng nền, không block GUI)
+        if self.tab_widget.currentIndex() == 2 and hasattr(self.agent, "check_server_latency"):
+            if hasattr(self.agent, "trigger_async_latency_check"):
+                self.agent.trigger_async_latency_check()
+                srv_ok = getattr(self.agent, "cached_server_ok", False)
+                srv_lat = getattr(self.agent, "cached_server_latency", None)
+                net_ok = getattr(self.agent, "cached_internet_ok", False)
+                net_lat = getattr(self.agent, "cached_internet_latency", None)
+            else:
+                srv_lat, srv_ok, _ = self.agent.check_server_latency()
+                net_lat, net_ok, _ = self.agent.check_internet_latency()
+
             if srv_ok and srv_lat is not None:
                 self.lbl_srv_lat_val.setText(f"{srv_lat:.1f} ms")
-                self.lbl_srv_status.setText("● Kết nối TCP ổn định")
-                self.lbl_srv_status.setStyleSheet("font-size: 10px; color: #059669; font-weight: bold;")
             else:
                 self.lbl_srv_lat_val.setText("-- ms")
-                self.lbl_srv_status.setText("● Không thể kết nối")
-                self.lbl_srv_status.setStyleSheet("font-size: 10px; color: #DC2626; font-weight: bold;")
 
-            # Internet Latency
-            net_lat, net_ok, _ = self.agent.check_internet_latency()
             if net_ok and net_lat is not None:
                 self.lbl_net_lat_val.setText(f"{net_lat:.1f} ms")
-                self.lbl_net_status.setText("● Internet sẵn sàng")
-                self.lbl_net_status.setStyleSheet("font-size: 10px; color: #2563EB; font-weight: bold;")
             else:
                 self.lbl_net_lat_val.setText("-- ms")
-                self.lbl_net_status.setText("● Không phản hồi mạng ngoài")
-                self.lbl_net_status.setStyleSheet("font-size: 10px; color: #D97706; font-weight: bold;")

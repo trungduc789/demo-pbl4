@@ -157,6 +157,82 @@ class TestClientAgentService(unittest.TestCase):
         dashboard.close()
         agent.stop()
 
+    def test_two_tier_policy_enforcement(self):
+        """Kiểm tra cơ chế bảo mật 2 tầng (2-Tier Policy): Admin Enforced (🔒) ưu tiên cao hơn Local Self-Protect (🔓)."""
+        from unittest.mock import MagicMock
+
+        mock_monitor = MagicMock()
+        mock_shaper = MagicMock()
+        mock_shaper.block_app.return_value = (True, "Blocked OK")
+        mock_shaper.unblock_app.return_value = (True, "Unblocked OK")
+        mock_shaper.apply_limit.return_value = (True, "Throttled OK")
+        mock_shaper.remove_limit.return_value = (True, "Removed limit OK")
+        mock_monitor.packet_shaper = mock_shaper
+        mock_monitor.collector = MagicMock()
+        mock_monitor.calculator = MagicMock()
+        mock_monitor.etw_consumer = MagicMock()
+
+        agent = ClientAgentService(
+            server_host=self.TEST_HOST,
+            server_port=self.TEST_PORT,
+            enable_etw=False,
+            monitor_service=mock_monitor,
+        )
+
+        # 1. Người dùng máy con tự chặn ứng dụng cục bộ (Tier 2 - Local Self-Protect)
+        ok, msg = agent.apply_local_policy("discord.exe", action="BLOCK")
+        self.assertTrue(ok, msg)
+        pol = agent.get_policy_for_app("discord.exe")
+        self.assertIsNotNone(pol)
+        self.assertEqual(pol["source"], "LOCAL")
+        self.assertFalse(pol["locked_by_admin"])
+        self.assertFalse(agent.is_locked_by_admin("discord.exe"))
+
+        # Người dùng tự gỡ chặn ứng dụng cục bộ thành công
+        ok, msg = agent.remove_local_policy("discord.exe")
+        self.assertTrue(ok, msg)
+        self.assertIsNone(agent.get_policy_for_app("discord.exe"))
+
+        # 2. Người dùng máy con tự giới hạn băng thông cho steam.exe, và Admin khóa cứng chrome.exe
+        ok, _ = agent.apply_local_policy("steam.exe", action="THROTTLE", limit_kbps=500.0)
+        self.assertTrue(ok)
+
+        admin_cmd = CommandPacket(
+            command_id="CMD-ADMIN-BLOCK-01",
+            target_device_uuid=agent.device_uuid,
+            action=CommandAction.BLOCK_APP.value,
+            target_app="chrome.exe",
+            direction="both",
+        )
+        agent.handle_remote_command(admin_cmd)
+
+        chrome_pol = agent.get_policy_for_app("chrome.exe")
+        self.assertIsNotNone(chrome_pol)
+        self.assertEqual(chrome_pol["source"], "ADMIN")
+        self.assertTrue(chrome_pol["locked_by_admin"])
+        self.assertTrue(agent.is_locked_by_admin("chrome.exe"))
+
+        # 3. Máy con cố gắng gỡ hoặc ghi đè lệnh của Admin -> Phải bị từ chối (DENIED)
+        ok_unblock, msg_unblock = agent.remove_local_policy("chrome.exe")
+        self.assertFalse(ok_unblock)
+        self.assertIn("Admin", msg_unblock)
+
+        ok_override, msg_override = agent.apply_local_policy("chrome.exe", action="THROTTLE", limit_kbps=1000.0)
+        self.assertFalse(ok_override)
+        self.assertIn("Admin", msg_override)
+
+        # Kiểm tra Audit Log đã ghi lại hành vi bị từ chối (DENIED)
+        audit_logs = agent.get_audit_logs()
+        self.assertTrue(any(log["status"] == "DENIED" and log["target"] == "chrome.exe" for log in audit_logs))
+
+        # 4. Xóa toàn bộ chính sách cục bộ (clear_all_local_policies): chỉ xóa LOCAL, giữ nguyên ADMIN
+        ok_clear, _ = agent.clear_all_local_policies()
+        self.assertTrue(ok_clear)
+        self.assertIsNone(agent.get_policy_for_app("steam.exe"))
+        self.assertIsNotNone(agent.get_policy_for_app("chrome.exe"))
+        self.assertTrue(agent.is_locked_by_admin("chrome.exe"))
+
+
 
 if __name__ == "__main__":
     unittest.main()

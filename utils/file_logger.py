@@ -72,7 +72,7 @@ class FileLogger:
     @classmethod
     def log_policy(
         cls,
-        action: str,  # "APPLY", "REMOVE"
+        action: str,  # "APPLY", "REMOVE", "BLOCK", "UNBLOCK"
         policy_type: str,
         target_app: str,
         limit_kbps: float = 0.0,
@@ -100,15 +100,18 @@ class FileLogger:
             th_kb = throttled_bytes / 1024.0
             th_str = f"{throttled_packets:,} gói ({th_kb:,.1f} KB)" if throttled_packets > 0 else "0 gói"
 
-            if action.upper() == "APPLY":
+            act_upper = action.upper()
+            if act_upper in ("APPLY", "BLOCK"):
+                tag = "POLICY_BLOCK" if act_upper == "BLOCK" else "POLICY_APPLY"
                 line = (
-                    f"[{timestamp_str}] [POLICY_APPLY] Loại: {policy_type} | "
+                    f"[{timestamp_str}] [{tag}] Loại: {policy_type} | "
                     f"Tiến trình: {target_app} | Hướng: {dir_str} | "
                     f"Mức trần: {limit_kbps:,.1f} KB/s | Trạng thái: {status}"
                 )
             else:
+                tag = "POLICY_UNBLOCK" if act_upper == "UNBLOCK" else "POLICY_REMOVE"
                 line = (
-                    f"[{timestamp_str}] [POLICY_REMOVE] Loại: {policy_type} | "
+                    f"[{timestamp_str}] [{tag}] Loại: {policy_type} | "
                     f"Tiến trình: {target_app} | Đã điều phối: {th_str} | Trạng thái: {status}"
                 )
 
@@ -121,3 +124,19 @@ class FileLogger:
                     f.write(line)
             except Exception:
                 pass
+
+    @classmethod
+    def read_policy_logs(cls, limit: int = 50) -> list:
+        """Đọc các dòng nhật ký chính sách gần nhất từ logs/policies.log."""
+        log_path = os.path.join(LOGS_DIR, "policies.log")
+        if not os.path.exists(log_path):
+            return []
+        try:
+            with cls._lock:
+                with open(log_path, "r", encoding="utf-8") as f:
+                    lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+            recent = lines[-limit:] if limit > 0 else lines
+            recent.reverse()
+            return [{"raw": ln} for ln in recent]
+        except Exception:
+            return []

@@ -1,3 +1,5 @@
+import os
+import sys
 import time
 import threading
 from collections import deque
@@ -11,6 +13,7 @@ import pyqtgraph as pg
 from application.monitor_service import MonitorService
 from config.settings import UPDATE_INTERVAL, MAX_DATA_POINTS
 from utils.safe_print import safe_print as print
+from utils.file_logger import FileLogger, LOGS_DIR
 
 from presentation.glasswire_icons import (
     get_glasswire_logo_icon,
@@ -592,7 +595,6 @@ class GlassWireTimelineScrubber(QtWidgets.QWidget):
         self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self.history_points = deque(maxlen=2400)
         self.window_duration = 300.0
-        self.is_history_mode = False
         self.slider_start: Optional[float] = None
         self.slider_end: Optional[float] = None
         self.drag_mode: Optional[str] = None
@@ -609,29 +611,7 @@ class GlassWireTimelineScrubber(QtWidgets.QWidget):
         self.update()
 
     def add_point(self, timestamp: float, value: float):
-        if not self.is_history_mode:
-            self.history_points.append((timestamp, value))
-            self.update()
-
-    def set_historical_series(self, series: list):
-        """Nạp dữ liệu chuỗi lịch sử vào mini scrubber để hiển thị toàn cảnh ngày."""
-        self.is_history_mode = True
-        self.history_points.clear()
-        self.slider_start = None
-        self.slider_end = None
-        if not series:
-            self.update()
-            return
-        n = len(series)
-        if n <= 800:
-            for pt in series:
-                self.history_points.append((pt["timestamp"], pt.get("down_kb", 0.0) + pt.get("up_kb", 0.0)))
-        else:
-            step = (n - 1) / 799.0
-            for i in range(800):
-                idx = int(round(i * step))
-                pt = series[idx]
-                self.history_points.append((pt["timestamp"], pt.get("down_kb", 0.0) + pt.get("up_kb", 0.0)))
+        self.history_points.append((timestamp, value))
         self.update()
 
     def set_slider_range(self, start: float, end: float):
@@ -642,7 +622,6 @@ class GlassWireTimelineScrubber(QtWidgets.QWidget):
 
     def reset_to_live(self):
         """Quay lại chế độ live monitor bám sát thời gian thực."""
-        self.is_history_mode = False
         self.slider_start = None
         self.slider_end = None
         self.drag_mode = None
@@ -650,13 +629,6 @@ class GlassWireTimelineScrubber(QtWidgets.QWidget):
 
     def get_time_bounds(self) -> Tuple[float, float]:
         """Tính toán khoảng thời gian bao quát hiển thị trên thanh timeline."""
-        if self.is_history_mode and self.history_points:
-            t_min = self.history_points[0][0]
-            t_max = self.history_points[-1][0]
-            if t_max <= t_min:
-                t_max = t_min + self.window_duration
-            return t_min, t_max
-
         now = time.time()
         if len(self.history_points) > 1:
             t_max = max(now, self.history_points[-1][0])
@@ -857,19 +829,15 @@ class GlassWireTimelineScrubber(QtWidgets.QWidget):
 
         win_rect = QtCore.QRectF(x1, 2, box_w, h - 14)
 
-        if self.is_history_mode:
-            painter.setPen(QtGui.QPen(QtGui.QColor("#3B82F6"), 1.4))
-            painter.setBrush(QtGui.QColor(239, 246, 255, 140))
-        else:
-            painter.setPen(QtGui.QPen(QtGui.QColor("#64748B"), 1.4))
-            painter.setBrush(QtGui.QColor(255, 255, 255, 205))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#64748B"), 1.4))
+        painter.setBrush(QtGui.QColor(255, 255, 255, 205))
 
         painter.drawRoundedRect(win_rect, 4, 4)
 
         # Hai nút kéo tròn hai bên ( ○-------------○ )
         handle_y = (h - 14) / 2.0 + 2.0
         painter.setBrush(QtGui.QColor("#FFFFFF"))
-        painter.setPen(QtGui.QPen(QtGui.QColor("#475569") if not self.is_history_mode else QtGui.QColor("#2563EB"), 1.8))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#475569"), 1.8))
         painter.drawEllipse(QtCore.QPointF(x1, handle_y), 4.5, 4.5)
         painter.drawEllipse(QtCore.QPointF(x2, handle_y), 4.5, 4.5)
 
@@ -1051,24 +1019,23 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self.current_y_max = 1024.0
         self._scale_down_hold_time = 0.0
 
-        # Tiến trình đang giám sát QoS
-        self.monitored_qos_app = ""
-        self.monitored_qos_limit = 0.0
-
         # Chế độ xem dữ liệu tại điểm & tạm dừng biểu đồ (Point Inspection & Pause/Resume)
         self.point_history = deque(maxlen=2400)
         self.is_paused = False
         self.pinned_time: Optional[float] = None
-        self.history_mode = False
-        self.historical_series: List[Dict] = []
-        self.current_hist_page_series: List[Dict] = []
-        self.raw_hist_logs: List[Dict] = []
+        self.raw_policy_logs: List[Dict] = []
 
         # Bộ lọc chiều lưu lượng và sắp xếp (Filter & Sort Sidebar)
         self.filter_direction = "both"      # "both", "incoming", "outgoing"
         self.filter_sort = "high_to_low"    # "high_to_low", "low_to_high", "alpha"
         self.filter_scope = "all"           # "all", "wan", "lan"
         self.current_traffic_view = "graph" # "graph" hoặc "usage" 
+
+        # Trạng thái Offline của máy con đang giám sát trong Admin Mode
+        self._is_monitored_device_offline: bool = False
+        self._offline_anchor_ts: Optional[float] = None
+        self._last_usage_conns: List = []
+        self._last_fed_telemetry_ts: Dict[str, float] = {}
 
         self._init_ui()
         self._start_worker()
@@ -1083,7 +1050,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
                     except Exception:
                         pass
                 try:
-                    self.async_bridge.post_event(self._on_remote_policy_updated)
+                    self.async_bridge.run_on_main(self._on_remote_policy_updated)
                 except Exception:
                     pass
             self.agent_service.on_policy_applied_locally = _on_policy_with_ui_refresh
@@ -1219,7 +1186,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self._setup_protect_page(self.page_protect)
         self.stacked_pages.addWidget(self.page_protect)
 
-        # Trang Log Analysis (MySQL Integrity & Event History)
+        # Trang Log Analysis (File-based Policy & Security Event History)
         self.page_logs = QtWidgets.QWidget()
         self._setup_logs_page(self.page_logs)
         self.stacked_pages.addWidget(self.page_logs)
@@ -1233,14 +1200,6 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self._switch_nav_page(0)
 
         self.setCentralWidget(container)
-
-    def _get_db_manager(self):
-        """Lấy DatabaseManager từ MonitorService hoặc FleetManagerService an toàn."""
-        if self.service and hasattr(self.service, "db_manager") and self.service.db_manager:
-            return self.service.db_manager
-        if self.fleet_service and hasattr(self.fleet_service, "db") and self.fleet_service.db:
-            return self.fleet_service.db
-        return None
 
     def _get_active_collector(self):
         """Lấy NetworkCollector để quét socket và thông số card mạng."""
@@ -1284,11 +1243,12 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
     def _create_breadcrumb_bar(self) -> QtWidgets.QFrame:
         """Tạo thanh Breadcrumb điều hướng quay lại danh sách máy trạm."""
         bar = QtWidgets.QFrame()
+        bar.setObjectName("breadcrumbBar")
         bar.setFixedHeight(38)
         bar.setStyleSheet("""
-            QFrame {
-                background-color: #EFF6FF;
-                border-bottom: 1px solid #BFDBFE;
+            QFrame#breadcrumbBar {
+                background-color: #FFFFFF;
+                border-bottom: 1px solid #E2E8F0;
                 padding: 2px 14px;
             }
         """)
@@ -1316,19 +1276,155 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         btn_back.clicked.connect(self._return_to_fleet_view)
         layout.addWidget(btn_back)
 
-        self.lbl_breadcrumb_info = QtWidgets.QLabel("Đang giám sát máy...")
-        self.lbl_breadcrumb_info.setStyleSheet("font-size: 12px; font-weight: 600; color: #1E3A8A;")
-        layout.addWidget(self.lbl_breadcrumb_info)
+        self.lbl_breadcrumb_device = QtWidgets.QLabel("💻 Đang giám sát máy trạm")
+        self.lbl_breadcrumb_device.setStyleSheet("font-size: 12px; font-weight: 700; color: #1E293B; border: none; background: transparent;")
+        layout.addWidget(self.lbl_breadcrumb_device)
+
+        # Thông báo Offline (CHỈ hiển thị khi máy trạm mất kết nối, ẩn khi Online)
+        self.lbl_offline_notice = QtWidgets.QLabel("🔴 MÁY TRẠM ĐÃ OFFLINE — Dữ liệu đang tạm dừng")
+        self.lbl_offline_notice.setStyleSheet("""
+            background-color: #FEF2F2;
+            color: #DC2626;
+            border: 1px solid #FECACA;
+            border-radius: 11px;
+            font-size: 11px;
+            font-weight: 800;
+            padding: 2px 12px;
+        """)
+        self.lbl_offline_notice.setVisible(False)
+        layout.addWidget(self.lbl_offline_notice)
+
         layout.addStretch()
 
         return bar
 
+    def _get_monitored_device_state(self):
+        """Trả về trạng thái FleetDeviceState của máy con đang được Admin giám sát (nếu có)."""
+        if self.is_admin_mode and self.fleet_service and self.selected_device_uuid:
+            return self.fleet_service.get_device_state(self.selected_device_uuid)
+        return None
+
+    def _sync_monitored_device_offline_state(self, dev_state):
+        """
+        Đồng bộ giao diện khi máy con đang giám sát Online/Offline:
+        - Offline: hiển thị thông báo Offline, kéo biểu đồ về 0 thay vì đi ngang, đóng băng mọi thông số tiến trình/Usage/Scanner.
+        - Online: ẩn thông báo Offline hoàn toàn, khôi phục badge LIVE.
+        """
+        is_off = bool(dev_state and dev_state.status != "online")
+        if hasattr(self, "lbl_offline_notice"):
+            if is_off:
+                off_ts = getattr(dev_state, "offline_at", 0.0) or getattr(dev_state, "last_seen", 0.0) or time.time()
+                off_str = time.strftime("%H:%M:%S", time.localtime(off_ts))
+                self.lbl_offline_notice.setText(f"🔴 MÁY TRẠM ĐÃ OFFLINE (Mất kết nối lúc {off_str}) — Đã dừng cập nhật")
+            self.lbl_offline_notice.setVisible(is_off)
+
+        if hasattr(self, "lbl_live_badge"):
+            if is_off:
+                self.lbl_live_badge.setText("🔴 OFFLINE")
+                self.lbl_live_badge.setStyleSheet("color: #DC2626; font-weight: bold; font-size: 11px; padding: 3px 8px; background-color: #FEF2F2; border-radius: 4px; border: 1px solid #FECACA;")
+            elif not getattr(self, "is_paused", False):
+                self.lbl_live_badge.setText("● LIVE")
+                self.lbl_live_badge.setStyleSheet("color: #059669; font-weight: bold; font-size: 11px; padding: 3px 8px; background-color: #ECFDF5; border-radius: 4px; border: 1px solid #A7F3D0;")
+
+        if is_off and not self._is_monitored_device_offline:
+            self._is_monitored_device_offline = True
+            off_ts = getattr(dev_state, "offline_at", 0.0) or getattr(dev_state, "last_seen", 0.0) or time.time()
+            last_pt_ts = self.down_points[-1][0] if self.down_points else off_ts
+            drop_ts = max(last_pt_ts + 1.0, off_ts)
+
+            # Chốt điểm về 0 ở thời điểm ngắt kết nối nếu đường sóng đang cao hơn 0
+            if not self.down_points or self.down_points[-1][1] != 0.0:
+                self.down_points.append((drop_ts, 0.0))
+            if not self.up_points or self.up_points[-1][1] != 0.0:
+                self.up_points.append((drop_ts, 0.0))
+            if not self.point_history or self.point_history[-1].get("down_kb", 0.0) != 0.0 or self.point_history[-1].get("up_kb", 0.0) != 0.0:
+                self.point_history.append({
+                    "timestamp": drop_ts,
+                    "down_kb": 0.0,
+                    "up_kb": 0.0,
+                    "top_procs": [],
+                })
+                if hasattr(self, "timeline_scrubber"):
+                    self.timeline_scrubber.add_point(drop_ts, 0.0)
+
+            self._offline_anchor_ts = drop_ts
+            self.latest_down = 0.0
+            self.latest_up = 0.0
+            self.latest_proc_down = 0.0
+            self.latest_proc_up = 0.0
+            self.latest_proc_speeds = []
+
+            self._update_app_sidebar([])
+            self._update_selected_app_hud()
+            if hasattr(self, "protect_view"):
+                self.protect_view.update_protect_table([], self.app_accumulated_bytes, self.app_metadata)
+            if hasattr(self, "usage_view") and hasattr(self, "traffic_content_stack") and self.traffic_content_stack.currentIndex() == 1:
+                self._update_usage_view_now()
+        elif not is_off and self._is_monitored_device_offline:
+            self._is_monitored_device_offline = False
+            self._offline_anchor_ts = None
+
+    def _switch_active_remote_device(self, device_uuid: Optional[str]):
+        """Đồng bộ bộ đệm biểu đồ và thông tin máy khi Admin chuyển đổi giữa các máy trạm."""
+        changed = (device_uuid != self.selected_device_uuid)
+        self.selected_device_uuid = device_uuid
+
+        dev_st = self.fleet_service.get_device_state(device_uuid) if (self.fleet_service and device_uuid) else None
+        if hasattr(self, "lbl_breadcrumb_device") and dev_st:
+            self.lbl_breadcrumb_device.setText(
+                f"💻 Đang giám sát máy trạm: {dev_st.hostname}  ({dev_st.ip_address or 'LAN'})  —  UUID: {device_uuid[:12]}"
+            )
+
+        if not changed or not device_uuid or not self.fleet_service:
+            self._sync_monitored_device_offline_state(dev_st)
+            return
+
+        self._is_monitored_device_offline = False
+        self._offline_anchor_ts = None
+        self._last_usage_conns = []
+        self.latest_down = 0.0
+        self.latest_up = 0.0
+        self.latest_proc_down = 0.0
+        self.latest_proc_up = 0.0
+        self.latest_proc_speeds = []
+
+        dev_state = dev_st
+        now = time.time()
+        first_hist_ts = dev_state.download_history[0][0] if (dev_state and dev_state.download_history) else now
+        base_end = min(now, first_hist_ts - 1.0)
+        init_times = np.linspace(base_end - 650.0, base_end, 650)
+        self.down_points = deque([(t, 0.0) for t in init_times], maxlen=2400)
+        self.up_points = deque([(t, 0.0) for t in init_times], maxlen=2400)
+        self.point_history.clear()
+        self.window_sample_history.clear()
+        self.app_accumulated_bytes = {"All apps": {"down": 0.0, "up": 0.0}}
+        self.total_accumulated_down = 0.0
+        self.total_accumulated_up = 0.0
+
+        if dev_state:
+            for ts, d_val in list(dev_state.download_history):
+                self.down_points.append((ts, d_val))
+            for ts, u_val in list(dev_state.upload_history):
+                self.up_points.append((ts, u_val))
+            for (ts, d_val), (_, u_val) in zip(list(dev_state.download_history), list(dev_state.upload_history)):
+                self.point_history.append({
+                    "timestamp": ts,
+                    "down_kb": d_val,
+                    "up_kb": u_val,
+                    "top_procs": [],
+                })
+                self.window_sample_history.append({
+                    "t": ts,
+                    "down_b": d_val * 1024.0 * UPDATE_INTERVAL,
+                    "up_b": u_val * 1024.0 * UPDATE_INTERVAL,
+                    "procs": {},
+                })
+
+        self._sync_monitored_device_offline_state(dev_state)
+
     def _on_machine_selected_for_control(self, device_uuid: str):
         """Khi Admin click chọn 1 máy trong Fleet View: chuyển sang chế độ Remote Detail View."""
-        self.selected_device_uuid = device_uuid
-        dev_state = self.fleet_service.get_device_state(device_uuid) if self.fleet_service else None
-        hostname = dev_state.hostname if dev_state else "Unknown"
-        ip = dev_state.ip_address if dev_state else "127.0.0.1"
+        self._switch_active_remote_device(device_uuid)
 
         if hasattr(self, 'protect_view'):
             self.protect_view.set_remote_mode(
@@ -1336,9 +1432,6 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             )
 
         self.breadcrumb_bar.setVisible(True)
-        self.lbl_breadcrumb_info.setText(
-            f"Đang giám sát & can thiệp máy con: <b>{hostname}</b> ({ip}) — [UUID: {device_uuid[:8]}...]"
-        )
 
         # Chuyển sang Tab Traffic Monitor (index 1 trong Admin Mode)
         target_tab = 1 if self.is_admin_mode else 0
@@ -1354,10 +1447,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
 
     def _on_machine_protect_requested(self, device_uuid: str):
         """Admin click nút 🛡️ Chặn / QoS trong Fleet View: chuyển thẳng đến tab Protect với máy đó."""
-        self.selected_device_uuid = device_uuid
-        dev_state = self.fleet_service.get_device_state(device_uuid) if self.fleet_service else None
-        hostname = dev_state.hostname if dev_state else "Unknown"
-        ip = dev_state.ip_address if dev_state else "127.0.0.1"
+        self._switch_active_remote_device(device_uuid)
 
         # Cấu hình protect_view ở chế độ remote
         if hasattr(self, 'protect_view'):
@@ -1366,9 +1456,6 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             )
 
         self.breadcrumb_bar.setVisible(True)
-        self.lbl_breadcrumb_info.setText(
-            f"🛡️ Đang can thiệp Protect máy con: <b>{hostname}</b> ({ip}) — [UUID: {device_uuid[:8]}...]"
-        )
 
         # Tìm index của tab Protect (index 2 trong admin mode: 0=Fleet, 1=Traffic, 2=Protect)
         protect_tab_index = 2 if self.is_admin_mode else 1
@@ -1386,36 +1473,55 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         if not self.selected_device_uuid and devices:
             online_devs = [d for d in devices if d.status == "online"]
             target_dev = online_devs[0] if online_devs else devices[0]
-            self.selected_device_uuid = target_dev.device_uuid
+            self._switch_active_remote_device(target_dev.device_uuid)
 
-        # Nếu đang giám sát một máy cụ thể thì nạp data của máy đó vào biểu đồ
+        if hasattr(self, 'protect_view'):
+            if not self.protect_view.remote_device_uuid and self.selected_device_uuid:
+                self.protect_view.set_remote_mode(
+                    self.selected_device_uuid,
+                    self.fleet_service.send_remote_command if self.fleet_service else None,
+                )
+            elif hasattr(self.protect_view, 'sync_fleet_devices_if_changed'):
+                self.protect_view.sync_fleet_devices_if_changed()
+
+        # Nếu đang giám sát một máy cụ thể thì đồng bộ trạng thái Online/Offline và chỉ nạp data khi máy Online
         if self.selected_device_uuid:
             dev_state = self.fleet_service.get_device_state(self.selected_device_uuid)
-            if dev_state and dev_state.latest_telemetry:
+            self._sync_monitored_device_offline_state(dev_state)
+            if dev_state and dev_state.status == "online" and dev_state.latest_telemetry:
                 telem = dev_state.latest_telemetry
-                proc_speeds = []
-                for p in telem.top_processes:
-                    proc_speeds.append({
-                        "name": p.name,
-                        "pid": p.pid,
-                        "down_kb": p.down_kbps,
-                        "up_kb": p.up_kbps,
-                        "rx_bytes": int(p.down_kbps * 1024),
-                        "tx_bytes": int(p.up_kbps * 1024),
-                        "exe": "",
-                    })
-                    if p.name not in self.app_metadata:
-                        self.app_metadata[p.name] = {"exe": "", "pid": p.pid}
-                down_spd = telem.speeds.download_kbps
-                up_spd = telem.speeds.upload_kbps
-                self._on_new_sample(
-                    telem.timestamp,
-                    down_spd,
-                    up_spd,
-                    proc_speeds,
-                    down_spd,
-                    up_spd
-                )
+                last_ts_map = getattr(self, "_last_fed_telemetry_ts", None)
+                if last_ts_map is None:
+                    last_ts_map = {}
+                    self._last_fed_telemetry_ts = last_ts_map
+                if telem.timestamp > last_ts_map.get(self.selected_device_uuid, 0.0):
+                    last_ts_map[self.selected_device_uuid] = telem.timestamp
+                    proc_speeds = []
+                    for p in telem.top_processes:
+                        proc_speeds.append({
+                            "name": p.name,
+                            "pid": p.pid,
+                            "down_kb": p.down_kbps,
+                            "up_kb": p.up_kbps,
+                            "rx_bytes": int(p.down_kbps * 1024),
+                            "tx_bytes": int(p.up_kbps * 1024),
+                            "exe": "",
+                        })
+                        if p.name not in self.app_metadata:
+                            self.app_metadata[p.name] = {"exe": "", "pid": p.pid}
+                    down_spd = telem.speeds.download_kbps
+                    up_spd = telem.speeds.upload_kbps
+                    now_ts = time.time()
+                    # Chống lệch đồng hồ giữa máy con và Admin làm điểm vẽ bị rơi ra ngoài khung thời gian
+                    display_ts = telem.timestamp if abs(now_ts - telem.timestamp) <= 4.0 else now_ts
+                    self._on_new_sample(
+                        display_ts,
+                        down_spd,
+                        up_spd,
+                        proc_speeds,
+                        down_spd,
+                        up_spd
+                    )
 
     # =========================================================================
     # HEADER THANH ĐIỀU HƯỚNG GLASSWIRE (NAV TABS + LOGO + UPGRADE)
@@ -1531,10 +1637,11 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
 
     def _on_remote_policy_updated(self):
         if hasattr(self, "protect_view"):
+            self.protect_view.sync_from_agent_policies()
+            self.protect_view._sync_all_pills_from_policies()
             self.protect_view.update_protect_table(
                 self.latest_proc_speeds, self.app_accumulated_bytes, self.app_metadata
             )
-        self._refresh_policy_table()
 
     def _switch_nav_page(self, index: int):
         """Chuyển trang hiển thị và áp dụng giao diện nút bấm GlassWire"""
@@ -1578,19 +1685,22 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             if index == 0:
                 self.breadcrumb_bar.setVisible(False)
                 self._refresh_fleet_admin_ui()
+            elif index == 1:  # Traffic Monitor
+                self.breadcrumb_bar.setVisible(bool(self.selected_device_uuid))
             elif index == 2:  # Protect view
+                self.breadcrumb_bar.setVisible(bool(self.selected_device_uuid))
                 if hasattr(self, 'protect_view'):
                     self.protect_view.update_protect_table(self.latest_proc_speeds, self.app_accumulated_bytes, self.app_metadata)
-                self._refresh_policy_table()
-            elif index == 3:  # Logs
+            elif index == 3:  # Logs (Local DB)
+                self.breadcrumb_bar.setVisible(False)
                 self._on_enter_usage_history_page()
-            elif index == 4:  # Scanner
+            elif index == 4:  # Scanner (Local Sockets)
+                self.breadcrumb_bar.setVisible(False)
                 self._refresh_connections()
         else:
             if index == 1:
                 if hasattr(self, 'protect_view'):
                     self.protect_view.update_protect_table(self.latest_proc_speeds, self.app_accumulated_bytes, self.app_metadata)
-                self._refresh_policy_table()
             elif index == 2:
                 self._on_enter_usage_history_page()
             elif index == 3:
@@ -1735,99 +1845,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self.btn_pause_toggle.clicked.connect(self._toggle_pause_resume)
         lc_layout.addWidget(self.btn_pause_toggle)
 
-        self.btn_history_mode = QtWidgets.QPushButton("📅 Xem Lịch Sử")
-        self.btn_history_mode.setFixedHeight(28)
-        self.btn_history_mode.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.btn_history_mode.setStyleSheet("""
-            QPushButton {
-                background-color: #EFF6FF;
-                color: #2563EB;
-                font-size: 11px;
-                font-weight: 600;
-                padding: 3px 12px;
-                border-radius: 5px;
-                border: 1px solid #BFDBFE;
-            }
-            QPushButton:hover {
-                background-color: #DBEAFE;
-            }
-        """)
-        self.btn_history_mode.clicked.connect(self._toggle_history_mode)
-        lc_layout.addWidget(self.btn_history_mode)
-
         chart_top_bar.addWidget(self.live_controls_widget)
-
-        # Điều khiển Lịch sử
-        self.history_controls_widget = QtWidgets.QWidget()
-        hc_layout = QtWidgets.QHBoxLayout(self.history_controls_widget)
-        hc_layout.setContentsMargins(0, 0, 0, 0)
-        hc_layout.setSpacing(8)
-
-        lbl_date = QtWidgets.QLabel("📅 Ngày:")
-        lbl_date.setStyleSheet("font-size: 11px; font-weight: bold; color: #334155;")
-        hc_layout.addWidget(lbl_date)
-
-        self.date_picker_history = QtWidgets.QDateEdit()
-        self.date_picker_history.setCalendarPopup(True)
-        self.date_picker_history.setDisplayFormat("yyyy-MM-dd")
-        self.date_picker_history.setDate(QtCore.QDate.currentDate())
-        self.date_picker_history.setFixedHeight(28)
-        self.date_picker_history.setMinimumWidth(110)
-        self.date_picker_history.setStyleSheet("font-size: 11px; padding: 2px 8px; border: 1px solid #CBD5E1; border-radius: 5px; background-color: #FFFFFF;")
-        self.date_picker_history.dateChanged.connect(self._on_history_date_picker_changed)
-        hc_layout.addWidget(self.date_picker_history)
-
-        btn_hist_today = QtWidgets.QPushButton("Hôm Nay")
-        btn_hist_today.setFixedHeight(28)
-        btn_hist_today.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        btn_hist_today.setStyleSheet("background-color: #FFFFFF; color: #334155; font-size: 11px; font-weight: 600; padding: 3px 10px; border: 1px solid #CBD5E1; border-radius: 5px;")
-        btn_hist_today.clicked.connect(lambda: self.date_picker_history.setDate(QtCore.QDate.currentDate()))
-        hc_layout.addWidget(btn_hist_today)
-
-        self.btn_load_history = QtWidgets.QPushButton("🔍 Tải Biểu Đồ")
-        self.btn_load_history.setFixedHeight(28)
-        self.btn_load_history.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.btn_load_history.setStyleSheet("background-color: #2563EB; color: #FFFFFF; font-size: 11px; font-weight: bold; padding: 3px 14px; border-radius: 5px; border: none;")
-        self.btn_load_history.clicked.connect(self._load_history_for_selected_date)
-        hc_layout.addWidget(self.btn_load_history)
-
-        self.btn_back_to_live = QtWidgets.QPushButton("⬅ Quay Lại Live")
-        self.btn_back_to_live.setFixedHeight(28)
-        self.btn_back_to_live.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.btn_back_to_live.setStyleSheet("background-color: #10B981; color: #FFFFFF; font-size: 11px; font-weight: bold; padding: 3px 14px; border-radius: 5px; border: none;")
-        self.btn_back_to_live.clicked.connect(self._exit_history_mode)
-        hc_layout.addWidget(self.btn_back_to_live)
-
-        # Các nút phóng to / thu nhỏ khi xem lịch sử
-        self.btn_hist_zoom_in = QtWidgets.QPushButton("🔍+ Phóng To")
-        self.btn_hist_zoom_in.setFixedHeight(28)
-        self.btn_hist_zoom_in.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.btn_hist_zoom_in.setStyleSheet("background-color: #EFF6FF; color: #2563EB; font-size: 11px; font-weight: bold; padding: 3px 10px; border: 1px solid #BFDBFE; border-radius: 5px;")
-        self.btn_hist_zoom_in.setToolTip("Phóng to biểu đồ vào khung giờ cao điểm (hoặc dùng con lăn chuột)")
-        self.btn_hist_zoom_in.clicked.connect(self._zoom_in_history)
-        hc_layout.addWidget(self.btn_hist_zoom_in)
-
-        self.btn_hist_zoom_out = QtWidgets.QPushButton("🔍- Thu Nhỏ")
-        self.btn_hist_zoom_out.setFixedHeight(28)
-        self.btn_hist_zoom_out.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.btn_hist_zoom_out.setStyleSheet("background-color: #EFF6FF; color: #2563EB; font-size: 11px; font-weight: bold; padding: 3px 10px; border: 1px solid #BFDBFE; border-radius: 5px;")
-        self.btn_hist_zoom_out.setToolTip("Thu nhỏ biểu đồ xem toàn cảnh (hoặc dùng con lăn chuột)")
-        self.btn_hist_zoom_out.clicked.connect(self._zoom_out_history)
-        hc_layout.addWidget(self.btn_hist_zoom_out)
-
-        self.btn_hist_zoom_24h = QtWidgets.QPushButton("⟲ Xem 24H")
-        self.btn_hist_zoom_24h.setFixedHeight(28)
-        self.btn_hist_zoom_24h.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.btn_hist_zoom_24h.setStyleSheet("background-color: #F8FAFC; color: #475569; font-size: 11px; font-weight: 600; padding: 3px 10px; border: 1px solid #CBD5E1; border-radius: 5px;")
-        self.btn_hist_zoom_24h.setToolTip("Đặt lại góc nhìn trọn vẹn 24 giờ")
-        self.btn_hist_zoom_24h.clicked.connect(self._reset_history_24h)
-        hc_layout.addWidget(self.btn_hist_zoom_24h)
-
-        self.history_controls_widget.setVisible(False)
-        chart_top_bar.addWidget(self.history_controls_widget)
-
-        self.combo_history_date = QtWidgets.QComboBox()
-        self.combo_history_date.setVisible(False)
 
         # Dropdown thời gian hiển thị (Mặc định: 5 Minutes)
         self.combo_time_window = QtWidgets.QComboBox()
@@ -2285,8 +2303,12 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         try:
             win_down, win_up, win_app_bytes = self._compute_window_traffic()
             tot_win_bytes = win_down + win_up
-            collector = self._get_active_collector()
-            active_conns = collector.collect_tcp_connections() if collector else []
+            if getattr(self, "_is_monitored_device_offline", False):
+                active_conns = list(getattr(self, "_last_usage_conns", []))
+            else:
+                collector = self._get_active_collector()
+                active_conns = collector.collect_tcp_connections() if collector else []
+                self._last_usage_conns = list(active_conns)
             self.usage_view.update_usage_data(
                 win_app_bytes,
                 active_conns,
@@ -2356,242 +2378,70 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         layout.setSpacing(0)
 
         # Giao diện GlassWire Protect phong cách chuẩn xác
-        self.protect_view = GlassWireProtectView(self.service, self.icon_manager, fleet_service=getattr(self, 'fleet_service', None))
+        self.protect_view = GlassWireProtectView(
+            self.service,
+            self.icon_manager,
+            fleet_service=getattr(self, 'fleet_service', None),
+            agent_service=getattr(self, 'agent_service', None),
+        )
+        if hasattr(self.protect_view, "combo_target_device") and self.is_admin_mode:
+            self.protect_view.combo_target_device.currentIndexChanged.connect(self._on_protect_device_combo_synced)
         layout.addWidget(self.protect_view)
 
-        # Các widget dự phòng giữ nguyên để tương thích ngược 100%
-        self.combo_qos_app = QtWidgets.QComboBox()
-        self.combo_shaper_dir = QtWidgets.QComboBox()
-        self.input_qos_limit = QtWidgets.QLineEdit("100")
-        self.qos_meter_label = QtWidgets.QLabel("")
-        self.qos_progress = QtWidgets.QProgressBar()
-        self.qos_status_card = QtWidgets.QLabel("")
-        self.policy_table = QtWidgets.QTableWidget()
+    def _on_protect_device_combo_synced(self, index: int):
+        """Đồng bộ máy đang chọn từ dropdown của tab Protect về BandwidthDashboard."""
+        if not self.is_admin_mode or not hasattr(self, "protect_view"):
+            return
+        uid = self.protect_view.combo_target_device.itemData(index)
+        if uid and uid != self.selected_device_uuid:
+            self._switch_active_remote_device(uid)
 
     def _setup_logs_page(self, parent: QtWidgets.QWidget):
-        scroll = QtWidgets.QScrollArea(parent)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        scroll.setStyleSheet("QScrollArea { background-color: #FFFFFF; border: none; }")
-
-        content_widget = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(content_widget)
-        layout.setContentsMargins(20, 16, 20, 20)
+        layout = QtWidgets.QVBoxLayout(parent)
+        layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(12)
 
         # 1. Header Toolbar
         header_layout = QtWidgets.QHBoxLayout()
-        header_left = QtWidgets.QVBoxLayout()
-        header_left.setSpacing(2)
-
-        title = QtWidgets.QLabel("📊 Usage History & Network Analytics")
-        title.setStyleSheet("font-size: 17px; font-weight: 800; color: #0F172A;")
-        sub_title = QtWidgets.QLabel("Thống kê lưu lượng mạng theo ngày, biểu đồ lịch sử tương tác và xếp hạng các ứng dụng tiêu thụ băng thông")
-        sub_title.setStyleSheet("font-size: 12px; color: #64748B;")
-        header_left.addWidget(title)
-        header_left.addWidget(sub_title)
-        header_layout.addLayout(header_left)
+        title = QtWidgets.QLabel("📜 Nhật Ký Hoạt Động & Chính Sách Mạng (Log Analysis)")
+        title.setStyleSheet("font-size: 16px; font-weight: 800; color: #0F172A; border: none; background: transparent;")
+        header_layout.addWidget(title)
         header_layout.addStretch()
+
+        btn_open_folder = QtWidgets.QPushButton("📂 Mở Thư Mục Logs")
+        btn_open_folder.setFixedHeight(28)
+        btn_open_folder.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        btn_open_folder.setStyleSheet("background-color: #FFFFFF; color: #475569; font-weight: 600; font-size: 11px; padding: 2px 12px; border: 1px solid #CBD5E1; border-radius: 5px;")
+        btn_open_folder.clicked.connect(self._open_logs_folder)
+        header_layout.addWidget(btn_open_folder)
+
+        btn_refresh = QtWidgets.QPushButton("🔄 Làm Mới")
+        btn_refresh.setFixedHeight(28)
+        btn_refresh.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        btn_refresh.setStyleSheet("background-color: #2563EB; color: #FFFFFF; font-weight: bold; font-size: 11px; padding: 2px 14px; border-radius: 5px;")
+        btn_refresh.clicked.connect(self._refresh_policy_logs)
+        header_layout.addWidget(btn_refresh)
+
         layout.addLayout(header_layout)
 
-        # 2. Thanh lọc ngày điều khiển (Filter Toolbar)
-        filter_bar = QtWidgets.QFrame()
-        filter_bar.setStyleSheet("""
-            QFrame {
-                background-color: #FFFFFF;
-                border: 1px solid #E2E8F0;
-                border-radius: 8px;
-                padding: 4px 10px;
-            }
-        """)
-        fb_layout = QtWidgets.QHBoxLayout(filter_bar)
-        fb_layout.setContentsMargins(6, 4, 6, 4)
-        fb_layout.setSpacing(8)
+        # 2. Subtitle / info banner
+        info_label = QtWidgets.QLabel("Hệ thống ghi nhận toàn bộ thao tác bảo mật (chặn, bỏ chặn, bóp băng thông) và kết nối mạng trực tiếp vào file log cục bộ (logs/policies.log & logs/connections.log).")
+        info_label.setStyleSheet("font-size: 11px; color: #64748B; background: transparent;")
+        layout.addWidget(info_label)
 
-        lbl_date_sel = QtWidgets.QLabel("📅 Chọn Ngày:")
-        lbl_date_sel.setStyleSheet("font-size: 12px; font-weight: bold; color: #334155;")
-        fb_layout.addWidget(lbl_date_sel)
+        # 3. Filter Box
+        filter_layout = QtWidgets.QHBoxLayout()
+        self.txt_policy_filter = QtWidgets.QLineEdit()
+        self.txt_policy_filter.setPlaceholderText("🔍 Tìm kiếm theo tiến trình, hành động (BLOCK, UNBLOCK, APPLY, REMOVE)...")
+        self.txt_policy_filter.setFixedHeight(28)
+        self.txt_policy_filter.setStyleSheet("font-size: 12px; padding: 2px 8px; border: 1px solid #CBD5E1; border-radius: 5px;")
+        self.txt_policy_filter.textChanged.connect(self._filter_policy_logs)
+        filter_layout.addWidget(self.txt_policy_filter)
+        layout.addLayout(filter_layout)
 
-        self.hist_page_date_picker = QtWidgets.QDateEdit()
-        self.hist_page_date_picker.setCalendarPopup(True)
-        self.hist_page_date_picker.setDisplayFormat("yyyy-MM-dd")
-        self.hist_page_date_picker.setDate(QtCore.QDate.currentDate())
-        self.hist_page_date_picker.setFixedHeight(28)
-        self.hist_page_date_picker.setStyleSheet("font-size: 12px; font-weight: 600; padding: 2px 8px; border: 1px solid #CBD5E1; border-radius: 5px;")
-        fb_layout.addWidget(self.hist_page_date_picker)
-
-        self.hist_page_combo_dates = QtWidgets.QComboBox()
-        self.hist_page_combo_dates.setFixedHeight(28)
-        self.hist_page_combo_dates.setMinimumWidth(125)
-        self.hist_page_combo_dates.setStyleSheet("font-size: 12px; font-weight: 600; padding: 2px 8px;")
-        self.hist_page_combo_dates.currentIndexChanged.connect(self._on_hist_page_combo_changed)
-        fb_layout.addWidget(self.hist_page_combo_dates)
-
-        btn_today = QtWidgets.QPushButton("Hôm Nay")
-        btn_today.setFixedHeight(28)
-        btn_today.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        btn_today.setStyleSheet("background-color: #FFFFFF; color: #2563EB; font-weight: 600; font-size: 11px; padding: 2px 10px; border: 1px solid #BFDBFE; border-radius: 5px;")
-        btn_today.clicked.connect(lambda: self.hist_page_date_picker.setDate(QtCore.QDate.currentDate()))
-        fb_layout.addWidget(btn_today)
-
-        btn_yesterday = QtWidgets.QPushButton("Hôm Qua")
-        btn_yesterday.setFixedHeight(28)
-        btn_yesterday.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        btn_yesterday.setStyleSheet("background-color: #FFFFFF; color: #475569; font-weight: 600; font-size: 11px; padding: 2px 10px; border: 1px solid #CBD5E1; border-radius: 5px;")
-        btn_yesterday.clicked.connect(lambda: self.hist_page_date_picker.setDate(QtCore.QDate.currentDate().addDays(-1)))
-        fb_layout.addWidget(btn_yesterday)
-
-        fb_layout.addSpacing(6)
-
-        self.btn_load_usage_history = QtWidgets.QPushButton("🔍 Tải Lịch Sử")
-        self.btn_load_usage_history.setFixedHeight(28)
-        self.btn_load_usage_history.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.btn_load_usage_history.setStyleSheet("""
-            QPushButton {
-                background-color: #2563EB;
-                color: #FFFFFF;
-                font-weight: bold;
-                font-size: 12px;
-                padding: 4px 16px;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #1D4ED8;
-            }
-        """)
-        self.btn_load_usage_history.clicked.connect(self._load_usage_history_page)
-        fb_layout.addWidget(self.btn_load_usage_history)
-
-        fb_layout.addStretch()
-
-        layout.addWidget(filter_bar)
-
-        # 3. 4 Thẻ chỉ số tổng quan (KPI Cards)
-        cards_layout = QtWidgets.QHBoxLayout()
-        cards_layout.setSpacing(12)
-
-        self.card_hist_down, self.lbl_hist_down_val, self.lbl_hist_down_sub = self._create_kpi_card("📥 TỔNG TẢI XUỐNG", "0.0 MB", "Lưu lượng nhận trong ngày", "#D97706", "#FFFBEB", "#FDE68A")
-        self.card_hist_up, self.lbl_hist_up_val, self.lbl_hist_up_sub = self._create_kpi_card("📤 TỔNG TẢI LÊN", "0.0 MB", "Lưu lượng gửi trong ngày", "#EA580C", "#FFF7ED", "#FED7AA")
-        self.card_hist_peak, self.lbl_hist_peak_val, self.lbl_hist_peak_sub = self._create_kpi_card("⚡ TỐC ĐỘ ĐỈNH", "0.0 KB/s", "Chưa ghi nhận đỉnh", "#2563EB", "#EFF6FF", "#BFDBFE")
-        self.card_hist_samples, self.lbl_hist_samples_val, self.lbl_hist_samples_sub = self._create_kpi_card("⏱️ MẪU ĐO & THỜI GIAN", "0 mẫu", "00:00:00 - 00:00:00", "#0F172A", "#F8FAFC", "#E2E8F0")
-
-        cards_layout.addWidget(self.card_hist_down)
-        cards_layout.addWidget(self.card_hist_up)
-        cards_layout.addWidget(self.card_hist_peak)
-        cards_layout.addWidget(self.card_hist_samples)
-        layout.addLayout(cards_layout)
-
-        # 4. Biểu đồ lịch sử tương tác (Interactive Historical Area Chart)
-        chart_box = QtWidgets.QFrame()
-        chart_box.setStyleSheet("background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px;")
-        cb_layout = QtWidgets.QVBoxLayout(chart_box)
-        cb_layout.setContentsMargins(12, 10, 12, 10)
-        cb_layout.setSpacing(6)
-
-        c_header = QtWidgets.QHBoxLayout()
-        lbl_chart_title = QtWidgets.QLabel("📈 Biểu Đồ Diễn Biến Lưu Lượng Băng Thông Trong Ngày")
-        lbl_chart_title.setStyleSheet("font-size: 13px; font-weight: bold; color: #1E293B;")
-        c_header.addWidget(lbl_chart_title)
-        c_header.addStretch()
-
-        self.lbl_hist_chart_hint = QtWidgets.QLabel("👉 Rê chuột để soi tốc độ | Click điểm để dừng xem ứng dụng lúc đó")
-        self.lbl_hist_chart_hint.setStyleSheet("font-size: 11px; color: #64748B; font-style: italic;")
-        c_header.addWidget(self.lbl_hist_chart_hint)
-        cb_layout.addLayout(c_header)
-
-        # Plot Widget
-        self.hist_time_axis = TimeAxisItem(orientation='bottom')
-        self.hist_plot_widget = pg.PlotWidget(axisItems={'bottom': self.hist_time_axis})
-        self.hist_plot_widget.setBackground('#FFFFFF')
-        self.hist_plot_widget.setFixedHeight(220)
-        self.hist_plot_widget.showGrid(x=False, y=True, alpha=0.08)
-        self.hist_plot_widget.getAxis('bottom').setPen(pg.mkPen("#E2E8F0", width=1))
-        self.hist_plot_widget.getAxis('bottom').setTextPen(pg.mkPen("#94A3B8"))
-        self.hist_plot_widget.getAxis('left').setStyle(showValues=True)
-        self.hist_plot_widget.getAxis('left').setPen(pg.mkPen("#E2E8F0", width=1))
-        self.hist_plot_widget.getAxis('left').setTextPen(pg.mkPen("#94A3B8"))
-
-        self.hist_curve_down = self.hist_plot_widget.plot(
-            pen=pg.mkPen(color="#D97706", width=2.0),
-            fillLevel=0,
-            brush=(245, 158, 11, 210)
-        )
-        self.hist_curve_up = self.hist_plot_widget.plot(
-            pen=pg.mkPen(color="#EA580C", width=1.5),
-            fillLevel=0,
-            brush=(244, 63, 94, 200)
-        )
-
-        # Crosshair & Marker cho biểu đồ lịch sử
-        self.hist_v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#3B82F6", width=1.2, style=QtCore.Qt.PenStyle.DashLine))
-        self.hist_h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#CBD5E1", width=1.0, style=QtCore.Qt.PenStyle.DotLine))
-        self.hist_v_line.hide()
-        self.hist_h_line.hide()
-        self.hist_plot_widget.addItem(self.hist_v_line, ignoreBounds=True)
-        self.hist_plot_widget.addItem(self.hist_h_line, ignoreBounds=True)
-
-        self.hist_hover_marker = pg.ScatterPlotItem(size=8, pen=pg.mkPen("#2563EB", width=2), brush=pg.mkBrush("#FFFFFF"), symbol='o')
-        self.hist_hover_marker.hide()
-        self.hist_plot_widget.addItem(self.hist_hover_marker)
-
-        self.hist_pinned_marker = pg.ScatterPlotItem(size=14, pen=pg.mkPen("#FFFFFF", width=2.5), brush=pg.mkBrush("#DC2626"), symbol='star')
-        self.hist_pinned_marker.hide()
-        self.hist_plot_widget.addItem(self.hist_pinned_marker)
-
-        # Tooltip badge cho biểu đồ lịch sử
-        self.hist_hover_badge = QtWidgets.QFrame(self.hist_plot_widget)
-        self.hist_hover_badge.setStyleSheet("""
-            QFrame {
-                background-color: rgba(15, 23, 42, 0.90);
-                border: 1px solid #3B82F6;
-                border-radius: 5px;
-                padding: 3px 7px;
-            }
-            QLabel {
-                color: #FFFFFF;
-                font-family: 'Segoe UI';
-                font-size: 10px;
-            }
-        """)
-        self.hist_hover_badge.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        h_hb_layout = QtWidgets.QVBoxLayout(self.hist_hover_badge)
-        h_hb_layout.setContentsMargins(4, 2, 4, 2)
-        h_hb_layout.setSpacing(1)
-        self.lbl_hist_hover_text = QtWidgets.QLabel("")
-        self.lbl_hist_hover_text.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        h_hb_layout.addWidget(self.lbl_hist_hover_text)
-        self.hist_hover_badge.hide()
-
-        self.hist_plot_widget.scene().sigMouseMoved.connect(self._on_hist_plot_mouse_moved)
-        self.hist_plot_widget.scene().sigMouseClicked.connect(self._on_hist_plot_mouse_clicked)
-
-        cb_layout.addWidget(self.hist_plot_widget)
-
-        # Banner chi tiết điểm soi trên trang lịch sử
-        self.hist_point_card = QtWidgets.QFrame()
-        self.hist_point_card.setObjectName("histPointCard")
-        self.hist_point_card.setStyleSheet("""
-            QFrame#histPointCard {
-                background-color: #FFFFFF;
-                border: 1px solid #CBD5E1;
-                border-left: 5px solid #2563EB;
-                border-radius: 6px;
-                padding: 6px 12px;
-            }
-        """)
-        self.hist_point_card.setVisible(False)
-        hpc_layout = QtWidgets.QHBoxLayout(self.hist_point_card)
-        hpc_layout.setContentsMargins(6, 4, 6, 4)
-        self.lbl_hist_point_details = QtWidgets.QLabel("")
-        self.lbl_hist_point_details.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        hpc_layout.addWidget(self.lbl_hist_point_details)
-        cb_layout.addWidget(self.hist_point_card)
-
-        layout.addWidget(chart_box)
-
-        # 5. QTabWidget bên dưới: Top Ứng Dụng | Nhật Ký Mẫu | CSDL MySQL
-        self.hist_tabs = QtWidgets.QTabWidget()
-        self.hist_tabs.setStyleSheet("""
+        # 4. Tabs: Policies Log & Connections Log
+        self.log_tabs = QtWidgets.QTabWidget()
+        self.log_tabs.setStyleSheet("""
             QTabWidget::pane {
                 border: 1px solid #E2E8F0;
                 background-color: #FFFFFF;
@@ -2617,67 +2467,33 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             }
         """)
 
-        # Tab 1: Top Ứng Dụng
-        tab_apps = QtWidgets.QWidget()
-        ta_layout = QtWidgets.QVBoxLayout(tab_apps)
-        ta_layout.setContentsMargins(12, 12, 12, 12)
-        ta_layout.setSpacing(8)
+        # Tab 1: Policies Table
+        tab_pol = QtWidgets.QWidget()
+        pol_layout = QtWidgets.QVBoxLayout(tab_pol)
+        pol_layout.setContentsMargins(8, 8, 8, 8)
 
-        self.top_apps_table = QtWidgets.QTableWidget()
-        self.top_apps_table.setColumnCount(6)
-        self.top_apps_table.setHorizontalHeaderLabels(["Ứng Dụng", "PID", "Tải Xuống (RX)", "Tải Lên (TX)", "Tổng Lưu Lượng", "Tỷ Lệ Tiêu Thụ %"])
-        self.top_apps_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.top_apps_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.top_apps_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.top_apps_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.top_apps_table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.top_apps_table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Fixed)
-        self.top_apps_table.setColumnWidth(5, 170)
-        self.top_apps_table.verticalHeader().setVisible(False)
-        self.top_apps_table.setMinimumHeight(240)
-        ta_layout.addWidget(self.top_apps_table)
-        self.hist_tabs.addTab(tab_apps, "🏆 Top Ứng Dụng Trong Ngày")
+        self.policy_log_table = QtWidgets.QTableWidget()
+        self.policy_log_table.setColumnCount(4)
+        self.policy_log_table.setHorizontalHeaderLabels(["Thời Gian", "Hành Động", "Tiến Trình & Chi Tiết", "Trạng Thái"])
+        self.policy_log_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.policy_log_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.policy_log_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.policy_log_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.policy_log_table.verticalHeader().setVisible(False)
+        pol_layout.addWidget(self.policy_log_table)
+        self.log_tabs.addTab(tab_pol, "🛡️ Nhật Ký Chính Sách (policies.log)")
 
-        # Tab 2: Nhật Ký Mẫu Chi Tiết
-        tab_logs = QtWidgets.QWidget()
-        tl_layout = QtWidgets.QVBoxLayout(tab_logs)
-        tl_layout.setContentsMargins(12, 12, 12, 12)
-        tl_layout.setSpacing(8)
+        # Tab 2: Connections Raw Log
+        tab_conn = QtWidgets.QWidget()
+        conn_layout = QtWidgets.QVBoxLayout(tab_conn)
+        conn_layout.setContentsMargins(8, 8, 8, 8)
+        self.txt_conn_log = QtWidgets.QPlainTextEdit()
+        self.txt_conn_log.setReadOnly(True)
+        self.txt_conn_log.setStyleSheet("font-family: 'Consolas', 'Courier New', monospace; font-size: 11px; background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px; color: #1E293B;")
+        conn_layout.addWidget(self.txt_conn_log)
+        self.log_tabs.addTab(tab_conn, "🌐 Nhật Ký Kết Nối Mạng (connections.log)")
 
-        log_filter_box = QtWidgets.QHBoxLayout()
-        self.txt_hist_log_filter = QtWidgets.QLineEdit()
-        self.txt_hist_log_filter.setPlaceholderText("🔍 Lọc theo tên tiến trình (vd: chrome, python, system)...")
-        self.txt_hist_log_filter.textChanged.connect(self._filter_hist_logs)
-        log_filter_box.addWidget(self.txt_hist_log_filter)
-        tl_layout.addLayout(log_filter_box)
-
-        self.history_table = QtWidgets.QTableWidget()
-        self.history_table.setColumnCount(5)
-        self.history_table.setHorizontalHeaderLabels(["Thời Gian", "PID", "Tên Tiến Trình", "Bytes Nhận (RX)", "Bytes Gửi (TX)"])
-        self.history_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.history_table.verticalHeader().setVisible(False)
-        self.history_table.setMinimumHeight(240)
-        tl_layout.addWidget(self.history_table)
-        self.hist_tabs.addTab(tab_logs, "📋 Nhật Ký Mẫu Lưu Lượng")
-
-        # Tab 3: CSDL MySQL
-        tab_db = QtWidgets.QWidget()
-        tdb_layout = QtWidgets.QVBoxLayout(tab_db)
-        tdb_layout.setContentsMargins(12, 12, 12, 12)
-        tdb_layout.setSpacing(10)
-
-        self.db_stats_card = QtWidgets.QLabel("Đang kết nối và kiểm tra CSDL MySQL...")
-        self.db_stats_card.setStyleSheet("background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px; padding: 14px; font-size: 13px; color: #334155; line-height: 1.6;")
-        tdb_layout.addWidget(self.db_stats_card)
-        tdb_layout.addStretch()
-        self.hist_tabs.addTab(tab_db, "🗄️ Trạng Thái CSDL MySQL (6 Bảng)")
-
-        layout.addWidget(self.hist_tabs)
-
-        scroll.setWidget(content_widget)
-        parent_layout = QtWidgets.QVBoxLayout(parent)
-        parent_layout.setContentsMargins(0, 0, 0, 0)
-        parent_layout.addWidget(scroll)
+        layout.addWidget(self.log_tabs)
 
     # =========================================================================
     # TRANG 3: NETWORK SCANNER (SOCKET TCP IP/CỔNG/TRẠNG THÁI)
@@ -2735,36 +2551,22 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self.conn_timer.start()
 
 
-        QtCore.QTimer.singleShot(1500, self._verify_database)
-
     def _on_time_window_changed(self, index: int):
         windows = [30.0, 60.0, 300.0, 600.0, 3600.0, 86400.0]
         self.window_duration = windows[min(index, len(windows) - 1)]
         self.time_axis.set_window_duration(self.window_duration)
         self.timeline_scrubber.set_window_duration(self.window_duration)
-        if not self.history_mode:
-            now = time.time()
-            render_now = now - self.render_delay
-            self.plot_widget.setXRange(render_now - self.window_duration, render_now, padding=0.0)
-            # Cập nhật ngay bảng bên trái, HUD và Usage view theo khung thời gian vừa chọn
-            self._update_app_sidebar(self.latest_proc_speeds)
-            self._update_selected_app_hud()
-            if hasattr(self, 'usage_view'):
-                self._update_usage_view_now()
+        now = time.time()
+        if getattr(self, "_is_monitored_device_offline", False) and getattr(self, "_offline_anchor_ts", None):
+            render_now = min(now - self.render_delay, self._offline_anchor_ts + 3.0)
         else:
-            if self.historical_series:
-                day_start = self.history_summary.get("day_start", self.historical_series[0]["timestamp"])
-                day_end = self.history_summary.get("day_end", self.historical_series[-1]["timestamp"])
-                center_t = getattr(self, "pinned_time", None)
-                if center_t is None:
-                    center_t = self.history_summary.get("peak_down_time_ts", (day_start + day_end) / 2.0)
-                half = self.window_duration / 2.0
-                win_start = max(day_start, center_t - half)
-                win_end = min(day_end, win_start + self.window_duration)
-                if win_end - win_start < self.window_duration:
-                    win_start = max(day_start, win_end - self.window_duration)
-                self._render_window_data(win_start, win_end)
-                self.timeline_scrubber.set_slider_range(win_start, win_end)
+            render_now = now - self.render_delay
+        self.plot_widget.setXRange(render_now - self.window_duration, render_now, padding=0.0)
+        # Cập nhật ngay bảng bên trái, HUD và Usage view theo khung thời gian vừa chọn
+        self._update_app_sidebar(self.latest_proc_speeds)
+        self._update_selected_app_hud()
+        if hasattr(self, 'usage_view'):
+            self._update_usage_view_now()
 
     @QtCore.pyqtSlot(float, float, float, list, float, float)
     def _on_new_sample(self, timestamp, down_kb, up_kb, proc_speeds, total_p_down, total_p_up):
@@ -2846,8 +2648,6 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
                 # 2. Cập nhật HUD bên dưới biểu đồ
                 self._update_selected_app_hud()
 
-            # 3. Đo đạc xác minh QoS thời gian thực
-            self._update_qos_realtime_verification(proc_speeds)
             if hasattr(self, 'protect_view'):
                 self.protect_view.update_protect_table(proc_speeds, self.app_accumulated_bytes, self.app_metadata)
             if hasattr(self, 'traffic_content_stack') and self.traffic_content_stack.currentIndex() == 1:
@@ -2884,7 +2684,12 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         if win_duration is None:
             win_duration = getattr(self, "window_duration", 300.0)
 
-        now = t_end if t_end is not None else time.time()
+        if t_end is not None:
+            now = t_end
+        elif getattr(self, "_is_monitored_device_offline", False) and getattr(self, "_offline_anchor_ts", None):
+            now = self._offline_anchor_ts
+        else:
+            now = time.time()
         cutoff = now - win_duration
 
         if not hasattr(self, "window_sample_history") or not self.window_sample_history:
@@ -3087,133 +2892,13 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
                 if name == prev_selected:
                     selected_row_idx = idx
 
-                if hasattr(self, 'combo_qos_app') and self.combo_qos_app.findText(name) == -1:
-                    self.combo_qos_app.addItem(name)
-
             if selected_row_idx >= 0:
                 self.app_list_table.selectRow(selected_row_idx)
         finally:
             self.app_list_table.blockSignals(False)
 
-    def _update_app_sidebar_history(self, top_procs: list, total_rx: float, total_tx: float):
-        """Cập nhật danh sách ứng dụng trong Sidebar theo dữ liệu lịch sử ngày chuẩn phong cách GlassWire"""
-        search_kw = self.search_app_input.text().strip().lower()
-
-        filtered_procs = []
-        for p in top_procs:
-            name = p.get("name", "")
-            if search_kw and search_kw not in name.lower():
-                continue
-            filtered_procs.append(p)
-
-        self.app_list_table.setRowCount(len(filtered_procs) + 1)
-
-        # Row 0: All apps
-        item_all_name = QtWidgets.QTableWidgetItem("  All apps")
-        item_all_name.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-        item_all_name.setForeground(QtGui.QBrush(QtGui.QColor("#0F172A")))
-
-        pix = QtGui.QPixmap(20, 20)
-        pix.fill(QtCore.Qt.GlobalColor.transparent)
-        p = QtGui.QPainter(pix)
-        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        p.setBrush(QtGui.QColor("#2563EB"))
-        p.setPen(QtCore.Qt.PenStyle.NoPen)
-        p.drawRoundedRect(2, 2, 6, 6, 2, 2)
-        p.drawRoundedRect(12, 2, 6, 6, 2, 2)
-        p.drawRoundedRect(2, 12, 6, 6, 2, 2)
-        p.drawRoundedRect(12, 12, 6, 6, 2, 2)
-        p.end()
-        item_all_name.setIcon(QtGui.QIcon(pix))
-
-        f_dir = getattr(self, "filter_direction", "both")
-        if f_dir == "incoming":
-            item_all_down = QtWidgets.QTableWidgetItem(self._format_bytes(total_rx))
-            item_all_down.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-            item_all_down.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
-            item_all_down.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-
-            item_all_up = QtWidgets.QTableWidgetItem("--")
-            item_all_up.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-            item_all_up.setForeground(QtGui.QBrush(QtGui.QColor("#94A3B8")))
-            item_all_up.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-        elif f_dir == "outgoing":
-            item_all_down = QtWidgets.QTableWidgetItem("--")
-            item_all_down.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-            item_all_down.setForeground(QtGui.QBrush(QtGui.QColor("#94A3B8")))
-            item_all_down.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-
-            item_all_up = QtWidgets.QTableWidgetItem(self._format_bytes(total_tx))
-            item_all_up.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-            item_all_up.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
-            item_all_up.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-        else:
-            item_all_down = QtWidgets.QTableWidgetItem(self._format_bytes(total_rx))
-            item_all_down.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-            item_all_down.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
-            item_all_down.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-
-            item_all_up = QtWidgets.QTableWidgetItem(self._format_bytes(total_tx))
-            item_all_up.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-            item_all_up.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
-            item_all_up.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-
-        self.app_list_table.setItem(0, 0, item_all_name)
-        self.app_list_table.setItem(0, 1, item_all_down)
-        self.app_list_table.setItem(0, 2, item_all_up)
-
-        for idx, item in enumerate(filtered_procs, start=1):
-            name = item.get("name", "Unknown")
-            name_item = QtWidgets.QTableWidgetItem(f"  {name}")
-            name_item.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
-
-            # Trích xuất icon của ứng dụng
-            icon = self.icon_manager.get_icon("", name)
-            name_item.setIcon(icon)
-
-            rx_b = item.get("rx_bytes", 0)
-            tx_b = item.get("tx_bytes", 0)
-
-            if f_dir == "incoming":
-                d_item = QtWidgets.QTableWidgetItem(self._format_bytes(rx_b))
-                d_item.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
-                d_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-                d_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-
-                u_item = QtWidgets.QTableWidgetItem("--")
-                u_item.setForeground(QtGui.QBrush(QtGui.QColor("#94A3B8")))
-                u_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-            elif f_dir == "outgoing":
-                d_item = QtWidgets.QTableWidgetItem("--")
-                d_item.setForeground(QtGui.QBrush(QtGui.QColor("#94A3B8")))
-                d_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-
-                u_item = QtWidgets.QTableWidgetItem(self._format_bytes(tx_b))
-                u_item.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
-                u_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-                u_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-            else:
-                d_item = QtWidgets.QTableWidgetItem(self._format_bytes(rx_b))
-                d_item.setForeground(QtGui.QBrush(QtGui.QColor("#475569")))
-                d_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-
-                u_item = QtWidgets.QTableWidgetItem(self._format_bytes(tx_b))
-                u_item.setForeground(QtGui.QBrush(QtGui.QColor("#475569")))
-                u_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-
-            self.app_list_table.setItem(idx, 0, name_item)
-            self.app_list_table.setItem(idx, 1, d_item)
-            self.app_list_table.setItem(idx, 2, u_item)
-
     def _filter_app_list(self):
-        if self.history_mode and hasattr(self, "history_top_procs"):
-            self._update_app_sidebar_history(
-                self.history_top_procs,
-                self.history_summary.get("total_rx_bytes", 0),
-                self.history_summary.get("total_tx_bytes", 0)
-            )
-        else:
-            self._update_app_sidebar(self.latest_proc_speeds)
+        self._update_app_sidebar(self.latest_proc_speeds)
 
     def _on_app_selected(self):
         selected_rows = self.app_list_table.selectedItems()
@@ -3232,8 +2917,10 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         row = item.row()
         if row > 0:
             app_name = self.app_list_table.item(row, 0).text().strip()
-            self.combo_qos_app.setEditText(app_name)
-            self._switch_nav_page(1)
+            if hasattr(self, 'protect_view') and hasattr(self.protect_view, 'search_input'):
+                self.protect_view.search_input.setText(app_name)
+            protect_tab_idx = 2 if self.is_admin_mode else 1
+            self._switch_nav_page(protect_tab_idx)
 
     def _update_selected_app_hud(self):
         """Cập nhật khối thống kê chi tiết của tiến trình đang chọn theo khung thời gian (chuẩn phong cách GlassWire)"""
@@ -3241,21 +2928,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         f_scope = getattr(self, "filter_scope", "all")
         scope_factor = 0.98 if f_scope == "wan" else (0.05 if f_scope == "lan" else 1.0)
 
-        if self.history_mode:
-            if self.selected_app_name == "All apps":
-                d_total = self.history_summary.get("total_rx_bytes", 0) * scope_factor
-                u_total = self.history_summary.get("total_tx_bytes", 0) * scope_factor
-            else:
-                d_total = 0.0
-                u_total = 0.0
-                for p in getattr(self, "history_top_procs", []):
-                    if p.get("name", "").lower() == self.selected_app_name.lower():
-                        d_total = p.get("rx_bytes", 0) * scope_factor
-                        u_total = p.get("tx_bytes", 0) * scope_factor
-                        break
-            d_speed = 0.0
-            u_speed = 0.0
-        elif self.selected_app_name == "All apps":
+        if self.selected_app_name == "All apps":
             d_speed = self.latest_down
             u_speed = self.latest_up
             d_total = win_down * scope_factor
@@ -3312,11 +2985,15 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
     def _render_frame(self):
         """Vòng lặp vẽ đồ thị mượt mà 35 FPS với bộ đệm trễ 5 giây và thuật toán khử gai GlassWire"""
         try:
-            if self.history_mode or self.is_paused:
+            if self.is_paused:
                 return
 
             now = time.time()
-            render_now = now - self.render_delay
+            if getattr(self, "_is_monitored_device_offline", False) and getattr(self, "_offline_anchor_ts", None):
+                # Đóng băng camera ngay sau đoạn sóng rớt về 0 để giữ nguyên đồ thị phiên vừa ngắt kết nối
+                render_now = min(now - self.render_delay, self._offline_anchor_ts + 3.0)
+            else:
+                render_now = now - self.render_delay
 
             # Giữ lại tối thiểu 3600 giây trong bộ nhớ để người dùng có thể tua lại tự do trên timeline
             cutoff = render_now - 3600.0
@@ -3367,9 +3044,9 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
     # =========================================================================
     def _find_nearest_sample(self, target_t: float) -> Optional[dict]:
         """Tìm mẫu đo gần nhất với mốc thời gian target_t bằng tìm kiếm nhị phân O(log N)."""
-        source = self.historical_series if self.history_mode else list(self.point_history)
+        source = list(self.point_history)
         if not source:
-            if not self.history_mode and self.down_points:
+            if self.down_points:
                 pts = list(self.down_points)
                 best_pt = min(pts, key=lambda p: abs(p[0] - target_t))
                 return {
@@ -3399,8 +3076,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             else:
                 high = mid - 1
 
-        max_tol = 3600.0 if self.history_mode else 60.0
-        if min_diff <= max_tol:
+        if min_diff <= 60.0:
             return best_item
         return None
 
@@ -3495,44 +3171,6 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
     def _render_window_data(self, win_start: float, win_end: float):
         """Vẽ đường sóng và thang đo cho khung thời gian [win_start, win_end] tương ứng với khung trượt."""
         try:
-            if self.history_mode:
-                self.plot_widget.setXRange(win_start, win_end, padding=0.0)
-                if self.historical_series:
-                    win_dur = max(10.0, win_end - win_start)
-                    hx = np.array([p["timestamp"] for p in self.historical_series], dtype=np.float64)
-                    hy_down = np.array([p.get("down_kb", 0.0) for p in self.historical_series], dtype=np.float64)
-                    hy_up = np.array([p.get("up_kb", 0.0) for p in self.historical_series], dtype=np.float64)
-
-                    x_dense = np.linspace(win_start, win_end, 600)
-                    smooth_down = self._generate_glasswire_wave(hx, hy_down, x_dense, win_dur)
-                    smooth_up = self._generate_glasswire_wave(hx, hy_up, x_dense, win_dur)
-
-                    f_dir = getattr(self, "filter_direction", "both")
-                    f_scope = getattr(self, "filter_scope", "all")
-                    scope_factor = 0.98 if f_scope == "wan" else (0.05 if f_scope == "lan" else 1.0)
-                    smooth_down_disp = smooth_down * scope_factor
-                    smooth_up_disp = smooth_up * scope_factor
-
-                    if f_dir == "incoming":
-                        self.curve_down.setData(x_dense, smooth_down_disp)
-                        self.curve_down.show()
-                        self.curve_up.hide()
-                        peak_val = max(float(np.max(smooth_down_disp)), 1.0) if len(smooth_down_disp) else 1.0
-                    elif f_dir == "outgoing":
-                        self.curve_up.setData(x_dense, smooth_up_disp)
-                        self.curve_up.show()
-                        self.curve_down.hide()
-                        peak_val = max(float(np.max(smooth_up_disp)), 1.0) if len(smooth_up_disp) else 1.0
-                    else:
-                        self.curve_down.setData(x_dense, smooth_down_disp)
-                        self.curve_up.setData(x_dense, smooth_up_disp)
-                        self.curve_down.show()
-                        self.curve_up.show()
-                        peak_val = max(float(np.max(smooth_down_disp)), float(np.max(smooth_up_disp)), 1.0) if len(smooth_down_disp) else 1.0
-
-                    self._update_y_scale(peak_val)
-                return
-
             win_duration = max(10.0, win_end - win_start)
 
             # Lấy các mẫu đo từ down_points / up_points hoặc point_history
@@ -3632,37 +3270,19 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
 
         # Lấy thông tin ứng dụng tại mốc thời gian này
         top_procs = nearest.get("top_procs", [])
-        if not top_procs and self.history_mode:
-            try:
-                from datetime import datetime as _dt
-                dt_obj = _dt.fromtimestamp(t_val)
-                db_mgr = self._get_db_manager()
-                db_procs = db_mgr.get_processes_around_time(dt_obj, tolerance_seconds=5.0) if db_mgr else []
-                if db_procs:
-                    top_procs = [
-                        {
-                            "name": p["name"],
-                            "down_kb": p["rx_bytes"] / 1024.0,
-                            "up_kb": p["tx_bytes"] / 1024.0
-                        }
-                        for p in db_procs[:4]
-                    ]
-            except Exception:
-                pass
 
-                # Cập nhật thanh Inspection Bar mới (chuẩn GlassWire Hình 2)
+        # Cập nhật thanh Inspection Bar mới (chuẩn GlassWire Hình 2)
         if hasattr(self, 'point_inspection_bar'):
             self.point_inspection_bar.set_inspection_data(
                 d_val, u_val, t_val, top_procs, self.icon_manager, self._format_speed
             )
             self.point_inspection_bar.show()
 
-        # Ẩn banner cũ ở đỉnh nếu đang ở chế độ Live (ở History mode thì vẫn giữ banner tổng quan)
-        if hasattr(self, 'point_inspector_card') and not getattr(self, 'history_mode', False):
+        if hasattr(self, 'point_inspector_card'):
             self.point_inspector_card.setVisible(False)
 
         # Đồng bộ vị trí khung trượt trên scrubber nếu chưa được gán
-        if self.timeline_scrubber.slider_start is None and not self.history_mode:
+        if self.timeline_scrubber.slider_start is None:
             half = self.window_duration / 2.0
             self.timeline_scrubber.set_slider_range(target_t - half, target_t + half)
 
@@ -3682,15 +3302,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self.wan_lan_widget.set_values(f"WAN  {self._format_bytes(wan_bytes)}", f"LAN  {self._format_bytes(lan_bytes)}", 96)
 
     def _resume_live(self):
-        """Bỏ dừng và tiếp tục vẽ theo hiện tại (đáp ứng đúng yêu cầu pharse1)."""
-        if getattr(self, 'history_mode', False):
-            self.pinned_time = None
-            self.pinned_vline.hide()
-            self.pinned_marker.hide()
-            if hasattr(self, 'point_inspection_bar'):
-                self.point_inspection_bar.hide()
-            return
-
+        """Bỏ dừng và tiếp tục vẽ theo hiện tại."""
         self.is_paused = False
         self.pinned_time = None
         self.pinned_vline.hide()
@@ -3701,8 +3313,12 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             self.point_inspection_bar.hide()
         self.timeline_scrubber.reset_to_live()
 
-        self.lbl_live_badge.setText("● LIVE")
-        self.lbl_live_badge.setStyleSheet("color: #059669; font-weight: bold; font-size: 11px; padding: 2px 7px; background-color: #ECFDF5; border-radius: 4px; border: 1px solid #A7F3D0;")
+        if getattr(self, "_is_monitored_device_offline", False):
+            self.lbl_live_badge.setText("🔴 OFFLINE")
+            self.lbl_live_badge.setStyleSheet("color: #DC2626; font-weight: bold; font-size: 11px; padding: 3px 8px; background-color: #FEF2F2; border-radius: 4px; border: 1px solid #FECACA;")
+        else:
+            self.lbl_live_badge.setText("● LIVE")
+            self.lbl_live_badge.setStyleSheet("color: #059669; font-weight: bold; font-size: 11px; padding: 2px 7px; background-color: #ECFDF5; border-radius: 4px; border: 1px solid #A7F3D0;")
 
         self.btn_pause_toggle.setText("⏸ Tạm Dừng")
         self.btn_pause_toggle.setStyleSheet("""
@@ -3724,10 +3340,12 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         # Khôi phục HUD về dữ liệu hiện tại
         self._update_selected_app_hud()
 
-        if not self.history_mode:
-            now = time.time()
+        now = time.time()
+        if getattr(self, "_is_monitored_device_offline", False) and getattr(self, "_offline_anchor_ts", None):
+            render_now = min(now - self.render_delay, self._offline_anchor_ts + 3.0)
+        else:
             render_now = now - self.render_delay
-            self.plot_widget.setXRange(render_now - self.window_duration, render_now, padding=0.0)
+        self.plot_widget.setXRange(render_now - self.window_duration, render_now, padding=0.0)
 
     def _toggle_pause_resume(self):
         """Nút chuyển đổi Tạm dừng / Tiếp tục vẽ biểu đồ."""
@@ -3735,219 +3353,36 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             self._resume_live()
         else:
             now = time.time()
-            render_now = now - self.render_delay
+            if getattr(self, "_is_monitored_device_offline", False) and getattr(self, "_offline_anchor_ts", None):
+                # Đóng băng camera ngay sau đoạn sóng rớt về 0 để giữ nguyên đồ thị phiên vừa ngắt kết nối
+                render_now = min(now - self.render_delay, self._offline_anchor_ts + 3.0)
+            else:
+                render_now = now - self.render_delay
             self._pin_point(render_now)
 
-    def _toggle_history_mode(self):
-        """Mở/đóng thanh chọn ngày lịch sử từ database MySQL."""
-        is_visible = not self.history_controls_widget.isVisible()
-        self.history_controls_widget.setVisible(is_visible)
-        if hasattr(self, 'live_controls_widget'):
-            self.live_controls_widget.setVisible(not is_visible)
-        if is_visible:
-            self._populate_history_dates()
-
-    def _populate_history_dates(self):
-        """Truy vấn danh sách các ngày có dữ liệu đo trong CSDL và nạp vào ComboBox thanh công cụ."""
-        db_mgr = self._get_db_manager()
-        if not db_mgr:
-            today_str = time.strftime("%Y-%m-%d")
-            self._apply_history_dates([today_str])
-            return
-        def bg():
-            try:
-                dates = db_mgr.get_recorded_dates()
-                self.async_bridge.run_on_main(self._apply_history_dates, dates)
-            except Exception as e:
-                print(f"[UI History Dates Error] {e}")
-        threading.Thread(target=bg, daemon=True).start()
-
-    def _apply_history_dates(self, dates: list):
-        self.combo_history_date.blockSignals(True)
-        self.combo_history_date.clear()
-        today_str = time.strftime("%Y-%m-%d")
-        if dates:
-            for d in dates:
-                self.combo_history_date.addItem(d)
-            latest_d = dates[0]
-            self.date_picker_history.setDate(QtCore.QDate.fromString(latest_d, "yyyy-MM-dd"))
-        else:
-            self.combo_history_date.addItem(today_str)
-            self.date_picker_history.setDate(QtCore.QDate.currentDate())
-        self.combo_history_date.blockSignals(False)
-
-    def _on_combo_history_date_changed(self, index: int):
-        date_str = self.combo_history_date.currentText().strip()
-        if date_str:
-            self.date_picker_history.blockSignals(True)
-            self.date_picker_history.setDate(QtCore.QDate.fromString(date_str, "yyyy-MM-dd"))
-            self.date_picker_history.blockSignals(False)
-
-    def _on_history_date_picker_changed(self, date: QtCore.QDate):
-        date_str = date.toString("yyyy-MM-dd")
-        # Đồng bộ ngược lại sang combobox nếu có
-        idx = self.combo_history_date.findText(date_str)
-        if idx >= 0:
-            self.combo_history_date.blockSignals(True)
-            self.combo_history_date.setCurrentIndex(idx)
-            self.combo_history_date.blockSignals(False)
-
-    def _load_history_for_selected_date(self):
-        """Tải dữ liệu của 1 ngày trong quá khứ và vẽ lại biểu đồ ngày hôm đó (theo cấu trúc toàn cảnh 24 giờ)."""
-        target_date = self.date_picker_history.date().toString("yyyy-MM-dd")
-        if not target_date:
-            target_date = self.combo_history_date.currentText().strip()
-        if not target_date:
-            return
-
-        self.btn_load_history.setEnabled(False)
-        self.btn_load_history.setText("Đang tải...")
-
-        db_mgr = self._get_db_manager()
-        if not db_mgr:
-            self.btn_load_history.setEnabled(True)
-            self.btn_load_history.setText("🔍 Tải Biểu Đồ")
-            QtWidgets.QMessageBox.warning(self, "CSDL Chưa Bật", "CSDL MySQL chưa kết nối để tải lại lịch sử ngày cũ.")
-            return
-
-        def bg():
-            try:
-                series = db_mgr.get_daily_traffic_series(target_date)
-                summary = db_mgr.get_daily_summary(target_date, series=series)
-                top_procs = db_mgr.get_top_processes_for_date(target_date, limit=30)
-                self.async_bridge.run_on_main(self._apply_history_series, series, target_date, summary, top_procs)
-            except Exception as e:
-                print(f"[UI Load History Error] {e}")
-                self.async_bridge.run_on_main(self._on_history_load_failed, target_date, str(e))
-
-        threading.Thread(target=bg, daemon=True).start()
-
-    def _on_history_load_failed(self, target_date: str, err_msg: str):
-        self.btn_load_history.setEnabled(True)
-        self.btn_load_history.setText("🔍 Tải Biểu Đồ")
-        QtWidgets.QMessageBox.warning(self, "Lỗi tải lịch sử", f"Không thể tải dữ liệu ngày {target_date}: {err_msg}")
-
-    def _apply_history_series(self, series: list, target_date: str, summary: dict = None, top_procs: list = None):
-        self.btn_load_history.setEnabled(True)
-        self.btn_load_history.setText("🔍 Tải Biểu Đồ")
-
-        if not series or len(series) < 2:
-            QtWidgets.QMessageBox.information(
-                self,
-                "Không có dữ liệu",
-                f"Chưa có dữ liệu lưu lượng đo đạc trong CSDL cho ngày {target_date}."
-            )
-            return
-
-        self.history_mode = True
-        self.is_paused = True
-        self.historical_series = series
-        self.history_summary = summary or {}
-        self.history_top_procs = top_procs or []
-        self.selected_app_name = "All apps"
-
-        # 1. Đồng bộ thanh chọn thời gian sang 24 Hours
-        self.window_duration = 86400.0
-        self.time_axis.set_window_duration(86400.0)
-        self.combo_time_window.blockSignals(True)
-        idx_24h = self.combo_time_window.findText("24 Hours")
-        if idx_24h != -1:
-            self.combo_time_window.setCurrentIndex(idx_24h)
-        self.combo_time_window.blockSignals(False)
-
-        day_start = summary.get("day_start", series[0]["timestamp"])
-        day_end = summary.get("day_end", series[-1]["timestamp"])
-
-        # 2. Nội suy đường sóng toàn cảnh 24 giờ siêu mượt (GlassWire dome wave)
-        hx = np.array([p["timestamp"] for p in series], dtype=np.float64)
-        hy_down = np.array([p["down_kb"] for p in series], dtype=np.float64)
-        hy_up = np.array([p["up_kb"] for p in series], dtype=np.float64)
-
-        x_dense = np.linspace(day_start, day_end, 800)
-        smooth_down = self._generate_glasswire_wave(hx, hy_down, x_dense, 86400.0)
-        smooth_up = self._generate_glasswire_wave(hx, hy_up, x_dense, 86400.0)
-
-        f_dir = getattr(self, "filter_direction", "both")
-        f_scope = getattr(self, "filter_scope", "all")
-        scope_factor = 0.98 if f_scope == "wan" else (0.05 if f_scope == "lan" else 1.0)
-        smooth_down_disp = smooth_down * scope_factor
-        smooth_up_disp = smooth_up * scope_factor
-
-        if f_dir == "incoming":
-            self.curve_down.setData(x_dense, smooth_down_disp)
-            self.curve_down.show()
-            self.curve_up.hide()
-            peak_val = max(float(np.max(smooth_down_disp)), 1.0)
-        elif f_dir == "outgoing":
-            self.curve_up.setData(x_dense, smooth_up_disp)
-            self.curve_up.show()
-            self.curve_down.hide()
-            peak_val = max(float(np.max(smooth_up_disp)), 1.0)
-        else:
-            self.curve_down.setData(x_dense, smooth_down_disp)
-            self.curve_up.setData(x_dense, smooth_up_disp)
-            self.curve_down.show()
-            self.curve_up.show()
-            peak_val = max(float(np.max(smooth_down_disp)), float(np.max(smooth_up_disp)), 1.0)
-        self._update_y_scale(peak_val)
-
-        # 3. Cài đặt góc nhìn camera bao quát trọn vẹn 24 giờ của ngày
-        self.plot_widget.setXRange(day_start, day_end, padding=0.0)
-
-        # 4. Đồng bộ mini timeline scrubber với chuỗi 24 giờ
-        self.timeline_scrubber.set_window_duration(86400.0)
-        self.timeline_scrubber.set_historical_series(series)
-
-        # 5. Cập nhật Sidebar danh sách ứng dụng theo ngày
-        self._update_app_sidebar_history(
-            self.history_top_procs,
-            summary.get("total_rx_bytes", 0),
-            summary.get("total_tx_bytes", 0)
-        )
-
-        # 6. Cập nhật khối HUD bán nguyệt và WAN/LAN bên dưới
-        self._update_selected_app_hud()
-
-        self.lbl_live_badge.setText(f"📅 24 GIỜ: {target_date}")
-        self.lbl_live_badge.setStyleSheet("color: #2563EB; font-weight: bold; font-size: 11px; padding: 2px 7px; background-color: #EFF6FF; border-radius: 4px; border: 1px solid #BFDBFE;")
-
-        # 7. Hiển thị thông báo tổng quan: thời gian dùng mạng và khung giờ cao điểm
-        down_str = self._format_bytes(summary.get("total_rx_bytes", 0))
-        up_str = self._format_bytes(summary.get("total_tx_bytes", 0))
-        peak_d_str = self._format_speed(summary.get("peak_down_kb", 0.0))
-        peak_u_str = self._format_speed(summary.get("peak_up_kb", 0.0))
-        active_time_str = summary.get("active_hours_str", "0 giờ")
-        peak_hour_str = summary.get("peak_hour_range", "N/A")
-        peak_mb_val = summary.get("peak_hour_mb", 0.0)
-        peak_mb_str = self._format_bytes(peak_mb_val * 1024.0 * 1024.0)
-
-        card_text = (
-            f"<div style='font-size: 11.5px; line-height: 1.5;'>"
-            f"📅 <b>BIỂU ĐỒ LỊCH SỬ 24 GIỜ:</b> <span style='color:#2563EB; font-weight:800;'>{target_date}</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
-            f"🕒 <b>Thời gian dùng mạng:</b> <span style='color:#059669; font-weight:800;'>{active_time_str} / 24 giờ</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
-            f"🔥 <b>Khung giờ cao điểm nhất:</b> <span style='color:#DC2626; font-weight:800;'>{peak_hour_str} ({peak_mb_str})</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
-            f"📥 Nhận: <span style='color:#D97706; font-weight:700;'>{down_str}</span> &nbsp;|&nbsp; "
-            f"📤 Gửi: <span style='color:#EA580C; font-weight:700;'>{up_str}</span> &nbsp;|&nbsp; "
-            f"⚡ Đỉnh: <b>{peak_d_str} ↓ / {peak_u_str} ↑</b> lúc {summary.get('peak_down_time', '')}<br>"
-            f"<span style='color:#475569;'>👉 <b>Bấm vào nút Filter</b> để xem lưu lượng riêng của từng ứng dụng &nbsp;|&nbsp; "
-            f"🔍 <b>Cuộn chuột hoặc bấm +/-</b> để phóng to/thu nhỏ khung giờ &nbsp;|&nbsp; "
-            f"↔️ <b>Kéo/click trên timeline bên dưới</b> để tua vào từng giờ cụ thể.</span>"
-            f"</div>"
-        )
-        self.lbl_point_details.setText(card_text)
-        if hasattr(self, 'btn_card_resume'):
-            self.btn_card_resume.setVisible(False)
-        if hasattr(self, 'btn_card_close'):
-            self.btn_card_close.setVisible(False)
-        self.point_inspector_card.setVisible(True)
-
     # =========================================================================
-    # TƯƠNG TÁC PHÓNG TO / THU NHỎ & KÉO TIMELINE BIỂU ĐỒ LỊCH SỬ
+    # TƯƠNG TÁC PHÓNG TO / THU NHỎ & KÉO TIMELINE LIVE PAUSE
     # =========================================================================
+    def _get_navigation_bounds(self) -> Optional[Tuple[float, float]]:
+        """Trả về giới hạn [min_t, max_t] cho phép zoom/pan trên chế độ Live/Pause."""
+        if self.down_points:
+            min_t = self.down_points[0][0]
+            max_t = self.down_points[-1][0]
+            if max_t - min_t < 30.0:
+                min_t = max_t - max(60.0, self.window_duration)
+            return (min_t, max_t)
+        if self.point_history:
+            min_t = self.point_history[0]["timestamp"]
+            max_t = self.point_history[-1]["timestamp"]
+            if max_t - min_t < 30.0:
+                min_t = max_t - max(60.0, self.window_duration)
+            return (min_t, max_t)
+        return None
+
     def eventFilter(self, obj, event):
         if hasattr(self, 'plot_widget') and obj is self.plot_widget.viewport():
             if event.type() == QtCore.QEvent.Type.Wheel:
-                if getattr(self, 'history_mode', False) or getattr(self, 'is_paused', False):
+                if getattr(self, 'is_paused', False):
                     self._on_plot_wheel_zoom(event)
                     return True
             elif event.type() == QtCore.QEvent.Type.MouseButtonPress:
@@ -3959,7 +3394,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
                         self._plot_drag_start_range = (vr[0], vr[1])
             elif event.type() == QtCore.QEvent.Type.MouseMove:
                 if (event.buttons() & QtCore.Qt.MouseButton.LeftButton) and hasattr(self, '_plot_drag_start_pos'):
-                    if getattr(self, 'history_mode', False) or getattr(self, 'is_paused', False):
+                    if getattr(self, 'is_paused', False):
                         dx = event.pos().x() - self._plot_drag_start_pos.x()
                         if abs(dx) > 6:
                             self._plot_drag_active = True
@@ -3974,8 +3409,10 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
 
     def _on_plot_wheel_zoom(self, event: QtGui.QWheelEvent):
         """Phóng to / thu nhỏ khung nhìn bằng con lăn chuột tại vị trí con trỏ."""
-        if not getattr(self, 'history_mode', False) or not self.historical_series:
+        bounds = self._get_navigation_bounds()
+        if not bounds:
             return
+        bound_start, bound_end = bounds
         pos = event.position()
         if not self.plot_widget.sceneBoundingRect().contains(pos):
             return
@@ -3984,42 +3421,44 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         if delta == 0:
             return
 
+        self.is_paused = True
+
         vr = self.plot_widget.plotItem.vb.viewRange()[0]
         cur_start, cur_end = vr[0], vr[1]
-        cur_dur = max(30.0, cur_end - cur_start)
+        cur_dur = max(15.0, cur_end - cur_start)
 
         zoom_factor = 0.75 if delta > 0 else 1.333
-        new_dur = max(30.0, min(86400.0, cur_dur * zoom_factor))
+        new_dur = max(15.0, min(86400.0, cur_dur * zoom_factor))
 
         ratio = (mouse_t - cur_start) / cur_dur if cur_dur > 0 else 0.5
         ratio = max(0.0, min(1.0, ratio))
         new_start = mouse_t - ratio * new_dur
         new_end = new_start + new_dur
 
-        day_start = self.history_summary.get("day_start", self.historical_series[0]["timestamp"])
-        day_end = self.history_summary.get("day_end", self.historical_series[-1]["timestamp"])
-
-        if new_dur >= (day_end - day_start):
-            new_start = day_start
-            new_end = day_end
+        if new_dur >= (bound_end - bound_start):
+            new_start = bound_start
+            new_end = bound_end
         else:
-            if new_start < day_start:
-                new_start = day_start
-                new_end = min(day_end, new_start + new_dur)
-            if new_end > day_end:
-                new_end = day_end
-                new_start = max(day_start, new_end - new_dur)
+            if new_start < bound_start:
+                new_start = bound_start
+                new_end = min(bound_end, new_start + new_dur)
+            if new_end > bound_end:
+                new_end = bound_end
+                new_start = max(bound_start, new_end - new_dur)
 
+        self.time_axis.set_window_duration(max(15.0, new_end - new_start))
         self._render_window_data(new_start, new_end)
         self.timeline_scrubber.set_slider_range(new_start, new_end)
         event.accept()
 
     def _on_plot_drag_pan(self, dx: float):
-        """Kéo rê biểu đồ sang trái/phải khi đang phóng to."""
-        if not getattr(self, 'history_mode', False) or not self.historical_series:
+        """Kéo rê biểu đồ sang trái/phải khi đang phóng to hoặc tạm dừng."""
+        bounds = self._get_navigation_bounds()
+        if not bounds or not hasattr(self, '_plot_drag_start_range'):
             return
-        if not hasattr(self, '_plot_drag_start_range'):
-            return
+        bound_start, bound_end = bounds
+        self.is_paused = True
+
         pixel_w = max(100.0, float(self.plot_widget.plotItem.vb.width()))
         span = self._plot_drag_start_range[1] - self._plot_drag_start_range[0]
         time_shift = -(dx / pixel_w) * span
@@ -4027,107 +3466,24 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         new_start = self._plot_drag_start_range[0] + time_shift
         new_end = self._plot_drag_start_range[1] + time_shift
 
-        day_start = self.history_summary.get("day_start", self.historical_series[0]["timestamp"])
-        day_end = self.history_summary.get("day_end", self.historical_series[-1]["timestamp"])
-
-        if new_start < day_start:
-            new_start = day_start
-            new_end = new_start + span
-        if new_end > day_end:
-            new_end = day_end
-            new_start = max(day_start, new_end - span)
+        if new_start < bound_start:
+            new_start = bound_start
+            new_end = min(bound_end, new_start + span)
+        if new_end > bound_end:
+            new_end = bound_end
+            new_start = max(bound_start, new_end - span)
 
         self._render_window_data(new_start, new_end)
         self.timeline_scrubber.set_slider_range(new_start, new_end)
-
-    def _zoom_in_history(self):
-        """Phóng to khung thời gian khi xem lịch sử."""
-        if not getattr(self, 'history_mode', False) or not self.historical_series:
-            return
-        vr = self.plot_widget.plotItem.vb.viewRange()[0]
-        cur_start, cur_end = vr[0], vr[1]
-        cur_dur = max(30.0, cur_end - cur_start)
-        new_dur = max(30.0, cur_dur * 0.5)
-
-        center_t = getattr(self, 'pinned_time', None)
-        if center_t is None or not (cur_start <= center_t <= cur_end):
-            center_t = (cur_start + cur_end) / 2.0
-
-        day_start = self.history_summary.get("day_start", self.historical_series[0]["timestamp"])
-        day_end = self.history_summary.get("day_end", self.historical_series[-1]["timestamp"])
-
-        new_start = max(day_start, center_t - new_dur / 2.0)
-        new_end = min(day_end, new_start + new_dur)
-        if new_end - new_start < new_dur:
-            new_start = max(day_start, new_end - new_dur)
-
-        self._render_window_data(new_start, new_end)
-        self.timeline_scrubber.set_slider_range(new_start, new_end)
-
-    def _zoom_out_history(self):
-        """Thu nhỏ khung thời gian khi xem lịch sử."""
-        if not getattr(self, 'history_mode', False) or not self.historical_series:
-            return
-        vr = self.plot_widget.plotItem.vb.viewRange()[0]
-        cur_start, cur_end = vr[0], vr[1]
-        cur_dur = max(30.0, cur_end - cur_start)
-        new_dur = min(86400.0, cur_dur * 2.0)
-
-        center_t = (cur_start + cur_end) / 2.0
-        day_start = self.history_summary.get("day_start", self.historical_series[0]["timestamp"])
-        day_end = self.history_summary.get("day_end", self.historical_series[-1]["timestamp"])
-
-        if new_dur >= (day_end - day_start):
-            new_start = day_start
-            new_end = day_end
-        else:
-            new_start = max(day_start, center_t - new_dur / 2.0)
-            new_end = min(day_end, new_start + new_dur)
-            if new_end - new_start < new_dur:
-                new_start = max(day_start, new_end - new_dur)
-
-        self._render_window_data(new_start, new_end)
-        self.timeline_scrubber.set_slider_range(new_start, new_end)
-
-    def _reset_history_24h(self):
-        """Đặt lại góc nhìn bao quát toàn bộ 24 giờ."""
-        if not getattr(self, 'history_mode', False) or not self.historical_series:
-            return
-        day_start = self.history_summary.get("day_start", self.historical_series[0]["timestamp"])
-        day_end = self.history_summary.get("day_end", self.historical_series[-1]["timestamp"])
-        self._render_window_data(day_start, day_end)
-        self.timeline_scrubber.set_slider_range(day_start, day_end)
-
-    def _exit_history_mode(self):
-        """Quay trở lại chế độ giám sát trực tiếp."""
-        if hasattr(self, 'btn_card_resume'):
-            self.btn_card_resume.setVisible(True)
-        if hasattr(self, 'btn_card_close'):
-            self.btn_card_close.setVisible(True)
-        if hasattr(self, 'point_inspector_card'):
-            self.point_inspector_card.setVisible(False)
-        self.history_mode = False
-        self.historical_series = []
-        self.history_summary = {}
-        self.history_top_procs = []
-        self.history_controls_widget.setVisible(False)
-        if hasattr(self, 'live_controls_widget'):
-            self.live_controls_widget.setVisible(True)
-        self.window_duration = 300.0
-        self.time_axis.set_window_duration(300.0)
-        self.combo_time_window.blockSignals(True)
-        self.combo_time_window.setCurrentIndex(2)  # 5 Minutes
-        self.combo_time_window.blockSignals(False)
-        self.timeline_scrubber.reset_to_live()
-        self._resume_live()
 
     # =========================================================================
     # CÁC PHƯƠNG THỨC XỬ LÝ TRANG USAGE HISTORY & ANALYTICS
     # =========================================================================
-    def _create_kpi_card(self, title_str: str, val_str: str, sub_str: str, text_color: str, bg_color: str, border_color: str) -> Tuple[QtWidgets.QFrame, QtWidgets.QLabel, QtWidgets.QLabel]:
+    def _create_kpi_card(self, title_str: str, val_str: str, text_color: str, bg_color: str, border_color: str) -> Tuple[QtWidgets.QFrame, QtWidgets.QLabel]:
         card = QtWidgets.QFrame()
+        card.setObjectName("kpiCard")
         card.setStyleSheet(f"""
-            QFrame {{
+            QFrame#kpiCard {{
                 background-color: {bg_color};
                 border: 1px solid {border_color};
                 border-radius: 8px;
@@ -4139,352 +3495,99 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         c_layout.setSpacing(2)
 
         lbl_t = QtWidgets.QLabel(title_str)
-        lbl_t.setStyleSheet(f"font-size: 10px; font-weight: 800; color: {text_color}; letter-spacing: 0.5px;")
+        lbl_t.setStyleSheet(f"font-size: 10px; font-weight: 800; color: {text_color}; letter-spacing: 0.5px; border: none; background: transparent;")
 
         lbl_v = QtWidgets.QLabel(val_str)
-        lbl_v.setStyleSheet("font-size: 18px; font-weight: 800; color: #0F172A;")
-
-        lbl_s = QtWidgets.QLabel(sub_str)
-        lbl_s.setStyleSheet("font-size: 11px; color: #64748B;")
+        lbl_v.setStyleSheet("font-size: 18px; font-weight: 800; color: #0F172A; border: none; background: transparent;")
 
         c_layout.addWidget(lbl_t)
         c_layout.addWidget(lbl_v)
-        c_layout.addWidget(lbl_s)
-        return card, lbl_v, lbl_s
+        return card, lbl_v
+
+    def _open_logs_folder(self):
+        """Mở thư mục logs trên hệ điều hành."""
+        try:
+            if not os.path.exists(LOGS_DIR):
+                os.makedirs(LOGS_DIR, exist_ok=True)
+            import subprocess
+            if sys.platform == "win32":
+                os.startfile(LOGS_DIR)
+            else:
+                subprocess.Popen(["xdg-open", LOGS_DIR])
+        except Exception as e:
+            print(f"[UI] Không thể mở thư mục logs: {e}")
 
     def _on_enter_usage_history_page(self):
-        """Kích hoạt khi người dùng chuyển sang trang Usage History."""
-        self._populate_usage_history_dates()
-        self._verify_database()
+        """Kích hoạt khi người dùng chuyển sang trang Log Analysis."""
+        self._refresh_policy_logs()
 
-    def _populate_usage_history_dates(self):
-        """Nạp danh sách ngày có dữ liệu vào thanh chọn của trang Usage History."""
-        db_mgr = self._get_db_manager()
-        if not db_mgr:
-            today_str = time.strftime("%Y-%m-%d")
-            self._apply_usage_history_dates([today_str])
-            return
-        def bg():
-            try:
-                dates = db_mgr.get_recorded_dates()
-                self.async_bridge.run_on_main(self._apply_usage_history_dates, dates)
-            except Exception as e:
-                print(f"[UI Usage Dates Error] {e}")
-        threading.Thread(target=bg, daemon=True).start()
+    def _refresh_policy_logs(self):
+        """Tải dữ liệu nhật ký mới nhất từ logs/policies.log và logs/connections.log."""
+        try:
+            self.raw_policy_logs = FileLogger.read_policy_logs(limit=200)
+            self._render_policy_table(self.raw_policy_logs)
 
-    def _apply_usage_history_dates(self, dates: list):
-        self.hist_page_combo_dates.blockSignals(True)
-        self.hist_page_combo_dates.clear()
-        today_str = time.strftime("%Y-%m-%d")
-        if dates:
-            for d in dates:
-                self.hist_page_combo_dates.addItem(d)
-            latest_d = dates[0]
-            self.hist_page_date_picker.setDate(QtCore.QDate.fromString(latest_d, "yyyy-MM-dd"))
-        else:
-            self.hist_page_combo_dates.addItem(today_str)
-            self.hist_page_date_picker.setDate(QtCore.QDate.currentDate())
-        self.hist_page_combo_dates.blockSignals(False)
-        self._load_usage_history_page()
+            conn_log_path = os.path.join(LOGS_DIR, "connections.log")
+            if os.path.exists(conn_log_path):
+                with open(conn_log_path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+                recent_lines = lines[-200:] if len(lines) > 200 else lines
+                self.txt_conn_log.setPlainText("".join(recent_lines))
+            else:
+                self.txt_conn_log.setPlainText("Chưa có nhật ký kết nối nào được ghi nhận.")
+        except Exception as e:
+            print(f"[UI] Lỗi khi tải nhật ký: {e}")
 
-    def _on_hist_page_combo_changed(self, index: int):
-        date_str = self.hist_page_combo_dates.currentText().strip()
-        if date_str:
-            self.hist_page_date_picker.blockSignals(True)
-            self.hist_page_date_picker.setDate(QtCore.QDate.fromString(date_str, "yyyy-MM-dd"))
-            self.hist_page_date_picker.blockSignals(False)
-            self._load_usage_history_page()
-
-    def _load_usage_history_page(self):
-        """Tải dữ liệu của ngày đã chọn và nạp vào toàn bộ trang Usage History."""
-        date_str = self.hist_page_date_picker.date().toString("yyyy-MM-dd")
-        if not date_str:
-            return
-
-        self.btn_load_usage_history.setEnabled(False)
-        self.btn_load_usage_history.setText("Đang tải...")
-
-        db_mgr = self._get_db_manager()
-        if not db_mgr:
-            self.btn_load_usage_history.setEnabled(True)
-            self.btn_load_usage_history.setText("🔍 Tải Lịch Sử")
-            summary = {
-                "total_rx_bytes": 0,
-                "total_tx_bytes": 0,
-                "peak_download_speed": 0,
-                "peak_upload_speed": 0,
-                "sample_count": 0,
-                "earliest_time": None,
-                "latest_time": None
-            }
-            self._apply_usage_history_page(summary, [], [], [], date_str)
-            return
-
-        def bg():
-            try:
-                series = db_mgr.get_daily_traffic_series(date_str)
-                summary = db_mgr.get_daily_summary(date_str, series=series)
-                top_procs = db_mgr.get_top_processes_for_date(date_str, limit=20)
-                logs = db_mgr.get_detailed_traffic_logs(date_str, limit=100)
-                self.async_bridge.run_on_main(self._apply_usage_history_page, summary, series, top_procs, logs, date_str)
-            except Exception as e:
-                print(f"[UI Usage Page Error] {e}")
-                self.async_bridge.run_on_main(self._on_usage_history_page_failed, str(e))
-
-        threading.Thread(target=bg, daemon=True).start()
-
-    def _on_usage_history_page_failed(self, err_msg: str):
-        self.btn_load_usage_history.setEnabled(True)
-        self.btn_load_usage_history.setText("🔍 Tải Lịch Sử")
-        QtWidgets.QMessageBox.warning(self, "Lỗi tải lịch sử", f"Không thể tải dữ liệu trang lịch sử: {err_msg}")
-
-    def _apply_usage_history_page(self, summary: dict, series: list, top_procs: list, logs: list, date_str: str):
-        self.btn_load_usage_history.setEnabled(True)
-        self.btn_load_usage_history.setText("🔍 Tải Lịch Sử")
-        self.current_hist_page_series = series
-        self.raw_hist_logs = logs
-
-        # 1. Cập nhật các thẻ KPI
-        rx_bytes = summary.get("total_rx_bytes", 0)
-        tx_bytes = summary.get("total_tx_bytes", 0)
-        peak_d = summary.get("peak_down_kb", 0.0)
-        peak_u = summary.get("peak_up_kb", 0.0)
-        peak_speed = max(peak_d, peak_u)
-        peak_time = summary.get("peak_down_time", "-") if peak_d >= peak_u else summary.get("peak_up_time", "-")
-        count = summary.get("sample_count", len(series))
-        first_t = summary.get("first_time", "-")
-        last_t = summary.get("last_time", "-")
-
-        self.lbl_hist_down_val.setText(self._format_bytes(rx_bytes))
-        self.lbl_hist_up_val.setText(self._format_bytes(tx_bytes))
-        self.lbl_hist_peak_val.setText(self._format_speed(peak_speed))
-        self.lbl_hist_peak_sub.setText(f"Đạt đỉnh lúc: {peak_time}")
-        self.lbl_hist_samples_val.setText(f"{count:,} mẫu đo")
-        if first_t != "-" and last_t != "-":
-            f_short = first_t.split(" ")[-1] if " " in first_t else first_t
-            l_short = last_t.split(" ")[-1] if " " in last_t else last_t
-            self.lbl_hist_samples_sub.setText(f"{f_short} ➔ {l_short}")
-        else:
-            self.lbl_hist_samples_sub.setText("Chưa có mốc thời gian")
-
-        # 2. Cập nhật đồ thị lịch sử
-        if series and len(series) >= 2:
-            hx = np.array([p["timestamp"] for p in series], dtype=np.float64)
-            hy_down = np.array([p["down_kb"] for p in series], dtype=np.float64)
-            hy_up = np.array([p["up_kb"] for p in series], dtype=np.float64)
-
-            self.hist_curve_down.setData(hx, hy_down)
-            self.hist_curve_up.setData(hx, hy_up)
-
-            y_max = max(float(np.max(hy_down)), float(np.max(hy_up)), 10.0) * 1.15
-            self.hist_plot_widget.setYRange(0, y_max, padding=0.0)
-            self.hist_plot_widget.setXRange(hx[0], hx[-1], padding=0.02)
-        else:
-            self.hist_curve_down.setData([], [])
-            self.hist_curve_up.setData([], [])
-
-        # 3. Cập nhật bảng Top Ứng Dụng
-        self._populate_top_apps_table(top_procs)
-
-        # 4. Cập nhật bảng Nhật Ký Chi Tiết
-        self._populate_hist_logs_table(logs)
-
-    def _populate_top_apps_table(self, top_procs: list):
-        self.top_apps_table.setRowCount(len(top_procs))
-        for row_idx, item in enumerate(top_procs):
-            name = item["name"]
-            pid = item["pid"]
-            rx = item["rx_bytes"]
-            tx = item["tx_bytes"]
-            tot = item["total_bytes"]
-            pct = item.get("percent", 0.0)
-
-            icon = self.icon_manager.get_icon("", name)
-            name_item = QtWidgets.QTableWidgetItem(icon, f"  {name}")
-            name_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-
-            pid_item = QtWidgets.QTableWidgetItem(str(pid) if pid > 0 else "-")
-            pid_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-
-            rx_item = QtWidgets.QTableWidgetItem(self._format_bytes(rx))
-            rx_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-            rx_item.setForeground(QtGui.QBrush(QtGui.QColor("#D97706")))
-
-            tx_item = QtWidgets.QTableWidgetItem(self._format_bytes(tx))
-            tx_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-            tx_item.setForeground(QtGui.QBrush(QtGui.QColor("#EA580C")))
-
-            tot_item = QtWidgets.QTableWidgetItem(self._format_bytes(tot))
-            tot_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-            tot_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-
-            # Progress bar tỷ lệ % tiêu thụ
-            pbar = QtWidgets.QProgressBar()
-            pbar.setFixedHeight(14)
-            pbar.setTextVisible(True)
-            pbar.setRange(0, 100)
-            pbar.setValue(int(min(100, max(0, pct))))
-            pbar.setFormat(f"{pct:.1f}%")
-            pbar.setStyleSheet("""
-                QProgressBar {
-                    background-color: #F1F5F9;
-                    border-radius: 4px;
-                    text-align: center;
-                    font-size: 10px;
-                    font-weight: bold;
-                    color: #0F172A;
-                }
-                QProgressBar::chunk {
-                    background-color: #2563EB;
-                    border-radius: 4px;
-                }
-            """)
-
-            self.top_apps_table.setItem(row_idx, 0, name_item)
-            self.top_apps_table.setItem(row_idx, 1, pid_item)
-            self.top_apps_table.setItem(row_idx, 2, rx_item)
-            self.top_apps_table.setItem(row_idx, 3, tx_item)
-            self.top_apps_table.setItem(row_idx, 4, tot_item)
-            self.top_apps_table.setCellWidget(row_idx, 5, pbar)
-
-    def _populate_hist_logs_table(self, logs: list):
-        self.history_table.setRowCount(len(logs))
+    def _render_policy_table(self, logs: List[Dict]):
+        """Hiển thị danh sách log chính sách lên bảng."""
+        self.policy_log_table.setRowCount(len(logs))
+        import re
         for row_idx, item in enumerate(logs):
-            t_item = QtWidgets.QTableWidgetItem(str(item["timestamp"]))
-            pid_item = QtWidgets.QTableWidgetItem(str(item["pid"]))
-            pid_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            name_item = QtWidgets.QTableWidgetItem(item["name"])
-            name_item.setForeground(QtGui.QBrush(QtGui.QColor("#2563EB")))
-            rx_item = QtWidgets.QTableWidgetItem(f"{item['rx_bytes']:,}")
-            rx_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-            rx_item.setForeground(QtGui.QBrush(QtGui.QColor("#D97706")))
-            tx_item = QtWidgets.QTableWidgetItem(f"{item['tx_bytes']:,}")
-            tx_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-            tx_item.setForeground(QtGui.QBrush(QtGui.QColor("#EA580C")))
+            raw_line = item.get("raw", "")
+            ts = ""
+            action = "POLICY"
+            details = raw_line
+            status = "SUCCESS"
 
-            self.history_table.setItem(row_idx, 0, t_item)
-            self.history_table.setItem(row_idx, 1, pid_item)
-            self.history_table.setItem(row_idx, 2, name_item)
-            self.history_table.setItem(row_idx, 3, rx_item)
-            self.history_table.setItem(row_idx, 4, tx_item)
+            m = re.match(r"^\[(.*?)\]\s*\[(.*?)\]\s*(.*)$", raw_line)
+            if m:
+                ts = m.group(1)
+                action = m.group(2)
+                details = m.group(3)
 
-    def _filter_hist_logs(self, text: str):
-        query = text.strip().lower()
-        if not hasattr(self, "raw_hist_logs"):
+            ts_item = QtWidgets.QTableWidgetItem(ts)
+            ts_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+
+            act_item = QtWidgets.QTableWidgetItem(action)
+            act_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            act_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+            if "BLOCK" in action:
+                act_item.setForeground(QtGui.QBrush(QtGui.QColor("#DC2626")))
+            elif "UNBLOCK" in action or "REMOVE" in action:
+                act_item.setForeground(QtGui.QBrush(QtGui.QColor("#16A34A")))
+            else:
+                act_item.setForeground(QtGui.QBrush(QtGui.QColor("#2563EB")))
+
+            det_item = QtWidgets.QTableWidgetItem(details)
+            status_item = QtWidgets.QTableWidgetItem(status)
+            status_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            if "SUCCESS" in status:
+                status_item.setForeground(QtGui.QBrush(QtGui.QColor("#16A34A")))
+
+            self.policy_log_table.setItem(row_idx, 0, ts_item)
+            self.policy_log_table.setItem(row_idx, 1, act_item)
+            self.policy_log_table.setItem(row_idx, 2, det_item)
+            self.policy_log_table.setItem(row_idx, 3, status_item)
+
+    def _filter_policy_logs(self, query: str):
+        query = query.strip().lower()
+        if not getattr(self, "raw_policy_logs", None):
             return
         if not query:
-            self._populate_hist_logs_table(self.raw_hist_logs)
+            self._render_policy_table(self.raw_policy_logs)
             return
-        filtered = [item for item in self.raw_hist_logs if query in item["name"].lower()]
-        self._populate_hist_logs_table(filtered)
-
-    def _on_hist_plot_mouse_moved(self, pos):
-        if not hasattr(self, "current_hist_page_series") or not self.current_hist_page_series:
-            self.hist_v_line.hide()
-            self.hist_h_line.hide()
-            self.hist_hover_marker.hide()
-            self.hist_hover_badge.hide()
-            return
-
-        if not self.hist_plot_widget.sceneBoundingRect().contains(pos):
-            self.hist_v_line.hide()
-            self.hist_h_line.hide()
-            self.hist_hover_marker.hide()
-            self.hist_hover_badge.hide()
-            return
-
-        mouse_pt = self.hist_plot_widget.plotItem.vb.mapSceneToView(pos)
-        target_t = mouse_pt.x()
-
-        # Tìm mẫu gần nhất
-        best_pt = min(self.current_hist_page_series, key=lambda p: abs(p["timestamp"] - target_t))
-        nt = best_pt["timestamp"]
-        nd = best_pt.get("down_kb", 0.0)
-        nu = best_pt.get("up_kb", 0.0)
-
-        self.hist_v_line.setPos(nt)
-        self.hist_h_line.setPos(nd)
-        self.hist_v_line.show()
-        self.hist_h_line.show()
-
-        self.hist_hover_marker.setData([nt], [nd])
-        self.hist_hover_marker.show()
-
-        lt = time.localtime(nt)
-        t_str = time.strftime("%H:%M:%S", lt)
-        d_str = self._format_speed(nd)
-        u_str = self._format_speed(nu)
-
-        self.lbl_hist_hover_text.setText(
-            f"🕒 <b>{t_str}</b><br>"
-            f"<span style='color:#F59E0B;'>↓ {d_str}</span>&nbsp;&nbsp;"
-            f"<span style='color:#F43F5E;'>↑ {u_str}</span>"
-        )
-        self.hist_hover_badge.adjustSize()
-        local_pos = self.hist_plot_widget.mapFromScene(pos)
-        bx = max(10, min(self.hist_plot_widget.width() - self.hist_hover_badge.width() - 10, local_pos.x() + 14))
-        by = max(10, min(self.hist_plot_widget.height() - self.hist_hover_badge.height() - 10, local_pos.y() - 44))
-        self.hist_hover_badge.move(int(bx), int(by))
-        self.hist_hover_badge.show()
-
-    def _on_hist_plot_mouse_clicked(self, event):
-        if event.button() != QtCore.Qt.MouseButton.LeftButton:
-            return
-        pos = event.scenePos()
-        if not self.hist_plot_widget.sceneBoundingRect().contains(pos):
-            return
-        if not hasattr(self, "current_hist_page_series") or not self.current_hist_page_series:
-            return
-
-        mouse_pt = self.hist_plot_widget.plotItem.vb.mapSceneToView(pos)
-        target_t = mouse_pt.x()
-        best_pt = min(self.current_hist_page_series, key=lambda p: abs(p["timestamp"] - target_t))
-        t_val = best_pt["timestamp"]
-        d_val = best_pt.get("down_kb", 0.0)
-        u_val = best_pt.get("up_kb", 0.0)
-
-        self.hist_pinned_marker.setData([t_val], [d_val])
-        self.hist_pinned_marker.show()
-
-        lt = time.localtime(t_val)
-        time_full_str = time.strftime("%H:%M:%S - %d/%m/%Y", lt)
-        d_str = self._format_speed(d_val)
-        u_str = self._format_speed(u_val)
-        tot_str = self._format_speed(d_val + u_val)
-
-        # Truy vấn ứng dụng lúc đó từ DB
-        def bg():
-            try:
-                from datetime import datetime as _dt
-                dt_obj = _dt.fromtimestamp(t_val)
-                db_mgr = self._get_db_manager()
-                db_procs = db_mgr.get_processes_around_time(dt_obj, tolerance_seconds=5.0) if db_mgr else []
-                self.async_bridge.run_on_main(self._apply_hist_point_procs, time_full_str, d_str, u_str, tot_str, db_procs)
-            except Exception as e:
-                print(f"[UI Hist Point Procs Error] {e}")
-        threading.Thread(target=bg, daemon=True).start()
-
-    def _apply_hist_point_procs(self, time_str: str, down_str: str, up_str: str, tot_str: str, procs: list):
-        if procs:
-            proc_items_text = " &nbsp;|&nbsp; ".join([
-                f"<b>{p['name']}</b>: <span style='color:#D97706;'>{self._format_bytes(p.get('rx_bytes', 0))} ↓</span>, <span style='color:#EA580C;'>{self._format_bytes(p.get('tx_bytes', 0))} ↑</span>"
-                for p in procs[:4]
-            ])
-            proc_html = f"<div style='margin-top: 3px; font-size: 11px; color: #334155;'>📱 <b>Ứng dụng hoạt động lúc này:</b> {proc_items_text}</div>"
-        else:
-            proc_html = "<div style='margin-top: 3px; font-size: 11px; color: #64748B;'>📱 Không có ứng dụng riêng lẻ nào ghi nhận lưu lượng tại giây này.</div>"
-
-        card_text = (
-            f"<div style='font-size: 12px; line-height: 1.5;'>"
-            f"📍 <b>MỐC ĐƯỢC CHỌN:</b> <span style='color:#0F172A; font-weight:800;'>{time_str}</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
-            f"📥 Tải xuống: <span style='color:#D97706; font-weight:800;'>{down_str}</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
-            f"📤 Tải lên: <span style='color:#EA580C; font-weight:800;'>{up_str}</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
-            f"⚡ Tổng: <span style='color:#2563EB; font-weight:800;'>{tot_str}</span>"
-            f"{proc_html}"
-            f"</div>"
-        )
-        self.lbl_hist_point_details.setText(card_text)
-        self.hist_point_card.setVisible(True)
+        filtered = [item for item in self.raw_policy_logs if query in item.get("raw", "").lower()]
+        self._render_policy_table(filtered)
 
     def _apply_y_ceiling(self, target_tier: float):
         self.plot_widget.setYRange(0, target_tier, padding=0.0)
@@ -4515,7 +3618,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
                 self._apply_y_ceiling(target_tier)
             elif target_tier < self.current_y_max:
                 # Đỉnh lưu lượng giảm: chỉ hạ thang đo sau khi lưu lượng thấp duy trì ổn định ít nhất 8 giây
-                if getattr(self, "history_mode", False) or now >= getattr(self, "_scale_down_hold_time", 0.0):
+                if now >= getattr(self, "_scale_down_hold_time", 0.0):
                     self.current_y_max = target_tier
                     self._apply_y_ceiling(target_tier)
         except Exception:
@@ -4616,8 +3719,8 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
 
             y_res = h00 * y0 + h10 * hi * d0 + h01 * y1 + h11 * hi * d1
 
-            # Khử mảng phẳng trước mốc mẫu đầu tiên
-            y_res = np.where(x_dense < ux[0], 0.0, y_res)
+            # Khử mảng phẳng trước mốc mẫu đầu tiên và sau mốc mẫu cuối cùng (tránh đường đi ngang khi máy Offline)
+            y_res = np.where((x_dense < ux[0]) | (x_dense > ux[-1]), 0.0, y_res)
             return np.nan_to_num(np.maximum(0.0, y_res), nan=0.0)
         except Exception:
             try:
@@ -4630,6 +3733,10 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         """Làm mới danh sách kết nối TCP"""
         if hasattr(self, "page_scanner") and self.stacked_pages.currentWidget() != self.page_scanner:
             return
+        if self.is_admin_mode and self.selected_device_uuid:
+            dev_state = self._get_monitored_device_state()
+            if dev_state and dev_state.status != "online":
+                return
         try:
             conns = self._get_active_connections()
             self.conn_table.setRowCount(len(conns))
@@ -4666,287 +3773,6 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         except Exception as e:
             print(f"[UI] Lỗi khi làm mới kết nối: {e}")
 
-    def _verify_database(self):
-        """Kiểm tra CSDL MySQL bất đồng bộ"""
-        db_mgr = self._get_db_manager()
-        if not db_mgr:
-            stats = {
-                "connected": False,
-                "devices": 0,
-                "network_interfaces": 0,
-                "interface_traffic": 0,
-                "processes": 0,
-                "process_traffic": 0,
-                "network_connections": 0,
-            }
-            self.db_stats_card.setText("⚠️ CSDL MySQL chưa kết nối (đang chạy với cờ --no-db hoặc chưa khởi động MySQL).")
-            return
-
-        def bg_worker():
-            try:
-                stats = db_mgr.get_database_stats()
-                history = db_mgr.get_recent_history(limit=15)
-                self.async_bridge.run_on_main(self._apply_database_verification, stats, history)
-            except Exception as e:
-                self.async_bridge.run_on_main(self.db_stats_card.setText, f"⚠️ Lỗi khi truy vấn CSDL: {e}")
-
-        threading.Thread(target=bg_worker, daemon=True).start()
-
-    def _apply_database_verification(self, stats: dict, history: list):
-        try:
-            if not stats.get("connected"):
-                self.db_stats_card.setText("❌ Không thể kết nối tới MySQL database.")
-                return
-
-            text = (
-                f"✅ <b>Trạng Thái Cơ Sở Dữ Liệu MySQL: ONLINE</b><br>"
-                f"📊 <b>Số lượng bản ghi hiện có:</b> "
-                f"devices: <b>{stats.get('devices', 0)}</b> | "
-                f"network_interfaces: <b>{stats.get('network_interfaces', 0)}</b> | "
-                f"interface_traffic: <b>{stats.get('interface_traffic', 0)}</b> | "
-                f"processes: <b>{stats.get('processes', 0)}</b> | "
-                f"process_traffic: <b>{stats.get('process_traffic', 0)}</b> | "
-                f"network_connections: <b>{stats.get('network_connections', 0)}</b><br>"
-                f"⏱️ <b>Mốc lưu gần nhất:</b> "
-                f"Lưu lượng card: <i>{stats.get('latest_interface_traffic', 'N/A')}</i> | "
-                f"Tiến trình: <i>{stats.get('latest_process_traffic', 'N/A')}</i> | "
-                f"Kết nối: <i>{stats.get('latest_connection', 'N/A')}</i>"
-            )
-            self.db_stats_card.setText(text)
-
-            self.history_table.setRowCount(len(history))
-            for row_idx, item in enumerate(history):
-                time_str = str(item["timestamp"])
-                t_item = QtWidgets.QTableWidgetItem(time_str)
-
-                pid_item = QtWidgets.QTableWidgetItem(str(item["pid"]))
-                pid_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-
-                name_item = QtWidgets.QTableWidgetItem(item["name"])
-                name_item.setForeground(QtGui.QBrush(QtGui.QColor("#2563EB")))
-
-                rx_item = QtWidgets.QTableWidgetItem(f"{item['rx_bytes']:,}")
-                rx_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-                rx_item.setForeground(QtGui.QBrush(QtGui.QColor("#D97706")))
-
-                tx_item = QtWidgets.QTableWidgetItem(f"{item['tx_bytes']:,}")
-                tx_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-                tx_item.setForeground(QtGui.QBrush(QtGui.QColor("#EA580C")))
-
-                self.history_table.setItem(row_idx, 0, t_item)
-                self.history_table.setItem(row_idx, 1, pid_item)
-                self.history_table.setItem(row_idx, 2, name_item)
-                self.history_table.setItem(row_idx, 3, rx_item)
-                self.history_table.setItem(row_idx, 4, tx_item)
-        except Exception as e:
-            self.db_stats_card.setText(f"⚠️ Lỗi khi cập nhật giao diện CSDL: {e}")
-
-    # =========================================================================
-    # CÁC THAO TÁC BÓP BĂNG THÔNG (WINDIVERT PACKET SHAPER)
-    # =========================================================================
-    def _on_apply_qos_clicked(self):
-        app_name = self.combo_qos_app.currentText().strip()
-        if not app_name:
-            QtWidgets.QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn hoặc nhập tên ứng dụng cần giới hạn (VD: brave.exe)!")
-            return
-
-        try:
-            limit_val = float(self.input_qos_limit.text().strip())
-            if limit_val <= 0:
-                raise ValueError()
-        except ValueError:
-            QtWidgets.QMessageBox.warning(self, "Sai định dạng", "Mức giới hạn phải là một số dương (KB/s)!")
-            return
-
-        dir_idx = self.combo_shaper_dir.currentIndex()
-        direction_map = {0: "both", 1: "upload", 2: "download"}
-        dir_code = direction_map.get(dir_idx, "both")
-        dir_text = self.combo_shaper_dir.currentText()
-
-        self.btn_apply_qos.setEnabled(False)
-        self.btn_apply_qos.setText("Đang áp dụng...")
-
-        def bg():
-            try:
-                success, msg = self.service.apply_bandwidth_limit(app_name, limit_val, dir_code)
-                self.async_bridge.run_on_main(self._on_qos_applied_result, success, msg, app_name, limit_val, dir_text)
-            except Exception as e:
-                self.async_bridge.run_on_main(self._on_qos_applied_result, False, str(e), app_name, limit_val, dir_text)
-
-        threading.Thread(target=bg, daemon=True).start()
-
-    def _on_qos_applied_result(self, success: bool, msg: str, app_name: str, limit_val: float, dir_text: str):
-        self.btn_apply_qos.setEnabled(True)
-        self.btn_apply_qos.setText("🚀 Áp Dụng Giới Hạn")
-
-        if success:
-            self.monitored_qos_app = app_name
-            self.monitored_qos_limit = limit_val
-            self.qos_status_card.setText(f"✅ Thành công: {msg}")
-            self._refresh_policy_table()
-            QtWidgets.QMessageBox.information(
-                self,
-                "Bóp Băng Thông Thành Công",
-                f"Đã kích hoạt bóp băng thông WinDivert cho '{app_name}'!\n"
-                f"• Chiều áp dụng: {dir_text}\n"
-                f"• Mức trần: {limit_val:,.1f} KB/s\n\n"
-                f"Bạn có thể mở ứng dụng (hoặc tab mới) để kiểm chứng ngay lập tức."
-            )
-        else:
-            self.qos_status_card.setText(f"❌ Thất bại: {msg}")
-            self._refresh_policy_table()
-            QtWidgets.QMessageBox.critical(self, "Lỗi bóp băng thông", f"{msg}\n\nLưu ý: Bạn cần chạy ứng dụng với quyền 'Run as administrator' để WinDivert có quyền can thiệp gói tin.")
-
-    def _on_remove_qos_clicked(self):
-        self.btn_remove_qos.setEnabled(False)
-        self.btn_remove_qos.setText("Đang gỡ bỏ...")
-
-        def bg():
-            try:
-                success, msg = self.service.remove_bandwidth_limit()
-                self.async_bridge.run_on_main(self._on_qos_removed_result, success, msg)
-            except Exception as e:
-                self.async_bridge.run_on_main(self._on_qos_removed_result, False, str(e))
-
-        threading.Thread(target=bg, daemon=True).start()
-
-    def _on_qos_removed_result(self, success: bool, msg: str):
-        self.btn_remove_qos.setEnabled(True)
-        self.btn_remove_qos.setText("❌ Gỡ Bỏ Giới Hạn")
-
-        self.monitored_qos_app = ""
-        self.monitored_qos_limit = 0.0
-        self.qos_progress.setValue(0)
-        self.qos_meter_label.setText("🎯 Đã gỡ bỏ giới hạn băng thông. Toàn bộ lưu lượng trở lại bình thường.")
-        self.qos_status_card.setText(f"✅ {msg}")
-        self._refresh_policy_table()
-        QtWidgets.QMessageBox.information(self, "Gỡ bỏ thành công", "Đã gỡ bỏ giới hạn băng thông. Lưu lượng mạng của ứng dụng đã được phục hồi tối đa.")
-
-    def _update_qos_realtime_verification(self, proc_speeds: list):
-        if not self.monitored_qos_app or self.monitored_qos_limit <= 0:
-            return
-
-        target = self.monitored_qos_app.lower()
-        target_no_ext = target.replace(".exe", "").strip()
-        measured_up_kb = 0.0
-        measured_down_kb = 0.0
-
-        for item in proc_speeds:
-            p_name = item.get("name", "").lower()
-            if p_name == target or p_name.replace(".exe", "") == target_no_ext or (target_no_ext and target_no_ext in p_name):
-                measured_up_kb += item.get("up_kb", 0.0)
-                measured_down_kb += item.get("down_kb", 0.0)
-
-        # Lấy thống kê chi tiết từ WinDivertPacketShaper
-        shaper_status = self.service.get_bandwidth_limit_status()
-        shaper_active = shaper_status.get("is_active", False)
-        direction = shaper_status.get("direction", "both")
-        throttled_pkts = shaper_status.get("throttled_packets", 0)
-        throttled_bytes = shaper_status.get("throttled_bytes", 0)
-        shaper_spd = shaper_status.get("current_speed_kbps", 0.0)
-        shaper_down = shaper_status.get("current_down_kbps", 0.0)
-        shaper_up = shaper_status.get("current_up_kbps", 0.0)
-
-        # Lấy tốc độ phản ánh trung thực lưu lượng thực tế qua kernel shaper
-        if shaper_active and (throttled_pkts > 0 or shaper_spd > 0):
-            disp_up = shaper_up if shaper_up > 0 else measured_up_kb
-            disp_down = shaper_down if shaper_down > 0 else measured_down_kb
-            if direction == "upload":
-                measured_speed = disp_up
-                dir_str = f"Upload: {disp_up:,.1f} KB/s"
-            elif direction == "download":
-                measured_speed = disp_down
-                dir_str = f"Download: {disp_down:,.1f} KB/s"
-            else:
-                measured_speed = shaper_spd if shaper_spd > 0 else max(disp_up, disp_down)
-                dir_str = f"Upload: {disp_up:,.1f} KB/s | Download: {disp_down:,.1f} KB/s"
-        else:
-            if direction == "upload":
-                measured_speed = measured_up_kb
-                dir_str = f"Upload: {measured_up_kb:,.1f} KB/s"
-            elif direction == "download":
-                measured_speed = measured_down_kb
-                dir_str = f"Download: {measured_down_kb:,.1f} KB/s"
-            else:
-                measured_speed = max(measured_up_kb, measured_down_kb)
-                dir_str = f"Upload: {measured_up_kb:,.1f} KB/s | Download: {measured_down_kb:,.1f} KB/s"
-
-        pct = (measured_speed / self.monitored_qos_limit * 100.0) if self.monitored_qos_limit > 0 else 0.0
-        self.qos_progress.setValue(min(100, int(pct)))
-
-        throttled_kb = throttled_bytes / 1024.0
-        throttled_str = f"{throttled_kb:,.1f} KB" if throttled_kb < 1024 else f"{(throttled_kb / 1024.0):,.2f} MB"
-
-        if measured_speed >= (self.monitored_qos_limit * 0.90):
-            status_text = "🔒 ĐANG GHÌM TỐC ĐỘ (Token Bucket kìm lưu lượng tại mức trần)"
-            style_color = "#EA580C"
-        else:
-            status_text = "🟢 ĐANG GIỚI HẠN (Lưu lượng tuân thủ mức trần cho phép)"
-            style_color = "#059669"
-
-        self.qos_meter_label.setText(
-            f"🎯 <b>Tiến trình đang bóp:</b> <span style='color:#2563EB'>{self.monitored_qos_app}</span> | "
-            f"<b>Mức trần:</b> <span style='color:#D97706'>{self.monitored_qos_limit:,.1f} KB/s</span> | "
-            f"<b>Tốc độ tức thời:</b> <span style='color:#0F172A'>{dir_str}</span><br>"
-            f"📦 <b>Số gói tin đã điều phối:</b> {throttled_pkts:,} gói ({throttled_str}) | "
-            f"Trạng thái: <span style='color:{style_color}; font-weight:bold;'>{status_text}</span>"
-        )
-
-    def _refresh_policy_table(self):
-        """Tải danh sách lịch sử áp dụng chính sách từ MySQL / File lên bảng UI."""
-        if not hasattr(self, 'policy_table'):
-            return
-
-        def bg():
-            try:
-                logs = self.service.get_policy_history(limit=50)
-                self.async_bridge.run_on_main(self._update_policy_table_ui, logs)
-            except Exception:
-                pass
-
-        threading.Thread(target=bg, daemon=True).start()
-
-    def _update_policy_table_ui(self, logs: list):
-        if not hasattr(self, 'policy_table'):
-            return
-
-        self.policy_table.setRowCount(0)
-        for row_idx, r in enumerate(logs):
-            self.policy_table.insertRow(row_idx)
-
-            time_str = r.get("applied_at_str", "")
-            action = r.get("action", "")
-            target_app = r.get("target_app", "")
-            direction = r.get("direction", "both")
-            limit_val = r.get("limit_kbps", 0.0)
-            pkts = r.get("throttled_packets", 0)
-            bytes_val = r.get("throttled_bytes", 0)
-            status = r.get("status", "SUCCESS")
-
-            dir_map = {"both": "Cả 2 chiều", "upload": "Tải lên", "download": "Tải về"}
-            dir_str = dir_map.get(str(direction).lower(), str(direction))
-
-            is_apply = (action == "APPLY")
-            action_item = QtWidgets.QTableWidgetItem("🚀 KÍCH HOẠT" if is_apply else "❌ GỠ BỎ")
-            action_item.setForeground(QtGui.QColor("#059669" if is_apply else "#DC2626"))
-            font_act = QtGui.QFont()
-            font_act.setBold(True)
-            action_item.setFont(font_act)
-
-            th_kb = bytes_val / 1024.0
-            pkt_str = f"{pkts:,} gói ({th_kb:,.1f} KB)" if pkts > 0 else "-"
-
-            self.policy_table.setItem(row_idx, 0, QtWidgets.QTableWidgetItem(time_str))
-            self.policy_table.setItem(row_idx, 1, action_item)
-            self.policy_table.setItem(row_idx, 2, QtWidgets.QTableWidgetItem(target_app))
-            self.policy_table.setItem(row_idx, 3, QtWidgets.QTableWidgetItem(dir_str))
-            self.policy_table.setItem(row_idx, 4, QtWidgets.QTableWidgetItem(f"{limit_val:,.1f} KB/s" if limit_val > 0 else "-"))
-            self.policy_table.setItem(row_idx, 5, QtWidgets.QTableWidgetItem(pkt_str))
-
-            st_item = QtWidgets.QTableWidgetItem("Thành công" if status == "SUCCESS" else status)
-            st_item.setForeground(QtGui.QColor("#059669" if status == "SUCCESS" else "#DC2626"))
-            self.policy_table.setItem(row_idx, 6, st_item)
-
     def _show_about_dialog(self):
         QtWidgets.QMessageBox.information(
             self,
@@ -4955,7 +3781,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             "Phiên bản tái hiện giao diện chuẩn GlassWire Free với đầy đủ tính năng PBL4:<br>"
             "• Đọc lưu lượng gói tin ETW / Socket tiến trình kernel thời gian thực<br>"
             "• Bóp băng thông mạng thời gian thực WinDivert Kernel Packet Shaper (Token Bucket)<br>"
-            "• Lưu trữ toàn vẹn vào cơ sở dữ liệu MySQL 6 bảng liên kết<br>"
+            "• Lưu trữ nhật ký an ninh và lịch sử thao tác thời gian thực (File-based Logs)<br>"
             "• Phân tích socket TCP và trạng thái kết nối mạng IPv4/IPv6"
         )
 

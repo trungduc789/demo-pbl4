@@ -5,7 +5,7 @@ Script Tự Động Đóng Gói Ứng Dụng Client & Server (Packaging Automati
     2. dist/Client_Agent/Client_Agent.exe
 - Tự động tích hợp Windows UAC Administrator Manifest (--uac-admin) để cấp quyền WinDivert & Firewall.
 - Tự động trích xuất và sao chép driver nhân Windows: WinDivert64.dll & WinDivert64.sys vào gói Client.
-- Tự động đóng gói file cấu hình client_config.json và database demo.sql.
+- Tự động đóng gói file cấu hình client_config.json.
 - Tạo sẵn các file hướng dẫn vận hành và file batch khởi chạy nhanh (.bat).
 """
 
@@ -60,11 +60,6 @@ def build_admin():
         "--windowed",
         "--name", "Admin_Server",
         "--uac-admin",
-        "--add-data", f"{os.path.join(PROJECT_ROOT, 'demo.sql')};.",
-        "--add-data", f"{os.path.join(PROJECT_ROOT, 'database.txt')};.",
-        "--hidden-import", "mysql.connector",
-        "--hidden-import", "mysql.connector.plugins",
-        "--hidden-import", "mysql.connector.locales",
         "--hidden-import", "pyqtgraph",
         "--hidden-import", "PyQt6",
         "--hidden-import", "PyQt6.QtCore",
@@ -78,12 +73,6 @@ def build_admin():
     admin_dist = os.path.join(PROJECT_ROOT, "dist", "Admin_Server")
     os.makedirs(os.path.join(admin_dist, "logs"), exist_ok=True)
 
-    # Copy demo.sql & database.txt sang dist/Admin_Server
-    for f in ["demo.sql", "database.txt"]:
-        src = os.path.join(PROJECT_ROOT, f)
-        if os.path.isfile(src):
-            shutil.copy2(src, os.path.join(admin_dist, f))
-
     # Tạo file hướng dẫn cho Admin
     readme_admin = os.path.join(admin_dist, "HUONG_DAN_ADMIN.txt")
     with open(readme_admin, "w", encoding="utf-8") as f:
@@ -91,19 +80,17 @@ def build_admin():
             "========================================================================\n"
             "         HƯỚNG DẪN VẬN HÀNH MÁY CHỦ QUẢN TRỊ (ADMIN SERVER)\n"
             "========================================================================\n\n"
-            "1. Chuẩn bị Cơ sở dữ liệu MySQL (Tùy chọn):\n"
-            "   - Khởi động MySQL (qua XAMPP hoặc MySQL Service).\n"
-            "   - Import file 'demo.sql' trong thư mục này vào MySQL database tên 'demo'.\n"
-            "   - Cấu hình mật khẩu root trong tệp config/settings.py nếu có thay đổi.\n\n"
-            "2. Khởi chạy Máy Chủ Quản Trị:\n"
+            "1. Khởi chạy Máy Chủ Quản Trị:\n"
             "   - Nhấp đúp vào 'Admin_Server.exe' (hoặc chạy 'Chay_Admin.bat').\n"
             "   - Khi hộp thoại UAC hỏi cấp quyền Administrator, hãy chọn 'Yes'.\n"
             "   - Ứng dụng sẽ tự động mở giao diện quản trị GlassWire Dashboard và\n"
             "     lắng nghe kết nối TCP từ các máy con trên Cổng 9988.\n\n"
-            "3. Giám sát & Can thiệp từ xa:\n"
+            "2. Giám sát & Can thiệp từ xa:\n"
             "   - Các máy con kết nối vào mạng sẽ xuất hiện tại tab 'Fleet Manager'.\n"
             "   - Bấm 'Xem & Điều khiển' để xem biểu đồ lưu lượng thời gian thực.\n"
-            "   - Vào tab 'Protect' để can thiệp chặn hoặc bóp băng thông từ xa.\n"
+            "   - Vào tab 'Protect' để can thiệp chặn hoặc bóp băng thông từ xa.\n\n"
+            "3. Lịch sử hoạt động & Chính sách:\n"
+            "   - Lịch sử thao tác an ninh được tự động lưu vào file 'logs/policies.log'.\n"
         )
 
     # Tạo batch file chạy nhanh

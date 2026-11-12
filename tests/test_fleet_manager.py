@@ -29,11 +29,10 @@ class TestFleetManagerService(unittest.TestCase):
     TEST_PORT = 19995
 
     def test_fleet_manager_coordination_and_command_dispatch(self):
-        # 1. Khởi động FleetManagerService (enable_db=False để kiểm thử chạy độc lập không phụ thuộc MySQL service)
+        # 1. Khởi động FleetManagerService
         fleet_service = FleetManagerService(
             host=self.TEST_HOST,
             port=self.TEST_PORT,
-            enable_db=False,
         )
         self.assertTrue(fleet_service.start(), "FleetManagerService phải khởi động thành công")
 

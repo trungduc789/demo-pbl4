@@ -191,10 +191,8 @@ class GlassWireUsageView(QWidget):
         # Nếu chưa truyền total_window_bytes thì tính tổng từ apps_list
         if total_window_bytes <= 0.0:
             total_window_bytes = sum(b for _, b in apps_list)
-        if total_window_bytes <= 0.0:
-            total_window_bytes = 1024.0 * 250.0  # Mặc định tối thiểu để hiển thị
 
-        max_app_val = max([x[1] for x in apps_list], default=total_window_bytes * 0.5)
+        max_app_val = max([x[1] for x in apps_list], default=1.0)
         for name, b_val in apps_list[:25]:
             icon = None
             if self.icon_manager:
@@ -203,72 +201,104 @@ class GlassWireUsageView(QWidget):
             item_w = UsageItemWidget(icon, name, "", b_val, max_app_val)
             self.col_apps.add_item(item_w)
 
-        # 2. XỬ LÝ CỘT HOSTS (Địa chỉ IP/Máy chủ)
+        # 2. XỬ LÝ CỘT HOSTS, TRAFFIC TYPE & KHU VỰC MẠNG TỪ ACTIVE CONNECTIONS THỰC TẾ
         self.col_hosts.clear_items()
-        seen_hosts = []
+        self.col_traffic_type.clear_items()
+        self.col_countries.clear_items()
+
+        host_counts: Dict[str, int] = {}
+        proto_counts: Dict[str, int] = {}
+        region_counts: Dict[str, int] = {}
+
         for conn in active_conns:
             r_ip = getattr(conn, "remote_ip", None) or (conn.raddr.ip if getattr(conn, "raddr", None) else None)
             if not r_ip:
                 continue
             r_port = getattr(conn, "remote_port", None) or (conn.raddr.port if getattr(conn, "raddr", None) else None)
             host_str = f"{r_ip}:{r_port}" if r_port else str(r_ip)
-            if host_str not in seen_hosts:
-                seen_hosts.append(host_str)
+            host_counts[host_str] = host_counts.get(host_str, 0) + 1
 
-        if not seen_hosts:
-            seen_hosts = [
-                "127.0.0.1:49350",
-                "2001:4860:4842:400::443 (Google)",
-                "127.0.0.1:49370",
-                "125.235.36.163:443",
-                "127.0.0.1:61795",
-                "127.0.0.1:49697",
-                "142.250.200.46:443 (Google Cloud)",
-                "20.198.118.190:443 (Microsoft Azure)",
-                "1.1.1.1:53 (Cloudflare DNS)",
-            ]
+            # Phân loại Giao thức dựa trên cổng thực tế
+            port_num = int(r_port or 0)
+            if port_num == 443:
+                proto_name = "HTTPS (TCP/443)"
+            elif port_num in (80, 8080):
+                proto_name = f"HTTP (TCP/{port_num})"
+            elif port_num == 53:
+                proto_name = "DNS (UDP/TCP 53)"
+            elif port_num in (445, 139, 137):
+                proto_name = f"SMB / NetBIOS ({port_num})"
+            elif port_num == 3306:
+                proto_name = "MySQL Database (3306)"
+            elif port_num in (9988, 9999):
+                proto_name = f"PBL4 Control Channel ({port_num})"
+            elif port_num == 123:
+                proto_name = "NTP Time Sync (123)"
+            elif port_num > 0:
+                proto_name = f"Application Port ({port_num})"
+            else:
+                proto_name = "Other TCP / UDP"
+            proto_counts[proto_name] = proto_counts.get(proto_name, 0) + 1
 
-        # Phân bổ lưu lượng cho từng Host theo tỷ lệ giảm dần từ total_window_bytes
-        host_weights = [0.38, 0.22, 0.14, 0.09, 0.06, 0.04, 0.03, 0.02, 0.01, 0.01]
-        sorted_hosts = []
-        for idx, h_name in enumerate(seen_hosts[:12]):
-            w = host_weights[idx] if idx < len(host_weights) else 0.008
-            sorted_hosts.append((h_name, total_window_bytes * w))
+            # Phân loại Khu vực / Phạm vi mạng dựa trên IP thực tế
+            ip_str = str(r_ip)
+            if ip_str.startswith("127.") or ip_str == "::1":
+                region_name = "Localhost / Loopback (127.0.0.1)"
+            elif ip_str.startswith(("10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31.", "fe80:")):
+                region_name = "Mạng Nội Bộ LAN (Private IP)"
+            elif ip_str.startswith(("142.250.", "172.217.", "216.58.", "8.8.")):
+                region_name = "Google Cloud / DNS"
+            elif ip_str.startswith(("1.1.1.", "1.0.0.", "104.16.", "104.17.", "104.18.", "172.64.", "172.67.")):
+                region_name = "Cloudflare CDN / Edge"
+            elif ip_str.startswith(("20.", "40.", "52.", "13.")):
+                region_name = "Microsoft Azure / Cloud"
+            else:
+                region_name = "Internet Quốc Tế (Public WAN)"
+            region_counts[region_name] = region_counts.get(region_name, 0) + 1
 
-        max_host_val = max([x[1] for x in sorted_hosts], default=1.0)
-        for host_str, b_val in sorted_hosts:
-            item_w = UsageItemWidget(None, host_str, "", b_val, max_host_val)
-            self.col_hosts.add_item(item_w)
+        total_conns = max(sum(host_counts.values()), 1)
 
-        # 3. XỬ LÝ CỘT TRAFFIC TYPE (Giao thức mạng)
-        self.col_traffic_type.clear_items()
-        proto_shares = [
-            ("Other TCP / UDP Protocols", 0.45),
-            ("Hypertext Transfer Protocol (HTTPS - 443)", 0.32),
-            ("Domain Name System (DNS - 53)", 0.09),
-            ("Hypertext Transfer Protocol (HTTP - 80)", 0.06),
-            ("Microsoft SSDP Discovery (1900)", 0.04),
-            ("NetBIOS Name Service (137)", 0.02),
-            ("Network Time Protocol (NTP - 123)", 0.02),
-        ]
-        sorted_proto = [(p_name, total_window_bytes * share) for p_name, share in proto_shares]
-        max_p_val = max([x[1] for x in sorted_proto], default=1.0)
-        for p_name, b_val in sorted_proto:
-            item_w = UsageItemWidget(None, p_name, "", b_val, max_p_val)
-            self.col_traffic_type.add_item(item_w)
+        def _sort_items(items_list):
+            if self.sort_order == "high_to_low":
+                items_list.sort(key=lambda x: x[1], reverse=True)
+            elif self.sort_order == "low_to_high":
+                items_list.sort(key=lambda x: x[1])
+            elif self.sort_order == "alpha":
+                items_list.sort(key=lambda x: x[0].lower())
+            return items_list
 
-        # 4. XỬ LÝ CỘT COUNTRIES (Quốc gia / Khu vực mạng)
-        self.col_countries.clear_items()
-        country_shares = [
-            ("Vietnam", 0.48),
-            ("United States", 0.26),
-            ("Local Network", 0.12),
-            ("Hong Kong", 0.06),
-            ("Singapore", 0.05),
-            ("Other", 0.03),
-        ]
-        sorted_countries = [(c_name, total_window_bytes * share) for c_name, share in country_shares]
-        max_c_val = max([x[1] for x in sorted_countries], default=1.0)
-        for c_name, b_val in sorted_countries:
-            item_w = UsageItemWidget(None, c_name, "", b_val, max_c_val)
-            self.col_countries.add_item(item_w)
+        # Render cột Hosts
+        if host_counts:
+            sorted_hosts = _sort_items([
+                (h_name, total_window_bytes * (cnt / total_conns))
+                for h_name, cnt in host_counts.items()
+            ])[:20]
+            max_host_val = max([x[1] for x in sorted_hosts], default=1.0)
+            for host_str, b_val in sorted_hosts:
+                self.col_hosts.add_item(UsageItemWidget(None, host_str, "", b_val, max_host_val))
+        else:
+            self.col_hosts.add_item(UsageItemWidget(None, "Chưa có kết nối ngoài", "", 0.0, 1.0))
+
+        # Render cột Traffic Type
+        if proto_counts:
+            sorted_proto = _sort_items([
+                (p_name, total_window_bytes * (cnt / total_conns))
+                for p_name, cnt in proto_counts.items()
+            ])
+            max_p_val = max([x[1] for x in sorted_proto], default=1.0)
+            for p_name, b_val in sorted_proto:
+                self.col_traffic_type.add_item(UsageItemWidget(None, p_name, "", b_val, max_p_val))
+        else:
+            self.col_traffic_type.add_item(UsageItemWidget(None, "Chưa ghi nhận giao thức", "", 0.0, 1.0))
+
+        # Render cột Khu vực mạng (Countries / Scope)
+        if region_counts:
+            sorted_regions = _sort_items([
+                (c_name, total_window_bytes * (cnt / total_conns))
+                for c_name, cnt in region_counts.items()
+            ])
+            max_c_val = max([x[1] for x in sorted_regions], default=1.0)
+            for c_name, b_val in sorted_regions:
+                self.col_countries.add_item(UsageItemWidget(None, c_name, "", b_val, max_c_val))
+        else:
+            self.col_countries.add_item(UsageItemWidget(None, "Chưa ghi nhận vùng mạng", "", 0.0, 1.0))

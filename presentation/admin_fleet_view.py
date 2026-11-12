@@ -27,6 +27,7 @@ class AdminFleetView(QWidget):
         super().__init__(parent)
         self._raw_devices: List[Any] = []
         self._current_summary: Dict[str, Any] = {}
+        self._rendered_uuids: List[str] = []
         self._init_ui()
 
     def _init_ui(self):
@@ -37,16 +38,9 @@ class AdminFleetView(QWidget):
 
         # 1. Header Toolbar
         header_layout = QHBoxLayout()
-        header_left = QVBoxLayout()
-        header_left.setSpacing(2)
-
         title = QLabel("🖥️ Quản Trị Hệ Thống Mạng (Fleet Management)")
-        title.setStyleSheet("font-size: 19px; font-weight: 800; color: #0F172A;")
-        sub_title = QLabel("Giám sát thông số thời gian thực, lưu lượng mạng và can thiệp bảo mật từ xa cho tất cả các máy con")
-        sub_title.setStyleSheet("font-size: 12px; color: #64748B;")
-        header_left.addWidget(title)
-        header_left.addWidget(sub_title)
-        header_layout.addLayout(header_left)
+        title.setStyleSheet("font-size: 19px; font-weight: 800; color: #0F172A; border: none; background: transparent;")
+        header_layout.addWidget(title)
         header_layout.addStretch()
         layout.addLayout(header_layout)
 
@@ -66,21 +60,12 @@ class AdminFleetView(QWidget):
         layout.addLayout(cards_layout)
 
         # 3. Thanh tìm kiếm và bộ lọc (Search & Filter Bar)
-        filter_bar = QFrame()
-        filter_bar.setStyleSheet("""
-            QFrame {
-                background-color: #FFFFFF;
-                border: 1px solid #E2E8F0;
-                border-radius: 8px;
-                padding: 4px 10px;
-            }
-        """)
-        fb_layout = QHBoxLayout(filter_bar)
-        fb_layout.setContentsMargins(8, 4, 8, 4)
+        fb_layout = QHBoxLayout()
+        fb_layout.setContentsMargins(0, 0, 0, 0)
         fb_layout.setSpacing(10)
 
         lbl_search = QLabel("🔍 Tìm máy:")
-        lbl_search.setStyleSheet("font-weight: bold; font-size: 12px; color: #475569;")
+        lbl_search.setStyleSheet("font-weight: bold; font-size: 12px; color: #475569; border: none; background: transparent;")
         fb_layout.addWidget(lbl_search)
 
         self.txt_search = QLineEdit()
@@ -88,7 +73,7 @@ class AdminFleetView(QWidget):
         self.txt_search.setFixedHeight(30)
         self.txt_search.setStyleSheet("""
             QLineEdit {
-                background-color: #F8FAFC;
+                background-color: #FFFFFF;
                 border: 1px solid #CBD5E1;
                 border-radius: 6px;
                 padding: 2px 10px;
@@ -103,7 +88,7 @@ class AdminFleetView(QWidget):
         fb_layout.addWidget(self.txt_search, stretch=1)
 
         lbl_filter = QLabel("Trạng thái:")
-        lbl_filter.setStyleSheet("font-weight: bold; font-size: 12px; color: #475569;")
+        lbl_filter.setStyleSheet("font-weight: bold; font-size: 12px; color: #475569; border: none; background: transparent;")
         fb_layout.addWidget(lbl_filter)
 
         self.cbo_status_filter = QComboBox()
@@ -111,7 +96,7 @@ class AdminFleetView(QWidget):
         self.cbo_status_filter.setFixedHeight(30)
         self.cbo_status_filter.setStyleSheet("""
             QComboBox {
-                background-color: #F8FAFC;
+                background-color: #FFFFFF;
                 border: 1px solid #CBD5E1;
                 border-radius: 6px;
                 padding: 2px 10px;
@@ -121,7 +106,7 @@ class AdminFleetView(QWidget):
         self.cbo_status_filter.currentIndexChanged.connect(self._apply_filter)
         fb_layout.addWidget(self.cbo_status_filter)
 
-        layout.addWidget(filter_bar)
+        layout.addLayout(fb_layout)
 
         # 4. Bảng danh sách máy con
         self.tbl_devices = QTableWidget()
@@ -193,9 +178,10 @@ class AdminFleetView(QWidget):
     def _create_hud_card(self, title: str, value: str, accent_color: str, bg_color: str) -> QFrame:
         """Tạo thẻ hiển thị chỉ số HUD phong cách GlassWire."""
         card = QFrame()
+        card.setObjectName("hudCard")
         card.setFixedHeight(74)
         card.setStyleSheet(f"""
-            QFrame {{
+            QFrame#hudCard {{
                 background-color: #FFFFFF;
                 border: 1px solid #E2E8F0;
                 border-left: 4px solid {accent_color};
@@ -207,9 +193,9 @@ class AdminFleetView(QWidget):
         l.setSpacing(2)
 
         lbl_t = QLabel(title)
-        lbl_t.setStyleSheet("font-size: 10px; font-weight: 800; color: #64748B;")
+        lbl_t.setStyleSheet("font-size: 10px; font-weight: 800; color: #64748B; border: none; background: transparent;")
         lbl_v = QLabel(value)
-        lbl_v.setStyleSheet(f"font-size: 18px; font-weight: 800; color: {accent_color};")
+        lbl_v.setStyleSheet(f"font-size: 18px; font-weight: 800; color: {accent_color}; border: none; background: transparent;")
         card.lbl_val = lbl_v  # Gắn thuộc tính để cập nhật sau
 
         l.addWidget(lbl_t)
@@ -273,11 +259,15 @@ class AdminFleetView(QWidget):
         self._render_table(filtered)
 
     def _render_table(self, devices: List[Any]):
-        """Render danh sách máy con vào bảng giao diện."""
-        self.tbl_devices.setRowCount(len(devices))
+        """Render danh sách máy con vào bảng giao diện (hỗ trợ cập nhật tại chỗ In-place tốc độ cao)."""
+        new_uuids = [getattr(d, 'device_uuid', '') for d in devices]
+        structure_changed = (new_uuids != self._rendered_uuids) or (self.tbl_devices.rowCount() != len(devices))
+
+        if structure_changed:
+            self.tbl_devices.setRowCount(len(devices))
+            self._rendered_uuids = new_uuids
 
         for row, dev in enumerate(devices):
-            self.tbl_devices.setRowHeight(row, 48)
             uuid_val = getattr(dev, 'device_uuid', '')
             status = getattr(dev, 'status', 'offline')
             hostname = getattr(dev, 'hostname', 'Unknown')
@@ -287,60 +277,90 @@ class AdminFleetView(QWidget):
             up_kbps = getattr(dev, 'current_up_kbps', 0.0)
             applied = getattr(dev, 'applied_policies', {})
 
+            if structure_changed:
+                self.tbl_devices.setRowHeight(row, 48)
+
             # Cột 0: Trạng thái Badge
-            status_item = QTableWidgetItem(f" {'● ONLINE' if status == 'online' else '○ OFFLINE'} ")
-            status_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            status_text = f" {'● ONLINE' if status == 'online' else '○ OFFLINE'} "
+            status_item = self.tbl_devices.item(row, 0)
+            if not status_item:
+                status_item = QTableWidgetItem()
+                status_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                self.tbl_devices.setItem(row, 0, status_item)
+            status_item.setText(status_text)
             if status == "online":
                 status_item.setForeground(QtGui.QColor("#059669"))
                 status_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
             else:
                 status_item.setForeground(QtGui.QColor("#94A3B8"))
                 status_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Normal))
-            self.tbl_devices.setItem(row, 0, status_item)
 
             # Cột 1: Tên máy & UUID
             short_uuid = uuid_val[:8] + "..." if len(uuid_val) > 8 else uuid_val
-            name_item = QTableWidgetItem(f"💻  {hostname}  ({short_uuid})")
-            name_item.setFont(QtGui.QFont("Segoe UI", 10, QtGui.QFont.Weight.Bold))
-            name_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft)
+            name_text = f"💻  {hostname}  ({short_uuid})"
+            name_item = self.tbl_devices.item(row, 1)
+            if not name_item:
+                name_item = QTableWidgetItem()
+                name_item.setFont(QtGui.QFont("Segoe UI", 10, QtGui.QFont.Weight.Bold))
+                name_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft)
+                self.tbl_devices.setItem(row, 1, name_item)
+            name_item.setText(name_text)
             name_item.setData(QtCore.Qt.ItemDataRole.UserRole, uuid_val)
-            self.tbl_devices.setItem(row, 1, name_item)
 
             # Cột 2: IP
-            ip_item = QTableWidgetItem(ip or "N/A")
-            ip_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            ip_item.setForeground(QtGui.QColor("#334155"))
-            self.tbl_devices.setItem(row, 2, ip_item)
+            ip_item = self.tbl_devices.item(row, 2)
+            if not ip_item:
+                ip_item = QTableWidgetItem()
+                ip_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                ip_item.setForeground(QtGui.QColor("#334155"))
+                self.tbl_devices.setItem(row, 2, ip_item)
+            ip_item.setText(ip or "N/A")
 
             # Cột 3: OS
-            os_item = QTableWidgetItem(os_info)
-            os_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            os_item.setForeground(QtGui.QColor("#64748B"))
-            self.tbl_devices.setItem(row, 3, os_item)
+            os_item = self.tbl_devices.item(row, 3)
+            if not os_item:
+                os_item = QTableWidgetItem()
+                os_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                os_item.setForeground(QtGui.QColor("#64748B"))
+                self.tbl_devices.setItem(row, 3, os_item)
+            os_item.setText(os_info)
 
             # Cột 4: Tải xuống ↓
             down_str = f" {self._format_speed(down_kbps)} ↓ "
-            down_item = QTableWidgetItem(down_str)
-            down_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            down_item = self.tbl_devices.item(row, 4)
+            if not down_item:
+                down_item = QTableWidgetItem()
+                down_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+                self.tbl_devices.setItem(row, 4, down_item)
+            down_item.setText(down_str)
             if status == "online" and down_kbps > 10.0:
                 down_item.setForeground(QtGui.QColor("#D97706"))
                 down_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
             else:
                 down_item.setForeground(QtGui.QColor("#94A3B8"))
-            self.tbl_devices.setItem(row, 4, down_item)
+                down_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Normal))
 
             # Cột 5: Tải lên ↑
             up_str = f" {self._format_speed(up_kbps)} ↑ "
-            up_item = QTableWidgetItem(up_str)
-            up_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            up_item = self.tbl_devices.item(row, 5)
+            if not up_item:
+                up_item = QTableWidgetItem()
+                up_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+                self.tbl_devices.setItem(row, 5, up_item)
+            up_item.setText(up_str)
             if status == "online" and up_kbps > 10.0:
                 up_item.setForeground(QtGui.QColor("#E11D48"))
                 up_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
             else:
                 up_item.setForeground(QtGui.QColor("#94A3B8"))
-            self.tbl_devices.setItem(row, 5, up_item)
+                up_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Normal))
 
             # Cột 6: Chính sách an ninh đang áp dụng
+            policy_item = self.tbl_devices.item(row, 6)
+            if not policy_item:
+                policy_item = QTableWidgetItem()
+                policy_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                self.tbl_devices.setItem(row, 6, policy_item)
             if applied:
                 num_block = sum(1 for p in applied.values() if p.get('action') == 'BLOCK_APP')
                 num_throttle = sum(1 for p in applied.values() if p.get('action') == 'THROTTLE_SET')
@@ -350,62 +370,62 @@ class AdminFleetView(QWidget):
                 if num_throttle > 0:
                     policy_parts.append(f"{num_throttle} Giới hạn")
                 policy_text = ", ".join(policy_parts) or f"{len(applied)} chính sách"
-                policy_item = QTableWidgetItem(f"🛡️ {policy_text}")
+                policy_item.setText(f"🛡️ {policy_text}")
                 policy_item.setForeground(QtGui.QColor("#2563EB"))
                 policy_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
             else:
-                policy_item = QTableWidgetItem("Bình thường")
+                policy_item.setText("Bình thường")
                 policy_item.setForeground(QtGui.QColor("#94A3B8"))
-            policy_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            self.tbl_devices.setItem(row, 6, policy_item)
+                policy_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Normal))
 
-            # Cột 7: Nút bấm Hành Động
-            action_widget = QWidget()
-            action_layout = QHBoxLayout(action_widget)
-            action_layout.setContentsMargins(6, 6, 6, 6)
-            action_layout.setSpacing(8)
+            # Cột 7: Nút bấm Hành Động (Chỉ tạo mới khi cấu trúc bảng thay đổi)
+            if structure_changed or self.tbl_devices.cellWidget(row, 7) is None:
+                action_widget = QWidget()
+                action_layout = QHBoxLayout(action_widget)
+                action_layout.setContentsMargins(6, 6, 6, 6)
+                action_layout.setSpacing(8)
 
-            btn_view = QPushButton("Xem Chi Tiết ➔")
-            btn_view.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-            btn_view.setFixedHeight(30)
-            btn_view.setStyleSheet("""
-                QPushButton {
-                    background-color: #2563EB;
-                    color: #FFFFFF;
-                    font-size: 11px;
-                    font-weight: bold;
-                    border-radius: 6px;
-                    padding: 4px 10px;
-                    border: none;
-                }
-                QPushButton:hover {
-                    background-color: #1D4ED8;
-                }
-            """)
-            btn_view.clicked.connect(lambda checked, uid=uuid_val: self.machine_selected.emit(uid))
-            action_layout.addWidget(btn_view)
+                btn_view = QPushButton("Xem Chi Tiết ➔")
+                btn_view.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+                btn_view.setFixedHeight(30)
+                btn_view.setStyleSheet("""
+                    QPushButton {
+                        background-color: #2563EB;
+                        color: #FFFFFF;
+                        font-size: 11px;
+                        font-weight: bold;
+                        border-radius: 6px;
+                        padding: 4px 10px;
+                        border: none;
+                    }
+                    QPushButton:hover {
+                        background-color: #1D4ED8;
+                    }
+                """)
+                btn_view.clicked.connect(lambda checked, uid=uuid_val: self.machine_selected.emit(uid))
+                action_layout.addWidget(btn_view)
 
-            btn_protect = QPushButton("🛡️ Chặn / QoS")
-            btn_protect.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-            btn_protect.setFixedHeight(30)
-            btn_protect.setStyleSheet("""
-                QPushButton {
-                    background-color: #DC2626;
-                    color: #FFFFFF;
-                    font-size: 11px;
-                    font-weight: bold;
-                    border-radius: 6px;
-                    padding: 4px 10px;
-                    border: none;
-                }
-                QPushButton:hover {
-                    background-color: #B91C1C;
-                }
-            """)
-            btn_protect.clicked.connect(lambda checked, uid=uuid_val: self.machine_protect_requested.emit(uid))
-            action_layout.addWidget(btn_protect)
+                btn_protect = QPushButton("🛡️ Chặn / QoS")
+                btn_protect.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+                btn_protect.setFixedHeight(30)
+                btn_protect.setStyleSheet("""
+                    QPushButton {
+                        background-color: #DC2626;
+                        color: #FFFFFF;
+                        font-size: 11px;
+                        font-weight: bold;
+                        border-radius: 6px;
+                        padding: 4px 10px;
+                        border: none;
+                    }
+                    QPushButton:hover {
+                        background-color: #B91C1C;
+                    }
+                """)
+                btn_protect.clicked.connect(lambda checked, uid=uuid_val: self.machine_protect_requested.emit(uid))
+                action_layout.addWidget(btn_protect)
 
-            self.tbl_devices.setCellWidget(row, 7, action_widget)
+                self.tbl_devices.setCellWidget(row, 7, action_widget)
 
     def _on_table_row_double_clicked(self, row: int, col: int):
         """Khi double click vào dòng nào đó thì mở ngay máy đó."""

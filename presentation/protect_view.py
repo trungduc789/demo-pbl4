@@ -21,7 +21,9 @@ Thiết kế chuẩn xác 100% theo giao diện GlassWire Protect (Firewall):
 - Tích hợp trực tiếp với WinDivert Kernel Packet Shaper của đồ án.
 """
 
-from typing import Dict, List, Optional, Set, Any
+import queue
+import threading
+from typing import Dict, List, Optional, Set, Any, Callable
 import psutil
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtWidgets import (
@@ -92,31 +94,69 @@ class ConnectionPillButton(QPushButton):
     """Nút bấm dạng Pill chuyển trạng thái Allowed / Blocked / Throttled trong bảng."""
     status_changed = QtCore.pyqtSignal(str, str, str)  # (app_name, direction, new_status)
 
-    def __init__(self, app_name: str, direction: str, initial_status: str = "allowed"):
+    def __init__(
+        self,
+        app_name: str,
+        direction: str,
+        initial_status: str = "allowed",
+        next_status_resolver: Optional[Callable[[str], str]] = None,
+    ):
         super().__init__()
         self.app_name = app_name
         self.direction = direction  # "in" hoặc "out"
         self.status = initial_status  # "allowed", "blocked", "throttled"
+        self._next_status_resolver = next_status_resolver
         self.setFixedHeight(24)
         self.setMinimumWidth(72)
         self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
         self._update_style()
         self.clicked.connect(self._toggle_status)
 
     def set_status(self, new_status: str):
+        if self.status == new_status:
+            return
         self.status = new_status
         self._update_style()
 
     def _toggle_status(self):
-        # Chuyển đổi vòng tròn: allowed -> blocked -> throttled -> allowed
-        if self.status == "allowed":
-            self.status = "blocked"
-        elif self.status == "blocked":
-            self.status = "throttled"
+        if self._next_status_resolver:
+            new_st = self._next_status_resolver(self.status)
         else:
-            self.status = "allowed"
+            # Mặc định chuyển đổi trực tiếp Allowed <-> Blocked để thao tác nhanh & an toàn
+            new_st = "blocked" if self.status == "allowed" else "allowed"
+        self.status = new_st
         self._update_style()
-        self.status_changed.emit(self.app_name, self.direction, self.status)
+        # Phát tín hiệu bất đồng bộ qua hàng đợi sự kiện Qt để tránh hủy/chặn C++ stack của nút đang bấm
+        app_name = self.app_name
+        direction = self.direction
+        status = self.status
+        QtCore.QTimer.singleShot(0, lambda: self.status_changed.emit(app_name, direction, status))
+
+    def _show_context_menu(self, pos: QtCore.QPoint):
+        """Menu chuột phải cho phép chọn nhanh Allowed / Blocked / Throttled."""
+        menu = QMenu(self)
+        act_allow = menu.addAction("✅ Allowed (Cho phép)")
+        act_block = menu.addAction("🚫 Blocked (Chặn kết nối)")
+        act_throttle = menu.addAction("⚡ Throttled (Giới hạn QoS)")
+        chosen = menu.exec(self.mapToGlobal(pos))
+        if not chosen:
+            return
+        target_status = self.status
+        if chosen == act_allow:
+            target_status = "allowed"
+        elif chosen == act_block:
+            target_status = "blocked"
+        elif chosen == act_throttle:
+            target_status = "throttled"
+        if target_status != self.status or target_status == "throttled":
+            self.status = target_status
+            self._update_style()
+            app_name = self.app_name
+            direction = self.direction
+            status = self.status
+            QtCore.QTimer.singleShot(0, lambda: self.status_changed.emit(app_name, direction, status))
 
     def _update_style(self):
         if self.status == "allowed":
@@ -176,21 +216,65 @@ class GlassWireProtectView(QWidget):
     """
     policy_changed = QtCore.pyqtSignal(str, str, str, float)  # app, direction, action, limit_kbps
 
-    def __init__(self, monitor_service=None, icon_manager=None, fleet_service=None):
+    def __init__(self, monitor_service=None, icon_manager=None, fleet_service=None, agent_service=None):
         super().__init__()
         self.service = monitor_service
         self.icon_manager = icon_manager
         self.fleet_service = fleet_service
+        self.agent_service = agent_service
         self.is_firewall_active = True
         self.firewall_mode = "Click To Block"
         self.default_throttle_kbps = 100.0
+        self._status_filter_mode = "all"  # "all", "blocked_or_throttled", "allowed"
 
-        # {app_name: {"in": "allowed"|"blocked"|"throttled", "out": ..., "limit_kbps": 100.0}}
+        # {app_name: {"in": "allowed"|"blocked"|"throttled", "out": ..., "limit_kbps": 100.0, "source": "ADMIN"|"LOCAL", "locked_by_admin": bool}}
         self.app_policies: Dict[str, Dict] = {}
+        self._effective_status_history: Dict[str, str] = {}
         self.remote_device_uuid: Optional[str] = None
         self.remote_commander: Optional[Any] = None
 
+        # Cấu trúc giữ cố định thứ tự dòng và widget để bảng KHÔNG BAO GIỜ nhảy loạn hoặc crash
+        self._row_app_order: List[str] = []
+        self._app_row_map: Dict[str, int] = {}
+        self._row_pills: Dict[str, Dict[str, ConnectionPillButton]] = {}
+        self._known_device_snapshot: List[tuple] = []
+
+        # Hàng đợi thực thi lệnh nền tuần tự để bấm liên tục 10-20 lần không gây đơ/crash UI
+        self._cmd_queue: queue.Queue = queue.Queue()
+        self._cmd_worker = threading.Thread(
+            target=self._command_worker_loop, daemon=True, name="ProtectView-CmdWorker"
+        )
+        self._cmd_worker.start()
+
         self._init_ui()
+
+    def _resolve_next_pill_status(self, current_status: str) -> str:
+        """
+        Xác định trạng thái kế tiếp khi click vào nút Pill dựa trên chế độ Firewall Mode:
+        - Click To Block: Chuyển trực tiếp Allowed <-> Blocked (không bật nhầm popup Throttle).
+        - Click To Throttle: Chuyển trực tiếp Allowed <-> Throttled.
+        - Block All: Chuyển trực tiếp Allowed <-> Blocked.
+        """
+        if self.firewall_mode == "Click To Throttle":
+            return "throttled" if current_status == "allowed" else "allowed"
+        return "blocked" if current_status == "allowed" else "allowed"
+
+    def _command_worker_loop(self):
+        """Luồng nền thực thi tuần tự các lệnh Block / Unblock / Throttle để không bao giờ khóa cứng GUI."""
+        while True:
+            try:
+                task = self._cmd_queue.get()
+                if task is None:
+                    break
+                fn = task
+                fn()
+            except Exception as e:
+                print(f"[Protect CmdWorker Error] {e}")
+            finally:
+                try:
+                    self._cmd_queue.task_done()
+                except Exception:
+                    pass
 
     def set_fleet_service(self, fleet_service):
         """Kích hoạt dịch vụ quản trị Fleet và thanh chọn máy con trên giao diện Protect."""
@@ -199,30 +283,54 @@ class GlassWireProtectView(QWidget):
             self.device_selector_widget.setVisible(bool(fleet_service is not None))
             self.refresh_fleet_devices_dropdown()
 
+    def _clear_table_state(self):
+        """Làm sạch bảng khi chuyển đổi giữa các máy con khác nhau."""
+        self._row_app_order.clear()
+        self._app_row_map.clear()
+        self._row_pills.clear()
+        self.table.setRowCount(0)
+
     def set_remote_mode(self, device_uuid: Optional[str], commander_func: Optional[Any]):
         """Cấu hình chế độ can thiệp từ xa tới máy con cụ thể."""
+        device_changed = (device_uuid != self.remote_device_uuid)
         self.remote_device_uuid = device_uuid
         self.remote_commander = commander_func
+
+        if device_changed:
+            self.app_policies.clear()
+            self._effective_status_history.clear()
+            self._clear_table_state()
+
         if device_uuid:
             dev_state = self.fleet_service.get_device_state(device_uuid) if self.fleet_service else None
-            hname = dev_state.hostname if dev_state else device_uuid[:8]
-            ip = dev_state.ip_address if dev_state else "127.0.0.1"
-            self.lbl_driver_status.setText(f"📡 Đang can thiệp máy con: {hname} ({ip}) [UUID: {device_uuid[:8]}...] (Sẵn sàng gửi lệnh)")
-            self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #2563EB;")
 
             # Đồng bộ lại chính sách đã áp dụng trên máy này
             if dev_state and dev_state.applied_policies:
                 for app_k, pol in dev_state.applied_policies.items():
                     act = pol.get("action")
+                    # Khớp lại tên hiển thị nếu đã có trong bảng
+                    matched_name = app_k
+                    for existing_name in self._row_app_order:
+                        if existing_name.lower() == app_k.lower():
+                            matched_name = existing_name
+                            break
                     if act == "BLOCK_APP":
-                        self.app_policies[app_k] = {"in": "blocked", "out": "blocked"}
+                        self.app_policies[matched_name] = {"in": "blocked", "out": "blocked"}
+                        self._effective_status_history[matched_name] = "blocked"
                     elif act == "THROTTLE_SET":
                         lim = pol.get("limit_kbps", 100.0)
-                        self.app_policies[app_k] = {"in": "throttled", "out": "throttled", "limit_kbps": lim}
-        else:
-            self.lbl_driver_status.setText("🛡️ WinDivert Engine: Đang bảo vệ | Kernel Throttling: Sẵn sàng")
-            self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #059669;")
+                        self.app_policies[matched_name] = {"in": "throttled", "out": "throttled", "limit_kbps": lim}
+                        self._effective_status_history[matched_name] = "throttled"
 
+            # Đảm bảo combobox hiển thị đúng máy con đang chọn
+            self.refresh_fleet_devices_dropdown()
+        else:
+            if hasattr(self, "combo_target_device"):
+                self.combo_target_device.blockSignals(True)
+                self.combo_target_device.setCurrentIndex(0)
+                self.combo_target_device.blockSignals(False)
+
+        self._sync_all_pills_from_policies()
 
     def _init_ui(self):
         main_layout = QVBoxLayout(self)
@@ -232,21 +340,13 @@ class GlassWireProtectView(QWidget):
         # ---------------------------------------------------------------------
         # 1. THANH ĐIỀU KHIỂN TRÊN CÙNG (FIREWALL CONTROLS BAR)
         # ---------------------------------------------------------------------
-        top_bar = QFrame()
-        top_bar.setStyleSheet("""
-            QFrame {
-                background-color: #FFFFFF;
-                border-bottom: 1px solid #F1F5F9;
-                padding-bottom: 8px;
-            }
-        """)
-        tb_layout = QHBoxLayout(top_bar)
-        tb_layout.setContentsMargins(0, 0, 0, 0)
+        tb_layout = QHBoxLayout()
+        tb_layout.setContentsMargins(0, 0, 0, 4)
         tb_layout.setSpacing(14)
 
         # Khối Công tắc Firewall
         lbl_fw = QLabel("Firewall")
-        lbl_fw.setStyleSheet("font-size: 12px; font-weight: bold; color: #475569;")
+        lbl_fw.setStyleSheet("font-size: 12px; font-weight: bold; color: #475569; border: none; background: transparent;")
         tb_layout.addWidget(lbl_fw)
 
         self.btn_fw_switch = FirewallSwitchButton()
@@ -293,7 +393,8 @@ class GlassWireProtectView(QWidget):
         # Ô tìm kiếm tiến trình
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("🔍 Search active apps...")
-        self.search_input.setFixedWidth(180)
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setFixedWidth(200)
         self.search_input.setFixedHeight(30)
         self.search_input.setStyleSheet("""
             QLineEdit {
@@ -315,6 +416,7 @@ class GlassWireProtectView(QWidget):
         self.btn_filter = QPushButton(" Filter")
         self.btn_filter.setIcon(get_filter_icon())
         self.btn_filter.setFixedHeight(30)
+        self.btn_filter.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self.btn_filter.setStyleSheet("""
             QPushButton {
                 background-color: #FFFFFF;
@@ -330,28 +432,22 @@ class GlassWireProtectView(QWidget):
                 color: #0F172A;
             }
         """)
+        self.btn_filter.clicked.connect(self._show_filter_menu)
         tb_layout.addWidget(self.btn_filter)
 
-        main_layout.addWidget(top_bar)
+        main_layout.addLayout(tb_layout)
 
         # ---------------------------------------------------------------------
         # 1.5. THANH CHỌN MÁY CON CHO CHẾ ĐỘ QUẢN TRỊ ADMIN (FLEET DEVICE SELECTOR)
         # ---------------------------------------------------------------------
-        self.device_selector_widget = QFrame()
-        self.device_selector_widget.setStyleSheet("""
-            QFrame {
-                background-color: #EFF6FF;
-                border: 1px solid #BFDBFE;
-                border-radius: 8px;
-                padding: 4px 10px;
-            }
-        """)
+        self.device_selector_widget = QWidget()
+        self.device_selector_widget.setStyleSheet("background: transparent; border: none;")
         dsw_layout = QHBoxLayout(self.device_selector_widget)
-        dsw_layout.setContentsMargins(8, 4, 8, 4)
+        dsw_layout.setContentsMargins(0, 0, 0, 0)
         dsw_layout.setSpacing(10)
 
-        lbl_target = QLabel("🎯 Máy con mục tiêu can thiệp:")
-        lbl_target.setStyleSheet("font-size: 12px; font-weight: bold; color: #1E40AF;")
+        lbl_target = QLabel("🎯 Máy con mục tiêu:")
+        lbl_target.setStyleSheet("font-size: 12px; font-weight: bold; color: #1E40AF; border: none; background: transparent;")
         dsw_layout.addWidget(lbl_target)
 
         self.combo_target_device = QComboBox()
@@ -366,6 +462,14 @@ class GlassWireProtectView(QWidget):
                 background-color: #FFFFFF;
                 color: #1E3A8A;
                 min-width: 280px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #FFFFFF;
+                color: #1E293B;
+                selection-background-color: #DBEAFE;
+                selection-color: #1E3A8A;
+                border: 1px solid #93C5FD;
+                padding: 4px;
             }
         """)
         self.combo_target_device.currentIndexChanged.connect(self._on_device_combo_changed)
@@ -452,13 +556,13 @@ class GlassWireProtectView(QWidget):
         main_layout.addLayout(group_bar)
 
         # ---------------------------------------------------------------------
-        # 3. BẢNG ACTIVE APPS CHUẨN GLASSWIRE
+        # 3. BẢNG ACTIVE APPS CHUẨN GLASSWIRE (DỮ LIỆU THỰC TẾ 100%)
         # ---------------------------------------------------------------------
         self.table = QTableWidget()
         self.table.setColumnCount(10)
         self.table.setHorizontalHeaderLabels([
             "", "App", "In Connections", "Out Connections",
-            "Version", "Hosts", "VirusTotal", "↓", "↑", "Traffic"
+            "PID", "Nguồn Luật", "Mức Trần QoS", "↓", "↑", "Traffic"
         ])
 
         header = self.table.horizontalHeader()
@@ -466,20 +570,28 @@ class GlassWireProtectView(QWidget):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(9, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(9, QHeaderView.ResizeMode.Fixed)
 
+        # Cố định độ rộng các cột để bảng không bị co giật ngang khi số liệu nhảy
         self.table.setColumnWidth(0, 36)
-        self.table.setColumnWidth(2, 110)
-        self.table.setColumnWidth(3, 110)
-        self.table.setColumnWidth(6, 90)
+        self.table.setColumnWidth(2, 115)
+        self.table.setColumnWidth(3, 115)
+        self.table.setColumnWidth(4, 70)
+        self.table.setColumnWidth(5, 110)
+        self.table.setColumnWidth(6, 115)
+        self.table.setColumnWidth(7, 90)
+        self.table.setColumnWidth(8, 90)
+        self.table.setColumnWidth(9, 95)
 
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(38)
         self.table.setShowGrid(False)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setStyleSheet("""
@@ -505,295 +617,543 @@ class GlassWireProtectView(QWidget):
 
         main_layout.addWidget(self.table, stretch=1)
 
-        # ---------------------------------------------------------------------
-        # 4. THANH TRẠNG THÁI WINDIVERT DƯỚI ĐÁY
-        # ---------------------------------------------------------------------
-        bottom_status = QFrame()
-        bottom_status.setStyleSheet("background-color: #FAFAFA; border-radius: 6px; padding: 6px 12px;")
-        bs_layout = QHBoxLayout(bottom_status)
-        bs_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.lbl_driver_status = QLabel("🛡️ WinDivert Engine: Đang bảo vệ | Kernel Throttling: Sẵn sàng")
-        self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #059669;")
-        bs_layout.addWidget(self.lbl_driver_status)
-        bs_layout.addStretch()
-
-        self.lbl_active_blocks = QLabel("0 tiến trình đang bị điều tiết / chặn")
-        self.lbl_active_blocks.setStyleSheet("font-size: 11px; font-weight: 500; color: #64748B;")
-        bs_layout.addWidget(self.lbl_active_blocks)
-
-        main_layout.addWidget(bottom_status)
-
     def _on_firewall_toggled(self, is_active: bool):
         self.is_firewall_active = is_active
         if self.remote_device_uuid and self.remote_commander:
+            uid = self.remote_device_uuid
+            commander = self.remote_commander
             if not is_active:
-                self.remote_commander(self.remote_device_uuid, "UNBLOCK_ALL", "", 0.0, "both")
-                self.remote_commander(self.remote_device_uuid, "REMOVE_LIMIT", "", 0.0, "both")
-                self.lbl_driver_status.setText(f"⚠️ Remote Firewall [{self.remote_device_uuid[:8]}]: Đã TẮT toàn bộ chính sách")
-                self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #DC2626;")
-            else:
-                self.lbl_driver_status.setText(f"🛡️ Remote Firewall [{self.remote_device_uuid[:8]}]: Đã BẬT")
-                self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #059669;")
+                self._cmd_queue.put(lambda: (
+                    commander(uid, "UNBLOCK_ALL", "", 0.0, "both"),
+                    commander(uid, "REMOVE_LIMIT", "", 0.0, "both")
+                ))
             return
 
         if not is_active:
-            try:
-                if self.service and hasattr(self.service, 'packet_shaper'):
-                    self.service.packet_shaper.stop()
-                self.lbl_driver_status.setText("⚠️ WinDivert Engine: Đã TẮT (Cho phép toàn bộ lưu lượng không giới hạn)")
-                self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #DC2626;")
-            except Exception as e:
-                print(f"[Protect] Lỗi tắt shaper: {e}")
+            def _stop_local():
+                try:
+                    if self.service and hasattr(self.service, 'packet_shaper'):
+                        self.service.packet_shaper.stop()
+                except Exception as e:
+                    print(f"[Protect] Lỗi tắt shaper: {e}")
+            self._cmd_queue.put(_stop_local)
         else:
-            self.lbl_driver_status.setText("🛡️ WinDivert Engine: Đang bảo vệ | Kernel Throttling: Sẵn sàng")
-            self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #059669;")
-            self._reapply_all_policies()
-
+            self._cmd_queue.put(self._reapply_all_policies)
 
     def _on_mode_changed(self, idx: int):
         modes = ["Click To Block", "Click To Throttle", "Block All"]
         self.firewall_mode = modes[min(idx, len(modes) - 1)]
 
-    def _filter_table(self, query: str):
-        query = query.strip().lower()
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 1)
-            if item:
-                text = item.text().lower()
-                self.table.setRowHidden(row, bool(query and query not in text))
+    def _show_filter_menu(self):
+        """Hiển thị menu lọc trạng thái ứng dụng."""
+        menu = QMenu(self)
+        act_all = menu.addAction("📋 Tất cả ứng dụng")
+        act_blocked = menu.addAction("🚫 Đang bị Chặn / Giới hạn (Blocked / Throttled)")
+        act_allowed = menu.addAction("✅ Đang Cho phép (Allowed)")
+
+        chosen = menu.exec(self.btn_filter.mapToGlobal(QtCore.QPoint(0, self.btn_filter.height())))
+        if not chosen:
+            return
+        if chosen == act_all:
+            self._status_filter_mode = "all"
+            self.btn_filter.setText(" Filter")
+        elif chosen == act_blocked:
+            self._status_filter_mode = "blocked_or_throttled"
+            self.btn_filter.setText(" Filter: Chặn/QoS")
+        elif chosen == act_allowed:
+            self._status_filter_mode = "allowed"
+            self.btn_filter.setText(" Filter: Allowed")
+        self._apply_all_rows_visibility()
+
+    def _should_hide_row(self, app_name: str) -> bool:
+        """Kiểm tra dòng của `app_name` có cần ẩn theo ô tìm kiếm và bộ lọc trạng thái hay không."""
+        query = self.search_input.text().strip().lower()
+        if query and query not in app_name.lower():
+            return True
+
+        if self._status_filter_mode != "all":
+            pol = self.app_policies.get(app_name, {"in": "allowed", "out": "allowed"})
+            eff = self._get_effective_status(pol.get("in", "allowed"), pol.get("out", "allowed"))
+            if self._status_filter_mode == "blocked_or_throttled" and eff == "allowed":
+                return True
+            if self._status_filter_mode == "allowed" and eff != "allowed":
+                return True
+
+        return False
+
+    def _apply_all_rows_visibility(self):
+        """Áp dụng bộ lọc tìm kiếm lên toàn bộ các dòng mà không làm xáo trộn thứ tự."""
+        visible_count = 0
+        for row, app_name in enumerate(self._row_app_order):
+            if row < self.table.rowCount():
+                hide = self._should_hide_row(app_name)
+                self.table.setRowHidden(row, hide)
+                if not hide:
+                    visible_count += 1
+
+        total = len(self._row_app_order)
+        if self.search_input.text().strip() or self._status_filter_mode != "all":
+            self.lbl_app_count.setText(f"({visible_count}/{total} running)")
+        else:
+            self.lbl_app_count.setText(f"({total} running)")
+
+    def _filter_table(self, _query: str = ""):
+        self._apply_all_rows_visibility()
+
+    def sync_from_agent_policies(self):
+        """Đồng bộ trạng thái chính sách 2 lớp từ ClientAgentService sang bảng Protect."""
+        if not self.agent_service or self.remote_device_uuid:
+            return
+        active_pols = getattr(self.agent_service, "active_policies", {})
+        matched_apps = set()
+
+        for app_k, pol in list(active_pols.items()):
+            raw_app_name = pol.get("app", app_k)
+            matched_name = raw_app_name
+            for existing_name in list(self._row_app_order) + list(self.app_policies.keys()):
+                if existing_name.lower() == app_k.lower() or existing_name.lower() == raw_app_name.lower():
+                    matched_name = existing_name
+                    break
+            matched_apps.add(matched_name)
+            act = pol.get("action", "BLOCK")
+            st = "blocked" if act == "BLOCK" else "throttled"
+            lim = float(pol.get("limit_kbps", self.default_throttle_kbps))
+            is_admin = bool(pol.get("locked_by_admin", pol.get("source", "ADMIN") == "ADMIN"))
+            self.app_policies[matched_name] = {
+                "in": st,
+                "out": st,
+                "limit_kbps": lim,
+                "source": "ADMIN" if is_admin else "LOCAL",
+                "locked_by_admin": is_admin,
+            }
+            self._effective_status_history[matched_name] = st
+
+        for app_name in list(self.app_policies.keys()):
+            if app_name not in matched_apps:
+                if self.agent_service.get_policy_for_app(app_name) is None:
+                    self.app_policies[app_name]["in"] = "allowed"
+                    self.app_policies[app_name]["out"] = "allowed"
+                    self.app_policies[app_name]["source"] = ""
+                    self.app_policies[app_name]["locked_by_admin"] = False
+                    self._effective_status_history[app_name] = "allowed"
+
+    def _format_policy_columns(self, app_name: str) -> tuple:
+        """Trả về (source_text, source_color, qos_text, qos_color) thực tế cho ứng dụng."""
+        pol = self.app_policies.get(app_name, {"in": "allowed", "out": "allowed"})
+        eff = self._get_effective_status(pol.get("in", "allowed"), pol.get("out", "allowed"))
+        if eff == "allowed":
+            return "—", "#94A3B8", "Không giới hạn", "#059669"
+
+        if self.remote_device_uuid:
+            src_text, src_color = "🔒 Admin Server", "#DC2626"
+        elif pol.get("locked_by_admin") or pol.get("source") == "ADMIN":
+            src_text, src_color = "🔒 Admin Server", "#DC2626"
+        else:
+            src_text, src_color = "🔓 Cục Bộ", "#2563EB"
+
+        if eff == "blocked":
+            return src_text, src_color, "🚫 Chặn (0 KB/s)", "#DC2626"
+        lim = float(pol.get("limit_kbps", self.default_throttle_kbps))
+        return src_text, src_color, f"⚡ {lim:,.0f} KB/s", "#D97706"
+
+    def _update_row_policy_columns(self, row: int, app_name: str, pid: Optional[int] = None):
+        """Cập nhật cột PID (4), Nguồn Luật (5), và Mức Trần QoS (6) theo thời gian thực."""
+        if pid is not None:
+            pid_str = str(pid) if pid > 0 else "—"
+            it_pid = self.table.item(row, 4)
+            if it_pid and it_pid.text() != pid_str:
+                it_pid.setText(pid_str)
+
+        src_text, src_color, qos_text, qos_color = self._format_policy_columns(app_name)
+        it_src = self.table.item(row, 5)
+        if it_src:
+            if it_src.text() != src_text:
+                it_src.setText(src_text)
+            it_src.setForeground(QtGui.QBrush(QtGui.QColor(src_color)))
+
+        it_qos = self.table.item(row, 6)
+        if it_qos:
+            if it_qos.text() != qos_text:
+                it_qos.setText(qos_text)
+            it_qos.setForeground(QtGui.QBrush(QtGui.QColor(qos_color)))
+
+    def _sync_all_pills_from_policies(self):
+        """Đồng bộ trạng thái hiển thị của các nút Pill hiện có theo self.app_policies."""
+        for app_name, pills in self._row_pills.items():
+            pol = self.app_policies.get(app_name, {"in": "allowed", "out": "allowed"})
+            in_btn = pills.get("in")
+            out_btn = pills.get("out")
+            if in_btn:
+                in_btn.set_status(pol.get("in", "allowed"))
+            if out_btn:
+                out_btn.set_status(pol.get("out", "allowed"))
+            row = self._app_row_map.get(app_name)
+            if row is not None and row < self.table.rowCount():
+                self._update_row_policy_columns(row, app_name)
+
+    def _append_new_app_row(self, info: Dict):
+        """Thêm một dòng mới cố định vào cuối bảng cho ứng dụng lần đầu xuất hiện."""
+        name = info.get("name", "Unknown")
+        pid = info.get("pid", 0)
+        down_kb = info.get("down_kb", 0.0)
+        up_kb = info.get("up_kb", 0.0)
+        exe_path = info.get("exe", "")
+        total_b = info.get("total_bytes", 0.0)
+
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setRowHeight(row, 38)
+
+        self._row_app_order.append(name)
+        self._app_row_map[name] = row
+
+        # Cột 0: Checkbox
+        chk = QCheckBox()
+        chk.setStyleSheet("margin-left: 8px;")
+        self.table.setCellWidget(row, 0, chk)
+
+        # Cột 1: App icon + name
+        item_name = QTableWidgetItem(f"  {name}")
+        item_name.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+        item_name.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
+        if self.icon_manager:
+            icon = self.icon_manager.get_icon(exe_path, name)
+            item_name.setIcon(icon)
+        self.table.setItem(row, 1, item_name)
+
+        # Cột 2 & 3: In Connections & Out Connections (Tạo 1 lần duy nhất, không bao giờ xóa khi update)
+        curr_policy = self.app_policies.get(name, {"in": "allowed", "out": "allowed"})
+        btn_in = ConnectionPillButton(
+            name, "in", curr_policy.get("in", "allowed"),
+            next_status_resolver=self._resolve_next_pill_status
+        )
+        btn_in.status_changed.connect(self._on_pill_status_changed)
+
+        box_in = QWidget()
+        layout_in = QHBoxLayout(box_in)
+        layout_in.setContentsMargins(4, 2, 4, 2)
+        layout_in.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        layout_in.addWidget(btn_in)
+        self.table.setCellWidget(row, 2, box_in)
+
+        btn_out = ConnectionPillButton(
+            name, "out", curr_policy.get("out", "allowed"),
+            next_status_resolver=self._resolve_next_pill_status
+        )
+        btn_out.status_changed.connect(self._on_pill_status_changed)
+
+        box_out = QWidget()
+        layout_out = QHBoxLayout(box_out)
+        layout_out.setContentsMargins(4, 2, 4, 2)
+        layout_out.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        layout_out.addWidget(btn_out)
+        self.table.setCellWidget(row, 3, box_out)
+
+        self._row_pills[name] = {"in": btn_in, "out": btn_out}
+
+        # Cột 4: PID thực tế
+        pid_str = str(pid) if pid > 0 else "—"
+        item_pid = QTableWidgetItem(pid_str)
+        item_pid.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        item_pid.setForeground(QtGui.QBrush(QtGui.QColor("#64748B")))
+        self.table.setItem(row, 4, item_pid)
+
+        src_text, src_color, qos_text, qos_color = self._format_policy_columns(name)
+
+        # Cột 5: Nguồn Luật (Admin / Cục bộ)
+        item_src = QTableWidgetItem(src_text)
+        item_src.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        item_src.setForeground(QtGui.QBrush(QtGui.QColor(src_color)))
+        item_src.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+        self.table.setItem(row, 5, item_src)
+
+        # Cột 6: Mức Trần QoS thực tế
+        item_qos = QTableWidgetItem(qos_text)
+        item_qos.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        item_qos.setForeground(QtGui.QBrush(QtGui.QColor(qos_color)))
+        item_qos.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+        self.table.setItem(row, 6, item_qos)
+
+        # Cột 7: Download Speed
+        down_str = f"{down_kb:,.1f} KB/s" if down_kb >= 1.0 else f"{down_kb * 1024:,.0f} B/s"
+        item_down = QTableWidgetItem(down_str)
+        item_down.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        item_down.setForeground(QtGui.QBrush(QtGui.QColor("#D97706")))
+        self.table.setItem(row, 7, item_down)
+
+        # Cột 8: Upload Speed
+        up_str = f"{up_kb:,.1f} KB/s" if up_kb >= 1.0 else f"{up_kb * 1024:,.0f} B/s"
+        item_up = QTableWidgetItem(up_str)
+        item_up.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        item_up.setForeground(QtGui.QBrush(QtGui.QColor("#EA580C")))
+        self.table.setItem(row, 8, item_up)
+
+        # Cột 9: Total Traffic
+        traffic_str = self._format_bytes(total_b)
+        item_traffic = QTableWidgetItem(traffic_str)
+        item_traffic.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        item_traffic.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
+        self.table.setItem(row, 9, item_traffic)
+
+        # Áp dụng ngay trạng thái ẩn/hiện nếu người dùng đang tìm kiếm
+        self.table.setRowHidden(row, self._should_hide_row(name))
+
+    def _update_existing_app_row(self, row: int, info: Dict):
+        """Cập nhật tại chỗ (in-place) các ô số liệu của dòng hiện có mà không tạo lại widget."""
+        name = info.get("name", "Unknown")
+        pid = info.get("pid", 0)
+        down_kb = info.get("down_kb", 0.0)
+        up_kb = info.get("up_kb", 0.0)
+        total_b = info.get("total_bytes", 0.0)
+
+        down_str = f"{down_kb:,.1f} KB/s" if down_kb >= 1.0 else f"{down_kb * 1024:,.0f} B/s"
+        item_down = self.table.item(row, 7)
+        if item_down and item_down.text() != down_str:
+            item_down.setText(down_str)
+
+        up_str = f"{up_kb:,.1f} KB/s" if up_kb >= 1.0 else f"{up_kb * 1024:,.0f} B/s"
+        item_up = self.table.item(row, 8)
+        if item_up and item_up.text() != up_str:
+            item_up.setText(up_str)
+
+        traffic_str = self._format_bytes(total_b)
+        item_traffic = self.table.item(row, 9)
+        if item_traffic and item_traffic.text() != traffic_str:
+            item_traffic.setText(traffic_str)
+
+        self._update_row_policy_columns(row, name, pid if pid > 0 else None)
+
+        # Đảm bảo pill khớp với chính sách lưu trữ
+        pol = self.app_policies.get(name, {"in": "allowed", "out": "allowed"})
+        pills = self._row_pills.get(name)
+        if pills:
+            in_btn = pills.get("in")
+            out_btn = pills.get("out")
+            if in_btn:
+                in_btn.set_status(pol.get("in", "allowed"))
+            if out_btn:
+                out_btn.set_status(pol.get("out", "allowed"))
 
     def update_protect_table(self, proc_speeds: List[Dict],
                              app_accumulated: Dict[str, Dict[str, float]],
                              app_metadata: Dict[str, Dict]):
-        """Cập nhật dữ liệu thời gian thực vào bảng Active Apps."""
-        # Tập hợp tất cả các ứng dụng có phát sinh lưu lượng hoặc đang chạy
-        seen_names = set()
-        active_apps = []
+        """
+        Cập nhật dữ liệu thời gian thực vào bảng Active Apps:
+        - Giữ cố định 100% vị trí các dòng đã hiển thị (không nhảy thứ tự).
+        - Cập nhật tại chỗ (in-place) tốc độ & lưu lượng mà không xóa/tạo lại nút bấm.
+        - Giữ nguyên kết quả tìm kiếm và vị trí cuộn của người dùng.
+        """
+        if self.agent_service and not self.remote_device_uuid:
+            self.sync_from_agent_policies()
 
-        # 1. Các ứng dụng có tốc độ chu kỳ hiện tại
+        apps_by_name: Dict[str, Dict] = {}
+        ordered_candidates: List[str] = []
+
+        # 1. Thu thập tốc độ chu kỳ hiện tại
         for p in proc_speeds:
             name = p.get("name", "")
-            if name and name != "All apps" and name not in seen_names:
-                seen_names.add(name)
-                active_apps.append(p)
+            if not name or name == "All apps":
+                continue
+            if name not in apps_by_name:
+                acc = app_accumulated.get(name, {"down": 0.0, "up": 0.0})
+                total_b = acc.get("down", 0.0) + acc.get("up", 0.0)
+                apps_by_name[name] = {
+                    "name": name,
+                    "pid": p.get("pid", 0) or app_metadata.get(name, {}).get("pid", 0),
+                    "down_kb": float(p.get("down_kb", 0.0)),
+                    "up_kb": float(p.get("up_kb", 0.0)),
+                    "exe": p.get("exe", "") or app_metadata.get(name, {}).get("exe", ""),
+                    "total_bytes": total_b,
+                }
+                ordered_candidates.append(name)
 
-        # 2. Các ứng dụng đã có tích lũy lưu lượng
+        # 2. Thu thập các ứng dụng đã có tích lũy lưu lượng
         for name, acc in app_accumulated.items():
-            if name != "All apps" and name not in seen_names:
-                seen_names.add(name)
-                active_apps.append({
+            if not name or name == "All apps":
+                continue
+            if name not in apps_by_name:
+                total_b = acc.get("down", 0.0) + acc.get("up", 0.0)
+                apps_by_name[name] = {
                     "name": name,
                     "pid": app_metadata.get(name, {}).get("pid", 0),
                     "down_kb": 0.0,
                     "up_kb": 0.0,
-                    "exe": app_metadata.get(name, {}).get("exe", "")
-                })
+                    "exe": app_metadata.get(name, {}).get("exe", ""),
+                    "total_bytes": total_b,
+                }
+                ordered_candidates.append(name)
 
-        if not active_apps:
-            # Fallback nếu chưa có dữ liệu mạng
-            for fallback_name in ["Google Chrome", "Microsoft Edge", "Riot Client", "NVIDIA App", "GlassWire Control Service"]:
-                active_apps.append({
-                    "name": fallback_name,
-                    "pid": 1000,
+        # 3. Giữ lại các ứng dụng đang có trong bảng hoặc đang có chính sách chặn/QoS
+        for name in list(self._row_app_order) + list(self.app_policies.keys()):
+            if name and name != "All apps" and name not in apps_by_name:
+                acc = app_accumulated.get(name, {"down": 0.0, "up": 0.0})
+                total_b = acc.get("down", 0.0) + acc.get("up", 0.0)
+                apps_by_name[name] = {
+                    "name": name,
+                    "pid": app_metadata.get(name, {}).get("pid", 0),
                     "down_kb": 0.0,
                     "up_kb": 0.0,
-                    "exe": ""
-                })
+                    "exe": app_metadata.get(name, {}).get("exe", ""),
+                    "total_bytes": total_b,
+                }
+                ordered_candidates.append(name)
 
-        self.lbl_app_count.setText(f"({len(active_apps)} running)")
-        self.table.clearContents()
-        self.table.setRowCount(len(active_apps))
+        self.table.setUpdatesEnabled(False)
+        try:
+            # Cập nhật tại chỗ các dòng đã tồn tại theo đúng vị trí cố định
+            for row, existing_name in enumerate(self._row_app_order):
+                info = apps_by_name.get(existing_name)
+                if info is not None:
+                    self._update_existing_app_row(row, info)
 
-        for row, p in enumerate(active_apps):
-            name = p.get("name", "Unknown")
-            pid = p.get("pid", 0)
-            down_kb = p.get("down_kb", 0.0)
-            up_kb = p.get("up_kb", 0.0)
-            exe_path = p.get("exe", "") or app_metadata.get(name, {}).get("exe", "")
+            # Chỉ thêm vào cuối bảng những ứng dụng mới xuất hiện lần đầu
+            for cand_name in ordered_candidates:
+                if cand_name not in self._app_row_map:
+                    self._append_new_app_row(apps_by_name[cand_name])
+        finally:
+            self.table.setUpdatesEnabled(True)
 
-            # Cột 0: Checkbox
-            chk = QCheckBox()
-            chk.setStyleSheet("margin-left: 8px;")
-            self.table.setCellWidget(row, 0, chk)
-
-            # Cột 1: App icon + name
-            item_name = QTableWidgetItem(f"  {name}")
-            item_name.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-            item_name.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
-            if self.icon_manager:
-                icon = self.icon_manager.get_icon(exe_path, name)
-                item_name.setIcon(icon)
-            self.table.setItem(row, 1, item_name)
-
-            # Cột 2 & 3: In Connections & Out Connections
-            curr_policy = self.app_policies.get(name, {"in": "allowed", "out": "allowed"})
-            btn_in = ConnectionPillButton(name, "in", curr_policy.get("in", "allowed"))
-            btn_in.status_changed.connect(self._on_pill_status_changed)
-            
-            box_in = QWidget()
-            layout_in = QHBoxLayout(box_in)
-            layout_in.setContentsMargins(4, 2, 4, 2)
-            layout_in.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            layout_in.addWidget(btn_in)
-            self.table.setCellWidget(row, 2, box_in)
-
-            btn_out = ConnectionPillButton(name, "out", curr_policy.get("out", "allowed"))
-            btn_out.status_changed.connect(self._on_pill_status_changed)
-            
-            box_out = QWidget()
-            layout_out = QHBoxLayout(box_out)
-            layout_out.setContentsMargins(4, 2, 4, 2)
-            layout_out.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            layout_out.addWidget(btn_out)
-            self.table.setCellWidget(row, 3, box_out)
-
-            # Cột 4: Version / Info
-            ver_text = "System Service" if pid <= 4 else "x64 Application"
-            item_ver = QTableWidgetItem(ver_text)
-            item_ver.setForeground(QtGui.QBrush(QtGui.QColor("#64748B")))
-            self.table.setItem(row, 4, item_ver)
-
-            # Cột 5: Hosts
-            item_hosts = QTableWidgetItem("127.0.0.1:*" if pid <= 4 else "Multiple IPs")
-            item_hosts.setForeground(QtGui.QBrush(QtGui.QColor("#64748B")))
-            self.table.setItem(row, 5, item_hosts)
-
-            # Cột 6: VirusTotal (0/71)
-            item_vt = QTableWidgetItem("🛡️ 0 / 71")
-            item_vt.setForeground(QtGui.QBrush(QtGui.QColor("#059669")))
-            item_vt.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
-            self.table.setItem(row, 6, item_vt)
-
-            # Cột 7: Download Speed
-            down_str = f"{down_kb:,.1f} KB/s" if down_kb >= 1.0 else f"{down_kb * 1024:,.0f} B/s"
-            item_down = QTableWidgetItem(down_str)
-            item_down.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-            item_down.setForeground(QtGui.QBrush(QtGui.QColor("#D97706")))
-            self.table.setItem(row, 7, item_down)
-
-            # Cột 8: Upload Speed
-            up_str = f"{up_kb:,.1f} KB/s" if up_kb >= 1.0 else f"{up_kb * 1024:,.0f} B/s"
-            item_up = QTableWidgetItem(up_str)
-            item_up.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-            item_up.setForeground(QtGui.QBrush(QtGui.QColor("#EA580C")))
-            self.table.setItem(row, 8, item_up)
-
-            # Cột 9: Total Traffic
-            acc = app_accumulated.get(name, {"down": 0.0, "up": 0.0})
-            total_b = acc.get("down", 0.0) + acc.get("up", 0.0)
-            traffic_str = self._format_bytes(total_b)
-            item_traffic = QTableWidgetItem(traffic_str)
-            item_traffic.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-            item_traffic.setForeground(QtGui.QBrush(QtGui.QColor("#1E293B")))
-            self.table.setItem(row, 9, item_traffic)
+        self._apply_all_rows_visibility()
 
     def _on_pill_status_changed(self, app_name: str, direction: str, new_status: str):
         """
         Xử lý khi người dùng click nút In/Out Connection:
-        - allowed  -> Gỡ chặn / gỡ giới hạn cho ứng dụng
-        - blocked  -> Chặn hoàn toàn kết nối mạng (Windows Firewall + WinDivert Drop)
+        - allowed   -> Gỡ chặn / gỡ giới hạn cho ứng dụng
+        - blocked   -> Chặn hoàn toàn kết nối mạng (Windows Firewall + WinDivert Drop)
         - throttled -> Giới hạn băng thông (WinDivert Token Bucket)
         """
+        # Kiểm tra khóa 2 tầng (2-Tier Policy Lock) nếu đang ở chế độ Client Mode
+        if not self.remote_device_uuid and self.agent_service and self.agent_service.is_locked_by_admin(app_name):
+            self.sync_from_agent_policies()
+            self._sync_all_pills_from_policies()
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Khóa Bởi Admin Server (🔒)",
+                f"Ứng dụng '{app_name}' đang chịu sự kiểm soát bắt buộc từ Admin Server.\n"
+                "Máy con không được phép tự ý gỡ bỏ hoặc thay đổi chính sách của Quản trị viên!"
+            )
+            return
+
         if app_name not in self.app_policies:
-            self.app_policies[app_name] = {"in": "allowed", "out": "allowed", "limit_kbps": self.default_throttle_kbps}
+            self.app_policies[app_name] = {
+                "in": "allowed",
+                "out": "allowed",
+                "limit_kbps": self.default_throttle_kbps,
+                "source": "ADMIN" if self.remote_device_uuid else "LOCAL",
+                "locked_by_admin": bool(self.remote_device_uuid),
+            }
 
+        # Nếu ở chế độ Click To Block / Click To Throttle thông thường, đồng bộ cả 2 chiều In & Out
+        # để người dùng chỉ cần 1 click là Chặn hoặc Mở chặn trọn vẹn cho ứng dụng đó
         self.app_policies[app_name][direction] = new_status
+        other_dir = "out" if direction == "in" else "in"
+        self.app_policies[app_name][other_dir] = new_status
+        self.app_policies[app_name]["source"] = "ADMIN" if self.remote_device_uuid else "LOCAL"
+        self.app_policies[app_name]["locked_by_admin"] = bool(self.remote_device_uuid)
 
-        # Xác định trạng thái tổng hợp của ứng dụng (ưu tiên blocked > throttled > allowed)
+        pills = self._row_pills.get(app_name)
+        if pills:
+            if pills.get("in"):
+                pills["in"].set_status(new_status)
+            if pills.get("out"):
+                pills["out"].set_status(new_status)
+
         in_status = self.app_policies[app_name].get("in", "allowed")
         out_status = self.app_policies[app_name].get("out", "allowed")
+        effective_status = self._get_effective_status(in_status, out_status)
+        effective_direction = self._get_effective_direction(in_status, out_status)
+        prev_effective = self._effective_status_history.get(app_name, "allowed")
+        self._effective_status_history[app_name] = effective_status
 
-        # Lấy exe_path từ metadata nếu có
-        exe_path = ""
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 1)
-            if item and item.text().strip() == app_name:
-                break
+        limit_val = float(self.app_policies[app_name].get("limit_kbps", self.default_throttle_kbps))
+        if effective_status == "throttled":
+            try:
+                new_lim, ok_diag = QInputDialog.getDouble(
+                    self, "Giới Hạn Băng Thông (QoS)",
+                    f"Nhập mức giới hạn tốc độ mạng cho '{app_name}' (KB/s):",
+                    limit_val, 1.0, 102400.0, 1
+                )
+                if ok_diag:
+                    limit_val = float(new_lim)
+                    self.app_policies[app_name]["limit_kbps"] = limit_val
+            except Exception:
+                pass
+
+        row_idx = self._app_row_map.get(app_name)
+        if row_idx is not None and row_idx < self.table.rowCount():
+            self._update_row_policy_columns(row_idx, app_name)
+
+        if self._status_filter_mode != "all":
+            self._apply_all_rows_visibility()
 
         # Chế độ điều khiển máy con từ xa (Remote Machine Control)
-        # QUAN TRỌNG: Phải kiểm tra remote mode TRƯỚC khi check self.service,
-        # vì trong Admin mode self.service = None nhưng remote_commander vẫn hoạt động.
         if self.remote_device_uuid and self.remote_commander:
-            # --- Xác định hành động chính cần thực hiện ---
-            in_status = self.app_policies[app_name].get("in", "allowed")
-            out_status = self.app_policies[app_name].get("out", "allowed")
-            effective_status = self._get_effective_status(in_status, out_status)
-            effective_direction = self._get_effective_direction(in_status, out_status)
+            uid = self.remote_device_uuid
+            commander = self.remote_commander
 
-            try:
-                if effective_status == "blocked":
-                    ok, msg = self.remote_commander(
-                        self.remote_device_uuid, "BLOCK_APP", app_name, 0.0, effective_direction
-                    )
-                elif effective_status == "throttled":
-                    limit_val = self.app_policies[app_name].get("limit_kbps", self.default_throttle_kbps)
-                    try:
-                        new_lim, ok_diag = QInputDialog.getDouble(
-                            self, "Giới Hạn Băng Thông Từ Xa",
-                            f"Nhập mức giới hạn tốc độ mạng cho '{app_name}' (KB/s):",
-                            limit_val, 1.0, 102400.0, 1
-                        )
-                        if ok_diag:
-                            limit_val = new_lim
-                            self.app_policies[app_name]["limit_kbps"] = limit_val
-                    except Exception:
-                        pass
-                    ok, msg = self.remote_commander(
-                        self.remote_device_uuid, "THROTTLE_SET", app_name, limit_val, effective_direction
-                    )
-                else:
-                    ok, msg = self.remote_commander(
-                        self.remote_device_uuid, "UNBLOCK_APP", app_name, 0.0, effective_direction
-                    )
-                    self.remote_commander(
-                        self.remote_device_uuid, "REMOVE_LIMIT", app_name, 0.0, effective_direction
-                    )
+            def _exec_remote():
+                try:
+                    if effective_status == "blocked":
+                        commander(uid, "BLOCK_APP", app_name, 0.0, effective_direction)
+                    elif effective_status == "throttled":
+                        if prev_effective == "blocked":
+                            commander(uid, "UNBLOCK_APP", app_name, 0.0, effective_direction)
+                        commander(uid, "THROTTLE_SET", app_name, limit_val, effective_direction)
+                    else:
+                        commander(uid, "UNBLOCK_APP", app_name, 0.0, effective_direction)
+                        if prev_effective == "throttled":
+                            commander(uid, "REMOVE_LIMIT", app_name, 0.0, effective_direction)
+                except Exception as e:
+                    print(f"[Protect Remote Command Error] {e}")
 
-                status_color = "#DC2626" if effective_status == "blocked" else ("#D97706" if effective_status == "throttled" else "#059669")
-                self.lbl_driver_status.setText(f"📡 Lệnh gửi tới [{self.remote_device_uuid[:8]}]: {effective_status.upper()} '{app_name}'")
-                self.lbl_driver_status.setStyleSheet(f"font-size: 11px; font-weight: 600; color: {status_color};")
-            except Exception as e:
-                print(f"[Protect Remote Command Error] {e}")
-            self._update_status_bar()
+            self._cmd_queue.put(_exec_remote)
             return
 
         # --- Chế độ cục bộ: kiểm tra firewall và service ---
-        if not self.is_firewall_active or not self.service:
-            self._update_status_bar()
+        if not self.is_firewall_active or (not self.service and not self.agent_service):
             return
 
-        # Xác định hành động chính cần thực hiện
-        effective_status = self._get_effective_status(in_status, out_status)
-        effective_direction = self._get_effective_direction(in_status, out_status)
+        def _exec_local():
+            try:
+                if self.agent_service:
+                    if effective_status == "blocked":
+                        if prev_effective == "throttled":
+                            self.agent_service.remove_local_policy(app_name)
+                        self.agent_service.apply_local_policy(
+                            app_name, action="BLOCK", limit_kbps=0.0, direction=effective_direction
+                        )
+                    elif effective_status == "throttled":
+                        if prev_effective == "blocked":
+                            self.agent_service.remove_local_policy(app_name)
+                        self.agent_service.apply_local_policy(
+                            app_name, action="THROTTLE", limit_kbps=limit_val, direction=effective_direction
+                        )
+                    else:
+                        self.agent_service.remove_local_policy(app_name)
+                elif self.service:
+                    if effective_status == "blocked":
+                        if prev_effective == "throttled":
+                            self.service.remove_bandwidth_limit(app_name)
+                        success, msg = self.service.block_application(app_name, direction=effective_direction)
+                        print(f"[Protect] BLOCK {app_name} ({effective_direction}): {msg}")
 
+                    elif effective_status == "throttled":
+                        if prev_effective == "blocked":
+                            self.service.unblock_application(app_name)
+                        success, msg = self.service.apply_bandwidth_limit(
+                            app_name, limit_kbps=limit_val, direction=effective_direction
+                        )
+                        print(f"[Protect] THROTTLE {app_name} ({effective_direction}, {limit_val} KB/s): {msg}")
 
-        try:
-            if effective_status == "blocked":
-                # CHẶN HOÀN TOÀN: Windows Firewall rule + WinDivert kernel drop + cắt TCP socket
-                success, msg = self.service.block_application(app_name, direction=effective_direction)
-                print(f"[Protect] BLOCK {app_name} ({effective_direction}): {msg}")
+                    else:
+                        self.service.unblock_application(app_name)
+                        if prev_effective == "throttled":
+                            self.service.remove_bandwidth_limit(app_name)
+                        print(f"[Protect] ALLOW {app_name}: Đã gỡ bỏ mọi hạn chế mạng")
+            except Exception as e:
+                print(f"[Protect] Lỗi áp dụng chính sách cho {app_name}: {e}")
 
-            elif effective_status == "throttled":
-                # Nếu trước đó đang bị block -> gỡ block trước
-                self.service.unblock_application(app_name)
-                # GIỚI HẠN BĂNG THÔNG: WinDivert Token Bucket throttling
-                limit_kbps = self.app_policies[app_name].get("limit_kbps", self.default_throttle_kbps)
-                success, msg = self.service.apply_bandwidth_limit(
-                    app_name, limit_kbps=limit_kbps, direction=effective_direction
-                )
-                print(f"[Protect] THROTTLE {app_name} ({effective_direction}, {limit_kbps} KB/s): {msg}")
-
-            else:
-                # CHO PHÉP: Gỡ bỏ mọi chính sách chặn và giới hạn
-                self.service.unblock_application(app_name)
-                self.service.remove_bandwidth_limit()
-                print(f"[Protect] ALLOW {app_name}: Đã gỡ bỏ mọi hạn chế mạng")
-
-        except Exception as e:
-            print(f"[Protect] Lỗi áp dụng chính sách cho {app_name}: {e}")
-
-        self._update_status_bar()
+        self._cmd_queue.put(_exec_local)
 
     def _get_effective_status(self, in_status: str, out_status: str) -> str:
         """Xác định trạng thái ưu tiên cao nhất: blocked > throttled > allowed."""
@@ -815,80 +1175,125 @@ class GlassWireProtectView(QWidget):
             return "upload"
         return "both"
 
-    def _update_status_bar(self):
-        """Cập nhật thanh trạng thái số tiến trình đang bị chặn/giới hạn."""
-        blocked_count = sum(
-            1 for p in self.app_policies.values()
-            if p.get("in") != "allowed" or p.get("out") != "allowed"
-        )
-        self.lbl_active_blocks.setText(f"{blocked_count} tiến trình đang bị điều tiết / chặn")
-
     def unblock_all_apps(self):
-        """Cho phép tất cả ứng dụng truyền tải bình thường - gỡ mọi chính sách chặn và giới hạn."""
-        # 1a. Nếu đang ở chế độ Admin điều khiển từ xa -> gửi lệnh cho máy con
-        if self.remote_device_uuid and self.remote_commander:
-            try:
-                self.remote_commander(self.remote_device_uuid, "UNBLOCK_ALL", "", 0.0, "both")
-                self.remote_commander(self.remote_device_uuid, "REMOVE_LIMIT", "", 0.0, "both")
-                self.lbl_driver_status.setText(f"📡 Đã gỡ TẤT CẢ chặn trên máy [{self.remote_device_uuid[:8]}]")
-                self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #059669;")
-                print(f"[Protect Remote] UNBLOCK_ALL gửi tới {self.remote_device_uuid}")
-            except Exception as e:
-                print(f"[Protect Remote] Lỗi gửi UNBLOCK_ALL: {e}")
-        # 1b. Chế độ cục bộ: gỡ chặn qua MonitorService
-        elif self.service:
-            try:
-                self.service.unblock_all_applications()
-                self.service.remove_bandwidth_limit()
-                print("[Protect] Đã gỡ bỏ TẤT CẢ chính sách chặn và giới hạn băng thông")
-            except Exception as e:
-                print(f"[Protect] Lỗi khi gỡ chặn tất cả: {e}")
+        """Cho phép tất cả ứng dụng truyền tải bình thường - tôn trọng khóa Admin nếu ở chế độ Client."""
+        if not self.remote_device_uuid and self.agent_service:
+            for app_name in list(self.app_policies.keys()):
+                if not self.agent_service.is_locked_by_admin(app_name):
+                    self.app_policies[app_name]["in"] = "allowed"
+                    self.app_policies[app_name]["out"] = "allowed"
+                    self.app_policies[app_name]["source"] = ""
+                    self.app_policies[app_name]["locked_by_admin"] = False
+                    self._effective_status_history[app_name] = "allowed"
 
-        # 2. Reset trạng thái nội bộ
+            self._sync_all_pills_from_policies()
+            if self._status_filter_mode != "all":
+                self._apply_all_rows_visibility()
+
+            def _agent_clear_local():
+                try:
+                    self.agent_service.clear_all_local_policies()
+                except Exception as e:
+                    print(f"[Protect] Lỗi gỡ chính sách cục bộ: {e}")
+
+            self._cmd_queue.put(_agent_clear_local)
+            return
+
+        # 1. Reset trạng thái nội bộ & giao diện ngay lập tức
         for app_name in self.app_policies:
             self.app_policies[app_name]["in"] = "allowed"
             self.app_policies[app_name]["out"] = "allowed"
+        self._effective_status_history.clear()
 
-        self.lbl_active_blocks.setText("0 tiến trình đang bị điều tiết / chặn")
+        self._sync_all_pills_from_policies()
+        if self._status_filter_mode != "all":
+            self._apply_all_rows_visibility()
 
-        # 3. Cập nhật giao diện - reset tất cả pill về Allowed
-        for row in range(self.table.rowCount()):
-            for col in [2, 3]:
-                cell_widget = self.table.cellWidget(row, col)
-                if cell_widget:
-                    # Tìm ConnectionPillButton bên trong QWidget wrapper
-                    for child in cell_widget.findChildren(QPushButton):
-                        if isinstance(child, ConnectionPillButton):
-                            child.set_status("allowed")
+        # 2a. Nếu đang ở chế độ Admin điều khiển từ xa -> gửi lệnh cho máy con qua worker
+        if self.remote_device_uuid and self.remote_commander:
+            uid = self.remote_device_uuid
+            commander = self.remote_commander
 
+            def _remote_unblock_all():
+                try:
+                    commander(uid, "UNBLOCK_ALL", "", 0.0, "both")
+                    commander(uid, "REMOVE_LIMIT", "", 0.0, "both")
+                    print(f"[Protect Remote] UNBLOCK_ALL gửi tới {uid}")
+                except Exception as e:
+                    print(f"[Protect Remote] Lỗi gửi UNBLOCK_ALL: {e}")
+
+            self._cmd_queue.put(_remote_unblock_all)
+        # 2b. Chế độ cục bộ: gỡ chặn qua MonitorService
+        elif self.service:
+            def _local_unblock_all():
+                try:
+                    self.service.unblock_all_applications()
+                    self.service.remove_bandwidth_limit()
+                    print("[Protect] Đã gỡ bỏ TẤT CẢ chính sách chặn và giới hạn băng thông")
+                except Exception as e:
+                    print(f"[Protect] Lỗi khi gỡ chặn tất cả: {e}")
+
+            self._cmd_queue.put(_local_unblock_all)
 
     def refresh_fleet_devices_dropdown(self):
         """Làm mới danh sách máy con trong combo_target_device từ FleetManagerService."""
         if not self.fleet_service or not hasattr(self, "combo_target_device"):
             return
 
-        self.combo_target_device.blockSignals(True)
-        self.combo_target_device.clear()
-        self.combo_target_device.addItem("— Chọn máy con mục tiêu —", None)
-
         try:
             devices = self.fleet_service.get_all_device_states()
-            for dev in devices:
-                uid = getattr(dev, "device_uuid", "")
-                hostname = getattr(dev, "hostname", "Unknown")
-                ip = getattr(dev, "ip_address", "")
-                status = getattr(dev, "status", "offline")
-                badge = "🟢" if status == "online" else "○"
-                label = f"{badge}  {hostname}  ({ip})  [{uid[:8]}...]"
-                self.combo_target_device.addItem(label, uid)
-
-                # Tự động chọn máy đang được set_remote_mode
-                if uid == self.remote_device_uuid:
-                    self.combo_target_device.setCurrentIndex(self.combo_target_device.count() - 1)
         except Exception as e:
             print(f"[Protect] Lỗi refresh fleet devices: {e}")
+            return
 
-        self.combo_target_device.blockSignals(False)
+        snapshot = [
+            (
+                getattr(d, "device_uuid", ""),
+                getattr(d, "hostname", "Unknown"),
+                getattr(d, "ip_address", ""),
+                getattr(d, "status", "offline"),
+            )
+            for d in devices
+        ]
+
+        self.combo_target_device.blockSignals(True)
+        try:
+            self.combo_target_device.clear()
+            self.combo_target_device.addItem("— Chọn máy con mục tiêu —", None)
+
+            selected_idx = 0
+            for uid, hostname, ip, status in snapshot:
+                badge = "🟢" if status == "online" else "⚪"
+                label = f"{badge}  {hostname}  ({ip})  [{uid[:8]}...]"
+                self.combo_target_device.addItem(label, uid)
+                if uid and uid == self.remote_device_uuid:
+                    selected_idx = self.combo_target_device.count() - 1
+
+            self.combo_target_device.setCurrentIndex(selected_idx)
+            self._known_device_snapshot = snapshot
+        finally:
+            self.combo_target_device.blockSignals(False)
+
+    def sync_fleet_devices_if_changed(self):
+        """Chỉ cập nhật dropdown khi danh sách máy con hoặc trạng thái kết nối thay đổi."""
+        if not self.fleet_service or not hasattr(self, "combo_target_device"):
+            return
+        try:
+            devices = self.fleet_service.get_all_device_states()
+            snapshot = [
+                (
+                    getattr(d, "device_uuid", ""),
+                    getattr(d, "hostname", "Unknown"),
+                    getattr(d, "ip_address", ""),
+                    getattr(d, "status", "offline"),
+                )
+                for d in devices
+            ]
+            current_uid = self.combo_target_device.currentData()
+            if snapshot != self._known_device_snapshot or current_uid != self.remote_device_uuid:
+                self.refresh_fleet_devices_dropdown()
+        except Exception:
+            pass
 
     def _on_device_combo_changed(self, index: int):
         """Khi Admin chọn máy con từ dropdown -> tự động set_remote_mode về máy đó."""
@@ -900,12 +1305,10 @@ class GlassWireProtectView(QWidget):
             commander = getattr(self.fleet_service, "send_remote_command", None)
             self.set_remote_mode(uid, commander)
         else:
-            # Người dùng chọn "— Chọn máy con mục tiêu —"
             self.set_remote_mode(None, None)
 
     def _prompt_block_custom_app(self):
         """Hiển thị dialog nhập tên .exe để chặn thủ công (không cần app xuất hiện trong traffic table)."""
-        from PyQt6.QtWidgets import QInputDialog
         app_name, ok = QInputDialog.getText(
             self, "Chặn Ứng Dụng Theo Tên",
             "Nhập tên tiến trình (.exe) cần chặn:\n(Ví dụ: chrome.exe, discord.exe, steam.exe)",
@@ -914,41 +1317,77 @@ class GlassWireProtectView(QWidget):
             return
 
         app_name = app_name.strip()
+        if not self.remote_device_uuid and self.agent_service and self.agent_service.is_locked_by_admin(app_name):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Khóa Bởi Admin Server (🔒)",
+                f"Ứng dụng '{app_name}' đang chịu sự kiểm soát bắt buộc từ Admin Server.\n"
+                "Máy con không được phép tự ý ghi đè chính sách của Quản trị viên!"
+            )
+            return
 
-        # Khởi tạo policy mặc định nếu chưa có
-        if app_name not in self.app_policies:
-            self.app_policies[app_name] = {"in": "blocked", "out": "blocked", "limit_kbps": self.default_throttle_kbps}
+        # Khởi tạo policy
+        self.app_policies[app_name] = {
+            "in": "blocked",
+            "out": "blocked",
+            "limit_kbps": self.default_throttle_kbps,
+            "source": "ADMIN" if self.remote_device_uuid else "LOCAL",
+            "locked_by_admin": bool(self.remote_device_uuid),
+        }
+        self._effective_status_history[app_name] = "blocked"
+
+        if app_name not in self._app_row_map:
+            self._append_new_app_row({
+                "name": app_name,
+                "pid": 0,
+                "down_kb": 0.0,
+                "up_kb": 0.0,
+                "exe": "",
+                "total_bytes": 0.0,
+            })
         else:
-            self.app_policies[app_name]["in"] = "blocked"
-            self.app_policies[app_name]["out"] = "blocked"
+            self._sync_all_pills_from_policies()
 
-        # Nếu đang ở chế độ remote -> gửi lệnh cho máy con
+        self._apply_all_rows_visibility()
+
         if self.remote_device_uuid and self.remote_commander:
-            try:
-                ok_cmd, msg = self.remote_commander(self.remote_device_uuid, "BLOCK_APP", app_name, 0.0, "both")
-                self.lbl_driver_status.setText(f"📡 Lệnh BLOCK gửi tới [{self.remote_device_uuid[:8]}]: '{app_name}'")
-                self.lbl_driver_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #DC2626;")
-                print(f"[Protect Remote] BLOCK_APP '{app_name}': {msg}")
-            except Exception as e:
-                print(f"[Protect Remote] Lỗi BLOCK_APP '{app_name}': {e}")
-        elif self.service and self.is_firewall_active:
-            try:
-                success, msg = self.service.block_application(app_name, direction="both")
-                self.lbl_driver_status.setText(f"🛡️ Đã chặn '{app_name}': {msg}")
-                print(f"[Protect] BLOCK '{app_name}': {msg}")
-            except Exception as e:
-                print(f"[Protect] Lỗi BLOCK '{app_name}': {e}")
+            uid = self.remote_device_uuid
+            commander = self.remote_commander
 
-        self._update_status_bar()
+            def _remote_block():
+                try:
+                    ok_cmd, msg = commander(uid, "BLOCK_APP", app_name, 0.0, "both")
+                    print(f"[Protect Remote] BLOCK_APP '{app_name}': {msg}")
+                except Exception as e:
+                    print(f"[Protect Remote] Lỗi BLOCK_APP '{app_name}': {e}")
+
+            self._cmd_queue.put(_remote_block)
+        elif self.agent_service and self.is_firewall_active:
+            def _agent_local_block():
+                try:
+                    self.agent_service.apply_local_policy(app_name, action="BLOCK", limit_kbps=0.0, direction="both")
+                except Exception as e:
+                    print(f"[Protect] Lỗi BLOCK '{app_name}': {e}")
+
+            self._cmd_queue.put(_agent_local_block)
+        elif self.service and self.is_firewall_active:
+            def _local_block():
+                try:
+                    success, msg = self.service.block_application(app_name, direction="both")
+                    print(f"[Protect] BLOCK '{app_name}': {msg}")
+                except Exception as e:
+                    print(f"[Protect] Lỗi BLOCK '{app_name}': {e}")
+
+            self._cmd_queue.put(_local_block)
 
     def _reapply_all_policies(self):
-
         """Áp dụng lại TẤT CẢ các chính sách đã lưu khi bật lại tường lửa."""
-        for app_name, policy in self.app_policies.items():
+        if not self.service:
+            return
+        for app_name, policy in list(self.app_policies.items()):
             in_status = policy.get("in", "allowed")
             out_status = policy.get("out", "allowed")
             if in_status != "allowed" or out_status != "allowed":
-                # Áp dụng lại chính sách cho từng ứng dụng
                 effective_status = self._get_effective_status(in_status, out_status)
                 effective_direction = self._get_effective_direction(in_status, out_status)
                 try:

@@ -20,7 +20,8 @@ class WinDivertPacketShaper:
     """
 
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._engine_lock = threading.RLock()
         self.target_app: str = ""
         self.target_pids: Set[int] = set()
         self.target_ports: Set[int] = set()
@@ -34,6 +35,12 @@ class WinDivertPacketShaper:
         self.blocked_apps: Dict[str, Dict] = {}
         self.blocked_ports: Set[int] = set()
         self.blocked_pids: Set[int] = set()
+
+        # Danh sách các ứng dụng bị BÓP BĂNG THÔNG (Multi-App QoS):
+        # {app_key: {"target_app": str, "limit_kbps": float, "direction": str, "tokens": float, "last_refill": float}}
+        self.throttled_apps: Dict[str, Dict] = {}
+        self.port_to_throttle_app: Dict[int, str] = {}
+        self.pid_to_throttle_app: Dict[int, str] = {}
 
         # Quản lý luồng và hàng đợi
         self._divert_handle: Optional[pydivert.WinDivert] = None
@@ -83,7 +90,7 @@ class WinDivertPacketShaper:
         raw_lower = app_name.lower().strip()
         clean = raw_lower.replace(".exe", "").strip()
         alias = self.ALIAS_MAP.get(clean, clean)
-        
+
         found_pids = set()
         found_exe = provided_exe if (provided_exe and os.path.exists(provided_exe)) else ""
         canonical_name = ""
@@ -96,10 +103,10 @@ class WinDivertPacketShaper:
                 p_base = p_name.replace(".exe", "")
 
                 is_match = (
-                    p_name == raw_lower or 
-                    p_name == f"{alias}.exe" or 
-                    p_base == clean or 
-                    p_base == alias or 
+                    p_name == raw_lower or
+                    p_name == f"{alias}.exe" or
+                    p_base == clean or
+                    p_base == alias or
                     (alias and (alias in p_name or alias in p_exe_lower))
                 )
 
@@ -130,17 +137,42 @@ class WinDivertPacketShaper:
 
     def _update_target_ports(self):
         """Quét và cập nhật danh sách local port thuộc tiến trình mục tiêu hoặc ứng dụng bị chặn."""
-        if not self.target_app and not self.blocked_apps:
+        with self._lock:
+            throttled_keys = list(self.throttled_apps.keys())
+            has_target = bool(self.target_app or throttled_keys)
+            blocked_names = list(self.blocked_apps.keys())
+
+        if not has_target and not blocked_names:
+            with self._lock:
+                self.target_pids.clear()
+                self.target_ports.clear()
+                self.pid_to_throttle_app.clear()
+                self.port_to_throttle_app.clear()
+                self.blocked_pids.clear()
+                self.blocked_ports.clear()
             return
 
-        found_pids = self._find_target_pids() if self.target_app else set()
+        pid_to_app: Dict[int, str] = {}
+        found_pids: Set[int] = set()
+        if throttled_keys:
+            for t_key in throttled_keys:
+                pids = self._find_pids_for_name(t_key)
+                found_pids.update(pids)
+                for p in pids:
+                    pid_to_app[p] = t_key
+        elif self.target_app:
+            found_pids = self._find_target_pids()
+            for p in found_pids:
+                pid_to_app[p] = self.target_app.lower()
+
         # Tìm PIDs cho tất cả các app bị chặn
         all_blocked_pids = set()
-        for b_name in list(self.blocked_apps.keys()):
+        for b_name in blocked_names:
             all_blocked_pids.update(self._find_pids_for_name(b_name))
 
         with self._lock:
             self.target_pids = found_pids
+            self.pid_to_throttle_app = pid_to_app
             self.blocked_pids = all_blocked_pids
 
         now = time.time()
@@ -150,11 +182,15 @@ class WinDivertPacketShaper:
         for pid in found_pids:
             try:
                 proc = psutil.Process(pid)
+                app_k = pid_to_app.get(pid, self.target_app.lower())
                 for conn in proc.net_connections(kind='all'):
                     if conn.laddr:
                         port = conn.laddr.port
                         new_ports.add(port)
-                        self._port_last_seen[port] = now
+                        with self._lock:
+                            self._port_last_seen[port] = now
+                            if app_k:
+                                self.port_to_throttle_app[port] = app_k
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
@@ -169,23 +205,25 @@ class WinDivertPacketShaper:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
-        # Giữ lại các cổng đã thấy trong vòng 120 giây
-        expired_ports = [p for p, t in self._port_last_seen.items() if now - t > 120.0]
-        for p in expired_ports:
-            del self._port_last_seen[p]
-
         with self._lock:
+            # Giữ lại các cổng đã thấy trong vòng 120 giây
+            expired_ports = [p for p, t in self._port_last_seen.items() if now - t > 120.0]
+            for p in expired_ports:
+                del self._port_last_seen[p]
+                self.port_to_throttle_app.pop(p, None)
+
             self.target_ports = set(self._port_last_seen.keys())
             self.blocked_ports = new_blocked_ports
 
-    def _port_monitor_loop(self):
+    def _port_monitor_loop(self, stop_event: Optional[threading.Event] = None):
         """Luồng chạy ngầm quét cổng mới mở của tiến trình mục tiêu tần số cao (50ms)."""
-        while not self._stop_event.is_set():
+        ev = stop_event or self._stop_event
+        while not ev.is_set():
             try:
                 self._update_target_ports()
             except Exception:
                 pass
-            self._stop_event.wait(0.05)
+            ev.wait(0.05)
 
     def _update_speed_stats(self, packet_size: int, is_inbound: bool):
         """Tính toán tốc độ tức thời mượt mà cho 2 chiều upload/download."""
@@ -210,15 +248,16 @@ class WinDivertPacketShaper:
                 self._recent_up_bytes = 0
                 self._recent_ts = now
 
-    def _throttle_worker_loop(self):
+    def _throttle_worker_loop(self, stop_event: Optional[threading.Event] = None):
         """
         Luồng Token Bucket: Lấy các gói tin của tiến trình mục tiêu từ hàng đợi,
-        tính toán độ trễ cần thiết để giữ tốc độ dưới mức trần, rồi inject lại vào mạng.
+        tính toán độ trễ cần thiết để giữ tốc độ dưới mức trần riêng cho từng app, rồi inject lại vào mạng.
         """
-        last_refill = time.perf_counter()
-        tokens = 0.0
+        ev = stop_event or self._stop_event
+        fallback_last_refill = time.perf_counter()
+        fallback_tokens = 0.0
 
-        while not self._stop_event.is_set():
+        while not ev.is_set():
             try:
                 item = self._packet_queue.get(timeout=0.05)
                 if item is None:
@@ -227,30 +266,51 @@ class WinDivertPacketShaper:
                 self._update_speed_stats(0, False)
                 continue
 
-            packet, packet_size, is_inbound = item
-            handle = self._divert_handle
+            if len(item) == 4:
+                packet, packet_size, is_inbound, app_key = item
+            else:
+                packet, packet_size, is_inbound = item
+                app_key = ""
 
+            handle = self._divert_handle
             if not handle or not handle.is_open:
                 break
 
-            rate_bytes_per_sec = max(1024.0, self.limit_kbps * 1024.0)
+            with self._lock:
+                app_cfg = self.throttled_apps.get(app_key) if app_key else None
+                limit_val = app_cfg["limit_kbps"] if app_cfg else self.limit_kbps
+
+            rate_bytes_per_sec = max(1024.0, limit_val * 1024.0)
             # Dung lượng burst tối đa 80ms hoặc 2KB để không bị nghẽn giật
             burst_capacity = max(2048.0, rate_bytes_per_sec * 0.08)
 
             now = time.perf_counter()
-            elapsed = now - last_refill
-            tokens = min(burst_capacity, tokens + elapsed * rate_bytes_per_sec)
-            last_refill = now
-
-            if tokens < packet_size:
-                needed = packet_size - tokens
-                sleep_sec = needed / rate_bytes_per_sec
-                if sleep_sec > 0.0002:
-                    time.sleep(sleep_sec)
-                tokens = 0.0
-                last_refill = time.perf_counter()
+            if app_cfg is not None:
+                elapsed = now - app_cfg.get("last_refill", now)
+                tokens = min(burst_capacity, app_cfg.get("tokens", 0.0) + elapsed * rate_bytes_per_sec)
+                app_cfg["last_refill"] = now
+                if tokens < packet_size:
+                    needed = packet_size - tokens
+                    sleep_sec = needed / rate_bytes_per_sec
+                    if sleep_sec > 0.0002:
+                        time.sleep(sleep_sec)
+                    app_cfg["tokens"] = 0.0
+                    app_cfg["last_refill"] = time.perf_counter()
+                else:
+                    app_cfg["tokens"] = tokens - packet_size
             else:
-                tokens -= packet_size
+                elapsed = now - fallback_last_refill
+                fallback_tokens = min(burst_capacity, fallback_tokens + elapsed * rate_bytes_per_sec)
+                fallback_last_refill = now
+                if fallback_tokens < packet_size:
+                    needed = packet_size - fallback_tokens
+                    sleep_sec = needed / rate_bytes_per_sec
+                    if sleep_sec > 0.0002:
+                        time.sleep(sleep_sec)
+                    fallback_tokens = 0.0
+                    fallback_last_refill = time.perf_counter()
+                else:
+                    fallback_tokens -= packet_size
 
             # Bơm gói tin trở lại ngăn xếp mạng
             try:
@@ -259,7 +319,7 @@ class WinDivertPacketShaper:
             except Exception:
                 pass
 
-    def _capture_loop(self):
+    def _capture_loop(self, stop_event: Optional[threading.Event] = None):
         """
         Luồng chính bắt gói tin tầng mạng:
         - Bắt các gói tin TCP/UDP không phải loopback.
@@ -267,37 +327,44 @@ class WinDivertPacketShaper:
         - Gói tin của các app khác: Gửi đi NGAY LẬP TỨC (Zero latency pass-through).
         - Gói tin của tiến trình mục tiêu: Đưa vào hàng đợi Token Bucket để bóp đúng trần.
         """
+        ev = stop_event or self._stop_event
         filter_str = "!loopback and (tcp or udp)"
+        w = None
         try:
             with pydivert.WinDivert(filter=filter_str, priority=0) as w:
                 self._divert_handle = w
-                print(f"[PacketShaper] Đã kích hoạt WinDivert thành công cho '{self.target_app}' (Trần: {self.limit_kbps} KB/s)")
+                print(f"[PacketShaper] Đã kích hoạt WinDivert thành công cho '{self.target_app or 'Blocked Apps'}' (Trần: {self.limit_kbps} KB/s)")
 
-                while not self._stop_event.is_set():
+                while not ev.is_set():
                     try:
                         packet = w.recv()
                         if not packet:
                             continue
                     except Exception:
-                        if self._stop_event.is_set():
+                        if ev.is_set():
                             break
                         continue
 
                     try:
                         is_target = False
                         is_drop = False
+                        matched_app_key = ""
                         with self._lock:
-                            ports = self.target_ports
-                            pids = self.target_pids
-                            blocked_ports = self.blocked_ports
-                            blocked_pids = self.blocked_pids
+                            ports = set(self.target_ports)
+                            pids = set(self.target_pids)
+                            blocked_ports = set(self.blocked_ports)
+                            blocked_pids = set(self.blocked_pids)
                             has_blocked = bool(self.blocked_apps)
+                            port_map = dict(self.port_to_throttle_app)
+                            pid_map = dict(self.pid_to_throttle_app)
 
                         if packet.is_outbound:
                             if packet.src_port in blocked_ports:
                                 is_drop = True
                             elif packet.src_port in ports:
-                                if self.direction in ("upload", "both"):
+                                matched_app_key = port_map.get(packet.src_port, "")
+                                app_dir = self.throttled_apps.get(matched_app_key, {}).get("direction", self.direction)
+                                if app_dir in ("upload", "both"):
                                     is_target = True
                             else:
                                 # Nhận diện tức thì qua PID của target hoặc blocked app
@@ -313,9 +380,13 @@ class WinDivertPacketShaper:
                                                                 self.blocked_ports.add(packet.src_port)
                                                                 is_drop = True
                                                             if pid in pids:
+                                                                matched_app_key = pid_map.get(pid, self.target_app.lower())
                                                                 self.target_ports.add(packet.src_port)
                                                                 self._port_last_seen[packet.src_port] = time.time()
-                                                                if self.direction in ("upload", "both"):
+                                                                if matched_app_key:
+                                                                    self.port_to_throttle_app[packet.src_port] = matched_app_key
+                                                                app_dir = self.throttled_apps.get(matched_app_key, {}).get("direction", self.direction)
+                                                                if app_dir in ("upload", "both"):
                                                                     is_target = True
                                                         break
                                                 if is_target or is_drop:
@@ -328,11 +399,13 @@ class WinDivertPacketShaper:
                             if packet.dst_port in blocked_ports:
                                 is_drop = True
                             elif packet.dst_port in ports:
-                                if self.direction in ("download", "both"):
+                                matched_app_key = port_map.get(packet.dst_port, "")
+                                app_dir = self.throttled_apps.get(matched_app_key, {}).get("direction", self.direction)
+                                if app_dir in ("download", "both"):
                                     is_target = True
 
                         # 1. Kiểm tra nếu gói tin thuộc về ứng dụng bị CHẶN HOÀN TOÀN (BLOCK)
-                        if not is_drop and has_blocked and is_target and self.is_blocked:
+                        if not is_drop and has_blocked and is_target and self.is_blocked and not self.throttled_apps and self.limit_kbps <= 0:
                             is_drop = True
 
                         if is_drop:
@@ -342,10 +415,10 @@ class WinDivertPacketShaper:
                             continue
 
                         # 2. Nếu là ứng dụng chỉ bị BÓP BĂNG THÔNG (THROTTLE)
-                        if is_target:
+                        if is_target and (self.limit_kbps > 0 or bool(self.throttled_apps)):
                             packet_len = len(packet.raw) if packet.raw else 64
                             try:
-                                self._packet_queue.put_nowait((packet, packet_len, packet.is_inbound))
+                                self._packet_queue.put_nowait((packet, packet_len, packet.is_inbound, matched_app_key))
                             except queue.Full:
                                 pass
                         else:
@@ -360,10 +433,77 @@ class WinDivertPacketShaper:
                         except Exception:
                             pass
         except Exception as e:
-            if not self._stop_event.is_set():
+            if not ev.is_set():
                 print(f"[PacketShaper Error] WinDivert capture dừng: {e}")
         finally:
+            if self._divert_handle is w:
+                self._divert_handle = None
+
+    def _ensure_engine_running(self, need_throttle: bool = False):
+        """Khởi động hoặc cập nhật các luồng WinDivert an toàn, tránh tạo luồng trùng lặp."""
+        with self._engine_lock:
+            if not self.is_active or (self._capture_thread and not self._capture_thread.is_alive()):
+                # Đảm bảo phiên cũ (nếu có) đã được đóng sạch trước khi mở handle mới
+                self._stop_engine_threads()
+                self.is_active = True
+                stop_ev = threading.Event()
+                self._stop_event = stop_ev
+                self._update_target_ports()
+
+                self._port_monitor_thread = threading.Thread(
+                    target=self._port_monitor_loop, args=(stop_ev,), daemon=True, name="PacketShaper-PortMonitor"
+                )
+                self._port_monitor_thread.start()
+
+                if need_throttle:
+                    self._throttle_worker_thread = threading.Thread(
+                        target=self._throttle_worker_loop, args=(stop_ev,), daemon=True, name="PacketShaper-TokenBucket"
+                    )
+                    self._throttle_worker_thread.start()
+
+                self._capture_thread = threading.Thread(
+                    target=self._capture_loop, args=(stop_ev,), daemon=True, name="PacketShaper-Capture"
+                )
+                self._capture_thread.start()
+            else:
+                if need_throttle and (not self._throttle_worker_thread or not self._throttle_worker_thread.is_alive()):
+                    stop_ev = self._stop_event
+                    self._throttle_worker_thread = threading.Thread(
+                        target=self._throttle_worker_loop, args=(stop_ev,), daemon=True, name="PacketShaper-TokenBucket"
+                    )
+                    self._throttle_worker_thread.start()
+                self._update_target_ports()
+
+    def _stop_engine_threads(self):
+        """Đóng handle WinDivert và chờ luồng bắt gói tin dừng hẳn."""
+        with self._engine_lock:
+            self.is_active = False
+            old_ev = self._stop_event
+            old_ev.set()
+
+            handle = self._divert_handle
             self._divert_handle = None
+            if handle:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+
+            while not self._packet_queue.empty():
+                try:
+                    self._packet_queue.get_nowait()
+                except Exception:
+                    break
+
+            cap_t = self._capture_thread
+            if cap_t and cap_t.is_alive() and cap_t is not threading.current_thread():
+                try:
+                    cap_t.join(timeout=0.25)
+                except Exception:
+                    pass
+            self._capture_thread = None
+            self._throttle_worker_thread = None
+            self._port_monitor_thread = None
 
     @staticmethod
     def _apply_windows_firewall_rule(app_name: str, exe_path: str = "", action: str = "block") -> bool:
@@ -475,20 +615,7 @@ class WinDivertPacketShaper:
         fw_ok = self._apply_windows_firewall_rule(target, real_exe, action="block")
 
         # 4. Kích hoạt luồng WinDivert để drop các gói tin tại driver
-        if not self.is_active:
-            self.is_active = True
-            self._stop_event.clear()
-            self._update_target_ports()
-            self._port_monitor_thread = threading.Thread(
-                target=self._port_monitor_loop, daemon=True, name="PacketShaper-PortMonitor"
-            )
-            self._port_monitor_thread.start()
-            self._capture_thread = threading.Thread(
-                target=self._capture_loop, daemon=True, name="PacketShaper-Capture"
-            )
-            self._capture_thread.start()
-        else:
-            self._update_target_ports()
+        self._ensure_engine_running(need_throttle=(self.limit_kbps > 0))
 
         msg = f"Đã kích hoạt chặn hoàn toàn truy cập mạng cho ứng dụng '{target}' ({len(pids)} tiến trình, Firewall: {'Bật' if fw_ok else 'WinDivert'})."
         print(f"[PacketShaper] {msg}")
@@ -496,21 +623,39 @@ class WinDivertPacketShaper:
 
     def unblock_app(self, app_name: str) -> Tuple[bool, str]:
         """Gỡ bỏ chặn cho một ứng dụng cụ thể."""
-        target = app_name if app_name.lower().endswith(".exe") else f"{app_name}.exe"
-        target_key = target.lower()
+        canonical_name, _, _ = self._resolve_target_name_and_exe(app_name)
+        raw_lower = app_name.lower().strip()
+        target = canonical_name or (app_name if raw_lower.endswith(".exe") else f"{app_name}.exe")
+        candidate_keys = {
+            raw_lower,
+            f"{raw_lower}.exe" if not raw_lower.endswith(".exe") else raw_lower[:-4],
+            target.lower(),
+        }
 
+        removed_names = {target}
         with self._lock:
-            if target_key in self.blocked_apps:
-                del self.blocked_apps[target_key]
+            for k in list(self.blocked_apps.keys()):
+                if k in candidate_keys or k.replace(".exe", "") in candidate_keys:
+                    removed_names.add(k)
+                    del self.blocked_apps[k]
 
         # Xóa rule Windows Firewall
-        self._remove_windows_firewall_rule(target)
+        for r_name in removed_names:
+            self._remove_windows_firewall_rule(r_name)
 
+        should_stop = False
         with self._lock:
-            if not self.blocked_apps and self.is_blocked:
+            if not self.blocked_apps:
                 self.is_blocked = False
+                self.blocked_pids.clear()
+                self.blocked_ports.clear()
                 if self.limit_kbps <= 0:
-                    self.remove_limit()
+                    should_stop = True
+
+        if should_stop:
+            self._stop_engine_threads()
+        else:
+            self._update_target_ports()
 
         msg = f"Đã gỡ chặn mạng cho ứng dụng '{target}' thành công."
         print(f"[PacketShaper] {msg}")
@@ -518,18 +663,21 @@ class WinDivertPacketShaper:
 
     def unblock_all(self) -> Tuple[bool, str]:
         """Gỡ bỏ chặn cho tất cả các ứng dụng."""
-        all_targets = list(self.blocked_apps.keys())
-        for target in all_targets:
-            self._remove_windows_firewall_rule(target)
-
         with self._lock:
+            all_targets = list(self.blocked_apps.keys())
             self.blocked_apps.clear()
             self.blocked_ports.clear()
             self.blocked_pids.clear()
             self.is_blocked = False
+            should_stop = (self.limit_kbps <= 0)
 
-        if self.limit_kbps <= 0:
-            self.remove_limit()
+        for target in all_targets:
+            self._remove_windows_firewall_rule(target)
+
+        if should_stop:
+            self._stop_engine_threads()
+        else:
+            self._update_target_ports()
 
         msg = "Đã gỡ bỏ toàn bộ chính sách chặn mạng cho tất cả ứng dụng."
         print(f"[PacketShaper] {msg}")
@@ -550,7 +698,7 @@ class WinDivertPacketShaper:
 
     def apply_limit(self, app_name: str, limit_kbps: float, direction: str = "both") -> Tuple[bool, str]:
         """
-        Kích hoạt bóp băng thông cho tiến trình mục tiêu.
+        Kích hoạt bóp băng thông cho tiến trình mục tiêu (hỗ trợ nhiều ứng dụng đồng thời).
         - app_name: Tên tiến trình (ví dụ: 'brave.exe', 'chrome.exe', 'brave')
         - limit_kbps: Mức trần băng thông tính bằng KB/s
         - direction: 'upload', 'download', hoặc 'both'
@@ -563,83 +711,101 @@ class WinDivertPacketShaper:
         if limit_kbps <= 0:
             return False, "Mức giới hạn băng thông phải lớn hơn 0 KB/s."
 
-        self.remove_limit()
+        canonical_name, _, _ = self._resolve_target_name_and_exe(app_name)
+        target = canonical_name or (app_name if app_name.lower().endswith(".exe") else f"{app_name}.exe")
+        target_key = target.lower()
+        dir_norm = direction.lower()
 
-        target = app_name if app_name.lower().endswith(".exe") else f"{app_name}.exe"
-        self.target_app = target
-        self.limit_kbps = limit_kbps
-        self.direction = direction.lower()
-        self.is_active = True
-        self._stop_event.clear()
-        self.total_throttled_bytes = 0
-        self.total_throttled_packets = 0
-        self.total_down_bytes = 0
-        self.total_up_bytes = 0
-        self._recent_down_bytes = 0
-        self._recent_up_bytes = 0
-        self._recent_ts = time.time()
-        self.current_speed_kbps = 0.0
-        self.current_down_kbps = 0.0
-        self.current_up_kbps = 0.0
-        self._port_last_seen.clear()
+        with self._lock:
+            self.throttled_apps[target_key] = {
+                "target_app": target,
+                "limit_kbps": limit_kbps,
+                "direction": dir_norm,
+                "tokens": 0.0,
+                "last_refill": time.perf_counter(),
+            }
+            self.target_app = target
+            self.limit_kbps = limit_kbps
+            self.direction = dir_norm
+            self.total_throttled_bytes = 0
+            self.total_throttled_packets = 0
+            self.total_down_bytes = 0
+            self.total_up_bytes = 0
+            self._recent_down_bytes = 0
+            self._recent_up_bytes = 0
+            self._recent_ts = time.time()
+            self.current_speed_kbps = 0.0
+            self.current_down_kbps = 0.0
+            self.current_up_kbps = 0.0
 
-        # Quét cổng lần đầu
-        self._update_target_ports()
+        self._ensure_engine_running(need_throttle=True)
 
-        # Khởi động luồng quét cổng
-        self._port_monitor_thread = threading.Thread(
-            target=self._port_monitor_loop, daemon=True, name="PacketShaper-PortMonitor"
-        )
-        self._port_monitor_thread.start()
-
-        # Khởi động luồng Token Bucket
-        self._throttle_worker_thread = threading.Thread(
-            target=self._throttle_worker_loop, daemon=True, name="PacketShaper-TokenBucket"
-        )
-        self._throttle_worker_thread.start()
-
-        # Khởi động luồng bắt gói tin WinDivert
-        self._capture_thread = threading.Thread(
-            target=self._capture_loop, daemon=True, name="PacketShaper-Capture"
-        )
-        self._capture_thread.start()
-
-        dir_str = "Upload & Download" if self.direction == "both" else ("Upload" if self.direction == "upload" else "Download")
+        dir_str = "Upload & Download" if dir_norm == "both" else ("Upload" if dir_norm == "upload" else "Download")
         msg = f"Đã kích hoạt bóp băng thông WinDivert cho '{target}' thành công: Giới hạn {dir_str} {limit_kbps:,.1f} KB/s."
         print(f"[PacketShaper] {msg}")
         return True, msg
 
-    def remove_limit(self) -> Tuple[bool, str]:
-        """Dừng can thiệp và giải phóng toàn bộ tài nguyên WinDivert."""
-        if not self.is_active:
+    def remove_limit(self, app_name: Optional[str] = None) -> Tuple[bool, str]:
+        """Dừng can thiệp giới hạn băng thông cho 1 ứng dụng hoặc toàn bộ (giữ nguyên WinDivert nếu vẫn còn ứng dụng khác)."""
+        with self._lock:
+            had_limit = bool(self.target_app or self.limit_kbps > 0 or self.throttled_apps)
+            if app_name and app_name.strip():
+                raw_lower = app_name.lower().strip()
+                canonical_name, _, _ = self._resolve_target_name_and_exe(app_name)
+                candidate_keys = {
+                    raw_lower,
+                    f"{raw_lower}.exe" if not raw_lower.endswith(".exe") else raw_lower[:-4],
+                    canonical_name.lower() if canonical_name else "",
+                }
+                removed_app = app_name
+                for k in list(self.throttled_apps.keys()):
+                    if k in candidate_keys or k.replace(".exe", "") in candidate_keys:
+                        removed_app = self.throttled_apps[k].get("target_app", k)
+                        del self.throttled_apps[k]
+                # Xóa các port ánh xạ tới ứng dụng vừa gỡ
+                for p, a_key in list(self.port_to_throttle_app.items()):
+                    if a_key in candidate_keys or a_key.replace(".exe", "") in candidate_keys:
+                        self.port_to_throttle_app.pop(p, None)
+                        self._port_last_seen.pop(p, None)
+                app = removed_app
+            else:
+                app = self.target_app or "tất cả ứng dụng"
+                self.throttled_apps.clear()
+                self.port_to_throttle_app.clear()
+                self.pid_to_throttle_app.clear()
+                self._port_last_seen.clear()
+
+            if self.throttled_apps:
+                # Vẫn còn ứng dụng khác đang bị giới hạn băng thông
+                last_k = next(reversed(self.throttled_apps))
+                last_cfg = self.throttled_apps[last_k]
+                self.target_app = last_cfg["target_app"]
+                self.limit_kbps = last_cfg["limit_kbps"]
+                self.direction = last_cfg["direction"]
+            else:
+                self.target_app = ""
+                self.target_pids.clear()
+                self.target_ports.clear()
+                self.limit_kbps = 0.0
+                self.current_speed_kbps = 0.0
+                self.current_down_kbps = 0.0
+                self.current_up_kbps = 0.0
+
+            has_remaining_work = bool(self.blocked_apps or self.throttled_apps)
+
+        if not self.is_active and not had_limit:
             return True, "Không có chính sách bóp băng thông nào đang chạy."
 
-        app = self.target_app
-        self.is_active = False
-        self._stop_event.set()
-
-        # Đóng handle để ngắt vòng lặp recv
-        if self._divert_handle:
-            try:
-                self._divert_handle.close()
-            except Exception:
-                pass
-
-        # Dọn dẹp hàng đợi
-        while not self._packet_queue.empty():
-            try:
-                self._packet_queue.get_nowait()
-            except Exception:
-                break
-
-        self.target_app = ""
-        self.target_pids.clear()
-        self.target_ports.clear()
-        self._port_last_seen.clear()
-        self.limit_kbps = 0.0
-        self.current_speed_kbps = 0.0
-        self.current_down_kbps = 0.0
-        self.current_up_kbps = 0.0
+        if not has_remaining_work:
+            self._stop_engine_threads()
+        else:
+            if not self.throttled_apps:
+                while not self._packet_queue.empty():
+                    try:
+                        self._packet_queue.get_nowait()
+                    except Exception:
+                        break
+            self._update_target_ports()
 
         msg = f"Đã gỡ bỏ giới hạn băng thông WinDivert cho '{app}' thành công. Toàn bộ lưu lượng trở lại bình thường."
         print(f"[PacketShaper] {msg}")
@@ -653,6 +819,7 @@ class WinDivertPacketShaper:
                 "target_app": self.target_app,
                 "limit_kbps": self.limit_kbps,
                 "direction": self.direction,
+                "throttled_apps": {k: dict(v) for k, v in self.throttled_apps.items()},
                 "target_ports_count": len(self.target_ports),
                 "throttled_packets": self.total_throttled_packets,
                 "throttled_bytes": self.total_throttled_bytes,

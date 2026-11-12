@@ -6,27 +6,38 @@ import ctypes
 import threading
 from ctypes import wintypes
 from collections import defaultdict
-from typing import Dict, Optional, Tuple, Callable
+from typing import Dict, Optional, Tuple
 from datetime import datetime
-import psutil
 from utils.safe_print import safe_print as print
 
 # ============================================================================
-# CẤU TRÚC VÀ HẰNG SỐ WIN32 ETW (EVENT TRACING FOR WINDOWS)
+# CẤU TRÚC VÀ HẰNG SỐ WIN32 ETW & TDH (EVENT TRACING FOR WINDOWS)
 # ============================================================================
 
 WNODE_FLAG_TRACED_GUID = 0x00020000
 EVENT_TRACE_REAL_TIME_MODE = 0x00000100
 EVENT_TRACE_CONTROL_QUERY = 0
 EVENT_TRACE_CONTROL_STOP = 1
+EVENT_CONTROL_CODE_ENABLE_PROVIDER = 1
+TRACE_LEVEL_INFORMATION = 4
 PROCESS_TRACE_MODE_REAL_TIME = 0x00000100
 PROCESS_TRACE_MODE_EVENT_RECORD = 0x10000000
+INVALID_PROCESSTRACE_HANDLE = 0xFFFFFFFFFFFFFFFF
+ERROR_SUCCESS = 0
+ERROR_ACCESS_DENIED = 5
+ERROR_INSUFFICIENT_BUFFER = 122
+ERROR_ALREADY_EXISTS = 183
 
-# GUIDs của các Network Providers trên Windows
-# 1. Microsoft-Windows-Kernel-Network
+# GUID của Network Provider trên Windows:
+# Microsoft-Windows-Kernel-Network ({7DD42A49-5329-4832-8DFD-43D979153A88})
+# Event IDs đã xác minh từ manifest (wevtutil gp Microsoft-Windows-Kernel-Network):
+#   Send: 10 (TCPv4), 26 (TCPv6), 42 (UDPv4), 58 (UDPv6)
+#   Recv: 11 (TCPv4), 27 (TCPv6), 43 (UDPv4), 59 (UDPv6)
 GUID_KERNEL_NETWORK = "{7DD42A49-5329-4832-8DFD-43D979153A88}"
-# 2. Microsoft-Windows-TCPIP
-GUID_WINDOWS_TCPIP = "{2F07E2E4-900D-47C5-85D0-E4530C158691}"
+KERNEL_NETWORK_SEND_IDS = frozenset((10, 26, 42, 58))
+KERNEL_NETWORK_RECV_IDS = frozenset((11, 27, 43, 59))
+
+TDH_PROPERTY_FLAG_STRUCT = 0x1
 
 class GUID(ctypes.Structure):
     _fields_ = [
@@ -132,6 +143,33 @@ EVENT_RECORD._fields_ = [
     ("UserContext", ctypes.c_void_p),
 ]
 
+class EVENT_TRACE_HEADER(ctypes.Structure):
+    _fields_ = [
+        ("Size", wintypes.USHORT),
+        ("HeaderType", ctypes.c_uint8),
+        ("Flags", ctypes.c_uint8),
+        ("ClassType", ctypes.c_uint8),
+        ("ClassLevel", ctypes.c_uint8),
+        ("ClassVersion", wintypes.USHORT),
+        ("ThreadId", wintypes.ULONG),
+        ("ProcessId", wintypes.ULONG),
+        ("TimeStamp", wintypes.LARGE_INTEGER),
+        ("Guid", GUID),
+        ("KernelTime", wintypes.ULONG),
+        ("UserTime", wintypes.ULONG),
+    ]
+
+class EVENT_TRACE(ctypes.Structure):
+    _fields_ = [
+        ("Header", EVENT_TRACE_HEADER),
+        ("InstanceId", wintypes.ULONG),
+        ("ParentInstanceId", wintypes.ULONG),
+        ("ParentGuid", GUID),
+        ("MofData", ctypes.c_void_p),
+        ("MofLength", wintypes.ULONG),
+        ("ClientContext", wintypes.ULONG),
+    ]
+
 class EVENT_TRACE_LOGFILEW(ctypes.Structure):
     _fields_ = [
         ("LogFileName", wintypes.LPWSTR),
@@ -139,7 +177,7 @@ class EVENT_TRACE_LOGFILEW(ctypes.Structure):
         ("CurrentTime", ctypes.c_int64),
         ("BuffersRead", wintypes.ULONG),
         ("ProcessTraceMode", wintypes.ULONG),
-        ("CurrentEvent", EVENT_RECORD),
+        ("CurrentEvent", EVENT_TRACE),
         ("LogfileHeader", ctypes.c_char * 280),
         ("BufferCallback", ctypes.c_void_p),
         ("BufferSize", wintypes.ULONG),
@@ -150,13 +188,125 @@ class EVENT_TRACE_LOGFILEW(ctypes.Structure):
         ("Context", ctypes.c_void_p),
     ]
 
+class TDH_NONSTRUCT_TYPE(ctypes.Structure):
+    _fields_ = [
+        ("InType", wintypes.USHORT),
+        ("OutType", wintypes.USHORT),
+        ("MapNameOffset", wintypes.ULONG),
+    ]
+
+class EVENT_PROPERTY_INFO(ctypes.Structure):
+    _fields_ = [
+        ("Flags", wintypes.ULONG),
+        ("NameOffset", wintypes.ULONG),
+        ("nonStructType", TDH_NONSTRUCT_TYPE),
+        ("count", wintypes.USHORT),
+        ("length", wintypes.USHORT),
+        ("Reserved", wintypes.ULONG),
+    ]
+
+class TRACE_EVENT_INFO(ctypes.Structure):
+    _fields_ = [
+        ("ProviderGuid", GUID),
+        ("EventGuid", GUID),
+        ("EventDescriptor", EVENT_DESCRIPTOR),
+        ("DecodingSource", wintypes.ULONG),
+        ("ProviderNameOffset", wintypes.ULONG),
+        ("LevelNameOffset", wintypes.ULONG),
+        ("ChannelNameOffset", wintypes.ULONG),
+        ("KeywordsNameOffset", wintypes.ULONG),
+        ("TaskNameOffset", wintypes.ULONG),
+        ("OpcodeNameOffset", wintypes.ULONG),
+        ("EventMessageOffset", wintypes.ULONG),
+        ("ProviderMessageOffset", wintypes.ULONG),
+        ("BinaryXMLOffset", wintypes.ULONG),
+        ("BinaryXMLSize", wintypes.ULONG),
+        ("EventNameOffset", wintypes.ULONG),
+        ("EventAttributesOffset", wintypes.ULONG),
+        ("PropertyCount", wintypes.ULONG),
+        ("TopLevelPropertyCount", wintypes.ULONG),
+        ("Flags", wintypes.ULONG),
+    ]
+
+def _configure_advapi32(advapi32):
+    """Thiết lập argtypes/restype chuẩn cho các hàm Win32 ETW trên x64/x86."""
+    TRACEHANDLE = ctypes.c_uint64
+    advapi32.StartTraceW.argtypes = [
+        ctypes.POINTER(TRACEHANDLE),
+        wintypes.LPCWSTR,
+        ctypes.POINTER(EVENT_TRACE_PROPERTIES),
+    ]
+    advapi32.StartTraceW.restype = wintypes.ULONG
+
+    advapi32.ControlTraceW.argtypes = [
+        TRACEHANDLE,
+        wintypes.LPCWSTR,
+        ctypes.POINTER(EVENT_TRACE_PROPERTIES),
+        wintypes.ULONG,
+    ]
+    advapi32.ControlTraceW.restype = wintypes.ULONG
+
+    advapi32.EnableTraceEx2.argtypes = [
+        TRACEHANDLE,
+        ctypes.POINTER(GUID),
+        wintypes.ULONG,
+        ctypes.c_uint8,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        wintypes.ULONG,
+        ctypes.c_void_p,
+    ]
+    advapi32.EnableTraceEx2.restype = wintypes.ULONG
+
+    advapi32.OpenTraceW.argtypes = [ctypes.POINTER(EVENT_TRACE_LOGFILEW)]
+    advapi32.OpenTraceW.restype = TRACEHANDLE
+
+    advapi32.ProcessTrace.argtypes = [
+        ctypes.POINTER(TRACEHANDLE),
+        wintypes.ULONG,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    advapi32.ProcessTrace.restype = wintypes.ULONG
+
+    advapi32.CloseTrace.argtypes = [TRACEHANDLE]
+    advapi32.CloseTrace.restype = wintypes.ULONG
+
+class PROPERTY_DATA_DESCRIPTOR(ctypes.Structure):
+    _fields_ = [
+        ("PropertyName", ctypes.c_uint64),
+        ("ArrayIndex", wintypes.ULONG),
+        ("Reserved", wintypes.ULONG),
+    ]
+
+def _configure_tdh(tdh):
+    """Thiết lập argtypes/restype cho TdhGetEventInformation và TdhGetProperty."""
+    tdh.TdhGetEventInformation.argtypes = [
+        PEVENT_RECORD,
+        wintypes.ULONG,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    tdh.TdhGetEventInformation.restype = wintypes.ULONG
+
+    tdh.TdhGetProperty.argtypes = [
+        PEVENT_RECORD,
+        wintypes.ULONG,
+        ctypes.c_void_p,
+        wintypes.ULONG,
+        ctypes.POINTER(PROPERTY_DATA_DESCRIPTOR),
+        wintypes.ULONG,
+        ctypes.c_void_p,
+    ]
+    tdh.TdhGetProperty.restype = wintypes.ULONG
+
 
 class ETWNetworkConsumer:
     """
-    ETW Consumer thu thập sự kiện gửi/nhận TCP/IP từ kernel:
+    ETW Consumer thu thập sự kiện gửi/nhận TCP/UDP từ kernel (Microsoft-Windows-Kernel-Network):
     - Bắt đầu ETW session thời gian thực.
-    - Đọc các sự kiện TCP/IP (Send / Receive).
-    - Phân tích PID và kích thước dữ liệu (rx_bytes, tx_bytes).
+    - Lọc chặt theo ProviderId và xác minh schema trường (PID, size) bằng TDH API.
     - Tổng hợp lưu lượng theo PID trong khoảng thời gian t.
     - Cơ chế tự phục hồi / fallback nếu chạy dưới quyền Non-Admin.
     """
@@ -173,74 +323,147 @@ class ETWNetworkConsumer:
         # Bảng tổng hợp dữ liệu: pid -> {'rx_bytes': int, 'tx_bytes': int}
         self._traffic_accumulator: Dict[int, Dict[str, int]] = defaultdict(lambda: {'rx_bytes': 0, 'tx_bytes': 0})
 
-        # Dành cho fallback tracker khi không có quyền Administrator
-        self._use_fallback = False
-        self._last_process_io: Dict[int, Tuple[int, int]] = {}
+        # Cache schema từ TdhGetEventInformation theo (event_id, version) -> (pid_off, pid_len, size_off, size_len)
+        self._kernel_net_guid_bytes = bytes(str_to_guid(GUID_KERNEL_NETWORK))
+        self._tdh_schema_cache: Dict[Tuple[int, int], Optional[Tuple[int, int, int, int]]] = {}
+        self._tdh_pid_name = ctypes.create_unicode_buffer("PID")
+        self._tdh_size_name = ctypes.create_unicode_buffer("size")
+        self._tdh_pid_desc = PROPERTY_DATA_DESCRIPTOR(ctypes.addressof(self._tdh_pid_name), 0xFFFFFFFF, 0)
+        self._tdh_size_desc = PROPERTY_DATA_DESCRIPTOR(ctypes.addressof(self._tdh_size_name), 0xFFFFFFFF, 0)
         try:
-            self._prev_net_io = psutil.net_io_counters()
+            self._tdh = ctypes.WinDLL("tdh", use_last_error=True)
+            _configure_tdh(self._tdh)
         except Exception:
-            self._prev_net_io = None
+            self._tdh = None
+
+        # Trạng thái fallback khi không có quyền Administrator
+        self._use_fallback = False
 
         # Giữ tham chiếu callback để GC không thu hồi
         self._c_callback = EVENT_RECORD_CALLBACK(self._event_callback)
 
+    def _resolve_tdh_schema(self, p_record: PEVENT_RECORD) -> Optional[Tuple[int, int, int, int]]:
+        """Dùng TdhGetEventInformation lấy offset và độ dài thật của trường PID và size từ manifest."""
+        if not self._tdh:
+            return None
+        try:
+            buf_size = wintypes.ULONG(0)
+            status = self._tdh.TdhGetEventInformation(p_record, 0, None, None, ctypes.byref(buf_size))
+            if status != ERROR_INSUFFICIENT_BUFFER or buf_size.value < ctypes.sizeof(TRACE_EVENT_INFO):
+                return None
+
+            buf = ctypes.create_string_buffer(buf_size.value)
+            status = self._tdh.TdhGetEventInformation(p_record, 0, None, buf, ctypes.byref(buf_size))
+            if status != ERROR_SUCCESS:
+                return None
+
+            info = ctypes.cast(buf, ctypes.POINTER(TRACE_EVENT_INFO)).contents
+            base = ctypes.addressof(buf)
+            prop_count = info.TopLevelPropertyCount
+            if prop_count <= 0:
+                return None
+
+            props = (EVENT_PROPERTY_INFO * prop_count).from_address(base + ctypes.sizeof(TRACE_EVENT_INFO))
+            offset = 0
+            pid_spec = None
+            size_spec = None
+
+            for i in range(prop_count):
+                prop = props[i]
+                if prop.Flags & TDH_PROPERTY_FLAG_STRUCT or prop.length == 0:
+                    break
+                name = ctypes.wstring_at(base + prop.NameOffset).lower() if prop.NameOffset else ""
+                if name == "pid" and pid_spec is None:
+                    pid_spec = (offset, prop.length)
+                elif name == "size" and size_spec is None:
+                    size_spec = (offset, prop.length)
+                if pid_spec is not None and size_spec is not None:
+                    return (pid_spec[0], pid_spec[1], size_spec[0], size_spec[1])
+                offset += prop.length
+        except Exception:
+            return None
+        return None
+
+    def _get_event_layout(self, p_record: PEVENT_RECORD, event_id: int, version: int) -> Optional[Tuple[int, int, int, int]]:
+        key = (event_id, version)
+        if key in self._tdh_schema_cache:
+            return self._tdh_schema_cache[key]
+
+        resolved = self._resolve_tdh_schema(p_record)
+        self._tdh_schema_cache[key] = resolved
+        return resolved
+
+    def _extract_via_tdh_property(self, p_record: PEVENT_RECORD) -> Tuple[int, int]:
+        """Trích xuất PID và size qua TdhGetProperty khi layout sự kiện không cố định offset."""
+        if not self._tdh:
+            return 0, 0
+        pid_val = ctypes.c_uint32(0)
+        size_val = ctypes.c_uint32(0)
+        st_size = self._tdh.TdhGetProperty(
+            p_record, 0, None, 1, ctypes.byref(self._tdh_size_desc), 4, ctypes.byref(size_val)
+        )
+        if st_size != ERROR_SUCCESS or size_val.value == 0:
+            return 0, 0
+        st_pid = self._tdh.TdhGetProperty(
+            p_record, 0, None, 1, ctypes.byref(self._tdh_pid_desc), 4, ctypes.byref(pid_val)
+        )
+        pid = pid_val.value if st_pid == ERROR_SUCCESS else 0
+        return pid, size_val.value
+    @staticmethod
+    def _unpack_uint(raw_bytes: bytes, offset: int, length: int) -> int:
+        if offset + length > len(raw_bytes):
+            return 0
+        if length == 4:
+            return struct.unpack_from("<I", raw_bytes, offset)[0]
+        if length == 2:
+            return struct.unpack_from("<H", raw_bytes, offset)[0]
+        if length == 8:
+            return struct.unpack_from("<Q", raw_bytes, offset)[0]
+        return 0
+
     def _event_callback(self, p_record: PEVENT_RECORD):
-        """Callback được gọi từ kernel mỗi khi có sự kiện mạng TCP/IP phát sinh."""
+        """Callback được gọi từ kernel mỗi khi có sự kiện mạng TCP/UDP phát sinh."""
         if not p_record:
             return
 
         header = p_record.contents.EventHeader
-        pid = header.ProcessId
-        if pid <= 0:
+        # Lọc chặt theo ProviderId: chỉ xử lý Microsoft-Windows-Kernel-Network
+        if bytes(header.ProviderId) != self._kernel_net_guid_bytes:
             return
 
         event_id = header.EventDescriptor.Id
-        user_data_len = p_record.contents.UserDataLength
-        user_data_ptr = p_record.contents.UserData
-
-        is_send = False
-        is_recv = False
-        packet_size = 0
-
-        # Phân loại sự kiện theo Event ID:
-        # 1. Kernel Network Provider ({7DD42A49-5329-4832-8DFD-43D979153A88})
-        #    10 = TcpSend, 11 = TcpReceive, 42 = UdpSend, 43 = UdpReceive
-        # 2. Microsoft-Windows-TCPIP Provider ({2F07E2E4-900D-47C5-85D0-E4530C158691})
-        #    1001 / 1360 = TcpDataTransferTx (Send), 1002 / 1361 = TcpDataTransferRx (Recv)
-        if event_id in (10, 42, 1001, 1360):
-            is_send = True
-        elif event_id in (11, 43, 1002, 1361):
-            is_recv = True
-
+        is_send = event_id in KERNEL_NETWORK_SEND_IDS
+        is_recv = event_id in KERNEL_NETWORK_RECV_IDS
         if not (is_send or is_recv):
             return
 
-        # Xác định kích thước dữ liệu (size) từ UserData payload
-        if user_data_ptr and user_data_len >= 4:
+        user_data_len = p_record.contents.UserDataLength
+        user_data_ptr = p_record.contents.UserData
+        if not user_data_ptr or user_data_len <= 0:
+            return
+
+        layout = self._get_event_layout(
+            p_record, event_id, header.EventDescriptor.Version
+        )
+        if layout is not None:
+            pid_off, pid_len, size_off, size_len = layout
+            needed = max(pid_off + pid_len, size_off + size_len)
+            if user_data_len < needed:
+                return
             try:
-                # Đọc payload từ con trỏ bộ nhớ UserData
-                raw_bytes = ctypes.string_at(user_data_ptr, min(user_data_len, 32))
-                
-                # Cấu trúc phổ biến của TCP data event trên Windows x64:
-                # [0..7]: Tcb / socket context, [8..11]: size (uint32)
-                if len(raw_bytes) >= 12:
-                    extracted_size = struct.unpack_from("<I", raw_bytes, 8)[0]
-                    if 0 < extracted_size <= 65536:
-                        packet_size = extracted_size
-
-                # Nếu chưa tìm được size hợp lệ, thử đọc DWORD ở offset 0
-                if packet_size == 0 and len(raw_bytes) >= 4:
-                    extracted_size = struct.unpack_from("<I", raw_bytes, 0)[0]
-                    if 0 < extracted_size <= 65536:
-                        packet_size = extracted_size
-
-                # Fallback kích thước theo độ dài UserDataLength
-                if packet_size == 0:
-                    packet_size = min(user_data_len, 1500)
+                raw_bytes = ctypes.string_at(user_data_ptr, needed)
+                pid = self._unpack_uint(raw_bytes, pid_off, pid_len)
+                packet_size = self._unpack_uint(raw_bytes, size_off, size_len)
             except Exception:
-                packet_size = min(user_data_len, 1500)
+                return
         else:
-            packet_size = 64  # Mặc định kích thước gói tin điều khiển tối thiểu
+            pid, packet_size = self._extract_via_tdh_property(p_record)
+
+        if pid <= 0 or pid >= 0xFFFFFFFF:
+            pid = header.ProcessId
+
+        if pid <= 0 or pid >= 0xFFFFFFFF or packet_size <= 0:
+            return
 
         # Tổng hợp byte vào bộ đếm theo PID
         with self._lock:
@@ -258,143 +481,166 @@ class ETWNetworkConsumer:
         self._worker_thread = threading.Thread(target=self._run_consumer, daemon=True, name="ETW-Consumer-Thread")
         self._worker_thread.start()
 
+    def is_alive(self) -> bool:
+        return bool(self.is_running and self._worker_thread and self._worker_thread.is_alive())
+
+    def is_etw_active(self) -> bool:
+        """Trả về True chỉ khi phiên ETW Kernel thực sự đang thu thập (không phải fallback psutil)."""
+        return bool(
+            self.is_running
+            and not self._use_fallback
+            and self.session_handle.value != 0
+            and self.trace_handle.value not in (0, INVALID_PROCESSTRACE_HANDLE, 0xFFFFFFFF)
+        )
+
+    def _build_trace_properties(self):
+        prop_size = ctypes.sizeof(EVENT_TRACE_PROPERTIES) + 1024
+        prop_buf = ctypes.create_string_buffer(prop_size)
+        p_props = ctypes.cast(prop_buf, ctypes.POINTER(EVENT_TRACE_PROPERTIES))
+        p_props.contents.Wnode.BufferSize = prop_size
+        p_props.contents.Wnode.Flags = WNODE_FLAG_TRACED_GUID
+        p_props.contents.Wnode.ClientContext = 1
+        p_props.contents.Wnode.Guid = str_to_guid(GUID_KERNEL_NETWORK)
+        p_props.contents.BufferSize = 64
+        p_props.contents.MinimumBuffers = 4
+        p_props.contents.MaximumBuffers = 64
+        p_props.contents.LogFileMode = EVENT_TRACE_REAL_TIME_MODE
+        p_props.contents.FlushTimer = 1
+        p_props.contents.LoggerNameOffset = ctypes.sizeof(EVENT_TRACE_PROPERTIES)
+        return prop_buf, p_props
+
+    def _cleanup_etw_handles(self, advapi32):
+        if self.trace_handle.value not in (0, INVALID_PROCESSTRACE_HANDLE, 0xFFFFFFFF):
+            advapi32.CloseTrace(self.trace_handle)
+            self.trace_handle = ctypes.c_uint64(0)
+
+        if self.session_handle.value != 0:
+            _stop_buf, p_stop_props = self._build_trace_properties()
+            advapi32.ControlTraceW(
+                self.session_handle,
+                self.SESSION_NAME,
+                p_stop_props,
+                EVENT_TRACE_CONTROL_STOP,
+            )
+            self.session_handle = ctypes.c_uint64(0)
+
     def _run_consumer(self):
-        """Khởi chạy engine thu thập và tổng hợp lưu lượng tiến trình TCP/IP."""
+        """Khởi chạy phiên ETW Kernel thời gian thực; tự động fallback nếu thiếu quyền Admin."""
         try:
-            print("[ETW/Process Engine] Khởi chạy engine giám sát lưu lượng tiến trình thời gian thực...")
-            self._run_fallback_loop()
+            advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+            _configure_advapi32(advapi32)
+
+            _prop_buf, p_props = self._build_trace_properties()
+            status = advapi32.StartTraceW(
+                ctypes.byref(self.session_handle),
+                self.SESSION_NAME,
+                p_props,
+            )
+
+            # Nếu session cũ còn sót lại từ lần chạy trước, dừng và khởi tạo lại
+            if status == ERROR_ALREADY_EXISTS:
+                _stop_buf, p_stop_props = self._build_trace_properties()
+                advapi32.ControlTraceW(
+                    0,
+                    self.SESSION_NAME,
+                    p_stop_props,
+                    EVENT_TRACE_CONTROL_STOP,
+                )
+                self.session_handle = ctypes.c_uint64(0)
+                _prop_buf, p_props = self._build_trace_properties()
+                status = advapi32.StartTraceW(
+                    ctypes.byref(self.session_handle),
+                    self.SESSION_NAME,
+                    p_props,
+                )
+
+            if status != ERROR_SUCCESS or self.session_handle.value == 0:
+                reason = "thiếu quyền Administrator" if status == ERROR_ACCESS_DENIED else f"mã lỗi Win32={status}"
+                print(f"[ETW Warning] Không thể khởi tạo ETW Session ({reason}). Chuyển sang chế độ fallback psutil.")
+                self._use_fallback = True
+                self._run_fallback_loop()
+                return
+
+            guid_kernel_net = str_to_guid(GUID_KERNEL_NETWORK)
+            enable_status = advapi32.EnableTraceEx2(
+                self.session_handle,
+                ctypes.byref(guid_kernel_net),
+                EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                TRACE_LEVEL_INFORMATION,
+                0xFFFFFFFFFFFFFFFF,
+                0,
+                0,
+                None,
+            )
+            if enable_status != ERROR_SUCCESS:
+                print(f"[ETW Warning] EnableTraceEx2(Kernel-Network) thất bại (mã lỗi={enable_status}). Chuyển sang chế độ fallback psutil.")
+                self._cleanup_etw_handles(advapi32)
+                self._use_fallback = True
+                self._run_fallback_loop()
+                return
+
+            logfile = EVENT_TRACE_LOGFILEW()
+            logfile.LoggerName = self.SESSION_NAME
+            logfile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD
+            logfile.EventRecordCallback = self._c_callback
+
+            trace_handle = advapi32.OpenTraceW(ctypes.byref(logfile))
+            self.trace_handle = ctypes.c_uint64(trace_handle)
+            if self.trace_handle.value in (0, INVALID_PROCESSTRACE_HANDLE, 0xFFFFFFFF):
+                err = ctypes.get_last_error()
+                print(f"[ETW Warning] OpenTraceW thất bại (mã lỗi={err}). Chuyển sang chế độ fallback psutil.")
+                self._cleanup_etw_handles(advapi32)
+                self._use_fallback = True
+                self._run_fallback_loop()
+                return
+
+            self._use_fallback = False
+            print(f"[ETW] Đã kích hoạt phiên Kernel ETW '{self.SESSION_NAME}' thành công.")
+
+            handles = (ctypes.c_uint64 * 1)(self.trace_handle.value)
+            proc_status = advapi32.ProcessTrace(handles, 1, None, None)
+            if self.is_running and proc_status != ERROR_SUCCESS:
+                print(f"[ETW Warning] ProcessTrace kết thúc bất thường (mã lỗi={proc_status}). Chuyển sang chế độ fallback psutil.")
+                self._cleanup_etw_handles(advapi32)
+                self._use_fallback = True
+                self._run_fallback_loop()
         except Exception as exc:
-            print(f"[ETW Error] Ngoại lệ luồng consumer: {exc}")
+            print(f"[ETW Error] Ngoại lệ luồng consumer: {exc}. Chuyển sang chế độ fallback psutil.")
+            self._use_fallback = True
+            if self.is_running:
+                self._run_fallback_loop()
 
     def _run_fallback_loop(self):
         """
-        Cơ chế tổng hợp lưu lượng theo PID siêu nhẹ, tập trung vào các tiến trình có kết nối mạng.
-        Giảm thời gian chiếm dụng CPU và GIL từ 800ms xuống dưới 15ms.
+        Chế độ chờ an toàn khi không thể bật Kernel ETW (ví dụ thiếu quyền Administrator).
+        Không dùng psutil.Process.io_counters() vì read_bytes/write_bytes bao gồm cả Disk I/O
+        và I/O khác, sẽ gán nhầm tiến trình ghi file lớn xuống đĩa thành upload mạng.
         """
-        import psutil
         while self.is_running:
-            try:
-                # 1. Thu thập các PID đang mở socket mạng (chỉ khoảng 15-30 tiến trình)
-                active_pids = set()
-                try:
-                    for conn in psutil.net_connections(kind='inet'):
-                        if conn.pid and conn.pid > 0:
-                            active_pids.add(conn.pid)
-                except Exception:
-                    pass
-
-                # Bổ sung các PID đã ghi nhận gần đây để tránh bỏ sót
-                active_pids.update(list(self._last_process_io.keys())[-40:])
-
-                for pid in active_pids:
-                    try:
-                        p = psutil.Process(pid)
-                        io = p.io_counters()
-                        curr_read = io.read_bytes
-                        curr_write = io.write_bytes
-
-                        if pid in self._last_process_io:
-                            prev_read, prev_write = self._last_process_io[pid]
-                            delta_rx = max(0, curr_read - prev_read)
-                            delta_tx = max(0, curr_write - prev_write)
-                            if delta_rx > 0 or delta_tx > 0:
-                                with self._lock:
-                                    self._traffic_accumulator[pid]['rx_bytes'] += delta_rx
-                                    self._traffic_accumulator[pid]['tx_bytes'] += delta_tx
-
-                        self._last_process_io[pid] = (curr_read, curr_write)
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        self._last_process_io.pop(pid, None)
-                        continue
-            except Exception:
-                pass
-
-            time.sleep(1.0)
+            time.sleep(0.5)
 
     def flush_and_aggregate(self) -> Dict[int, Dict[str, int]]:
         """
         Lấy ra mẫu dữ liệu tổng hợp byte (rx_bytes, tx_bytes) theo từng PID
         trong khoảng thời gian vừa qua, đồng thời reset bộ đếm cho chu kỳ tiếp theo.
-        Tự động đối chiếu và chuẩn hóa theo lưu lượng thực tế của toàn bộ card mạng
-        để triệt tiêu hoàn toàn hiện tượng thao tác đọc/ghi file đĩa (Disk I/O)
-        bị tính nhầm thành lưu lượng mạng làm vọt trần QoS!
+        Khi Kernel ETW không hoạt động (_use_fallback=True), trả về {} thay vì bịa số liệu từ Disk I/O.
         """
         with self._lock:
             snapshot = dict(self._traffic_accumulator)
             self._traffic_accumulator.clear()
 
-        if not snapshot:
+        if self._use_fallback:
             return {}
 
-        # Đo lưu lượng card mạng thực tế của toàn hệ thống
-        try:
-            curr_net = psutil.net_io_counters()
-            if self._prev_net_io is not None:
-                real_rx = max(0, curr_net.bytes_recv - self._prev_net_io.bytes_recv)
-                real_tx = max(0, curr_net.bytes_sent - self._prev_net_io.bytes_sent)
-            else:
-                real_rx = None
-                real_tx = None
-            self._prev_net_io = curr_net
-        except Exception:
-            real_rx = None
-            real_tx = None
-
-        if real_rx is None or real_tx is None:
-            return snapshot
-
-        sum_rx = sum(d.get('rx_bytes', 0) for d in snapshot.values())
-        sum_tx = sum(d.get('tx_bytes', 0) for d in snapshot.values())
-
-        # Nếu tổng delta I/O vượt quá lưu lượng card mạng thực tế (do ghi đĩa cache/database)
-        # -> Chuẩn hóa theo tỷ trọng lưu lượng thực tế
-        normalized = {}
-        for pid, d in snapshot.items():
-            rx = d.get('rx_bytes', 0)
-            tx = d.get('tx_bytes', 0)
-
-            if real_rx == 0:
-                norm_rx = 0
-            elif sum_rx > real_rx:
-                norm_rx = int(rx * (real_rx / sum_rx))
-            else:
-                norm_rx = rx
-
-            if real_tx == 0:
-                norm_tx = 0
-            elif sum_tx > real_tx:
-                norm_tx = int(tx * (real_tx / sum_tx))
-            else:
-                norm_tx = tx
-
-            if norm_rx > 0 or norm_tx > 0:
-                normalized[pid] = {'rx_bytes': norm_rx, 'tx_bytes': norm_tx}
-
-        return normalized
+        return snapshot
 
     def stop(self):
         """Dừng ETW Consumer và dọn dẹp Trace Session."""
         self.is_running = False
         try:
             advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-            if self.trace_handle.value not in (0, 0xFFFFFFFFFFFFFFFF):
-                advapi32.CloseTrace(self.trace_handle)
-                self.trace_handle = ctypes.c_uint64(0)
-
-            if self.session_handle.value != 0:
-                prop_size = ctypes.sizeof(EVENT_TRACE_PROPERTIES) + 1024
-                prop_buf = ctypes.create_string_buffer(prop_size)
-                p_props = ctypes.cast(prop_buf, ctypes.POINTER(EVENT_TRACE_PROPERTIES))
-                p_props.contents.Wnode.BufferSize = prop_size
-                p_props.contents.LoggerNameOffset = ctypes.sizeof(EVENT_TRACE_PROPERTIES)
-
-                advapi32.ControlTraceW(
-                    self.session_handle,
-                    ctypes.c_wchar_p(self.SESSION_NAME),
-                    p_props,
-                    EVENT_TRACE_CONTROL_STOP
-                )
-                self.session_handle = ctypes.c_uint64(0)
+            _configure_advapi32(advapi32)
+            self._cleanup_etw_handles(advapi32)
             print("[ETW] Đã dừng ETW Consumer thành công.")
         except Exception as exc:
             print(f"[ETW] Lỗi khi dừng consumer: {exc}")
