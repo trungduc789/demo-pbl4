@@ -119,6 +119,106 @@ class TestFleetManagerService(unittest.TestCase):
             agent.stop()
             fleet_service.stop()
 
+    def test_reconnect_does_not_mark_device_offline(self):
+        """Khi client cùng UUID kết nối lại trước khi phiên cũ đóng, trạng thái vẫn phải là online."""
+        from infrastructure.network_client import NetworkClient
+
+        fleet_service = FleetManagerService(host=self.TEST_HOST, port=19996)
+        self.assertTrue(fleet_service.start())
+
+        disconnect_calls = []
+        orig_disc = fleet_service.server.on_device_disconnected
+
+        def tracked_disc(uuid_val):
+            disconnect_calls.append(uuid_val)
+            if orig_disc:
+                orig_disc(uuid_val)
+
+        fleet_service.server.on_device_disconnected = tracked_disc
+
+        reg = DeviceRegistrationData(
+            device_uuid="reconnect-race-uuid",
+            hostname="RACE-PC",
+            os_name="Windows",
+            os_version="11",
+            mac_address="AA:BB:CC:DD:EE:FF",
+            ip_address="127.0.0.1",
+        )
+        c1 = NetworkClient(server_host=self.TEST_HOST, server_port=19996, reg_data=reg)
+        c2 = NetworkClient(server_host=self.TEST_HOST, server_port=19996, reg_data=reg)
+
+        try:
+            c1.start()
+            deadline = time.time() + 4.0
+            while not c1.is_connected() and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(c1.is_connected())
+
+            # Kết nối client thứ 2 cùng UUID khi client 1 chưa đóng chủ động
+            c2.start()
+            deadline = time.time() + 4.0
+            while not c2.is_connected() and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(c2.is_connected())
+
+            # Chờ thread của phiên cũ dọn dẹp xong
+            time.sleep(0.3)
+
+            state = fleet_service.get_device_state("reconnect-race-uuid")
+            self.assertIsNotNone(state)
+            self.assertEqual(state.status, "online")
+            self.assertEqual(disconnect_calls, [])
+        finally:
+            c1.stop()
+            c2.stop()
+            fleet_service.stop()
+
+    def test_unblock_all_preserves_throttle_policies(self):
+        """UNBLOCK_ALL chỉ gỡ các chính sách BLOCK_APP, giữ nguyên chính sách THROTTLE_SET."""
+        fleet_service = FleetManagerService(host=self.TEST_HOST, port=19997)
+        self.assertTrue(fleet_service.start())
+
+        agent = ClientAgentService(
+            server_host=self.TEST_HOST,
+            server_port=19997,
+            update_interval=1.0,
+            enable_etw=False,
+        )
+        reg_event = threading.Event()
+        fleet_service.on_fleet_updated = reg_event.set
+
+        try:
+            agent.start()
+            self.assertTrue(reg_event.wait(timeout=4.0))
+
+            ok1, _ = fleet_service.send_remote_command(
+                device_uuid=agent.device_uuid,
+                action=CommandAction.THROTTLE_SET.value,
+                target_app="discord.exe",
+                limit_kbps=200.0,
+            )
+            ok2, _ = fleet_service.send_remote_command(
+                device_uuid=agent.device_uuid,
+                action=CommandAction.BLOCK_APP.value,
+                target_app="chrome.exe",
+            )
+            self.assertTrue(ok1 and ok2)
+
+            state = fleet_service.get_device_state(agent.device_uuid)
+            self.assertIn("discord.exe", state.applied_policies)
+            self.assertIn("chrome.exe", state.applied_policies)
+
+            ok3, _ = fleet_service.send_remote_command(
+                device_uuid=agent.device_uuid,
+                action=CommandAction.UNBLOCK_ALL.value,
+            )
+            self.assertTrue(ok3)
+            self.assertNotIn("chrome.exe", state.applied_policies)
+            self.assertIn("discord.exe", state.applied_policies)
+        finally:
+            agent.stop()
+            fleet_service.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

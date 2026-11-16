@@ -20,6 +20,8 @@ class FileLogger:
     _lock = threading.Lock()
     _seen_connections = set()
     _max_seen_cache = 5000
+    MAX_LOG_BYTES = 5 * 1024 * 1024  # 5 MB mỗi file log
+    BACKUP_COUNT = 3                 # Giữ tối đa 3 file sao lưu (.1, .2, .3)
 
     @classmethod
     def _ensure_dir(cls):
@@ -28,6 +30,43 @@ class FileLogger:
                 os.makedirs(LOGS_DIR, exist_ok=True)
             except Exception:
                 pass
+
+    @classmethod
+    def _rotate_if_needed(cls, log_path: str, incoming_bytes: int = 0):
+        """Xoay vòng file log khi vượt ngưỡng MAX_LOG_BYTES (gọi trong _lock)."""
+        if cls.MAX_LOG_BYTES <= 0 or not os.path.exists(log_path):
+            return
+        try:
+            if os.path.getsize(log_path) + incoming_bytes <= cls.MAX_LOG_BYTES:
+                return
+            if cls.BACKUP_COUNT <= 0:
+                os.remove(log_path)
+                return
+
+            oldest = f"{log_path}.{cls.BACKUP_COUNT}"
+            if os.path.exists(oldest):
+                os.remove(oldest)
+
+            for i in range(cls.BACKUP_COUNT - 1, 0, -1):
+                src = f"{log_path}.{i}"
+                dst = f"{log_path}.{i + 1}"
+                if os.path.exists(src):
+                    os.replace(src, dst)
+
+            os.replace(log_path, f"{log_path}.1")
+        except Exception:
+            pass
+
+    @classmethod
+    def _append_line(cls, log_path: str, line: str):
+        """Xoay vòng nếu cần và ghi một dòng vào file log (gọi trong _lock)."""
+        cls._ensure_dir()
+        cls._rotate_if_needed(log_path, len(line.encode("utf-8")))
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
 
     @classmethod
     def log_connection(
@@ -54,7 +93,6 @@ class FileLogger:
                 cls._seen_connections.clear()
             cls._seen_connections.add(conn_key)
 
-            cls._ensure_dir()
             log_path = os.path.join(LOGS_DIR, "connections.log")
             timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             pid_str = f"PID={pid}" if pid else "PID=N/A"
@@ -63,11 +101,7 @@ class FileLogger:
             st_str = f"[{state}]" if state else ""
 
             line = f"[{timestamp_str}] [{protocol.upper()}] {proc_name} ({pid_str}) | {l_str} -> {r_str} {st_str}\n"
-            try:
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(line)
-            except Exception:
-                pass
+            cls._append_line(log_path, line)
 
     @classmethod
     def log_policy(
@@ -86,7 +120,6 @@ class FileLogger:
         Ghi nhật ký áp dụng / gỡ bỏ chính sách an ninh mạng (bóp băng thông / chặn).
         """
         with cls._lock:
-            cls._ensure_dir()
             log_path = os.path.join(LOGS_DIR, "policies.log")
             timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -119,24 +152,26 @@ class FileLogger:
                 line += f" | Chi tiết: {details}"
             line += "\n"
 
-            try:
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(line)
-            except Exception:
-                pass
+            cls._append_line(log_path, line)
 
     @classmethod
     def read_policy_logs(cls, limit: int = 50) -> list:
-        """Đọc các dòng nhật ký chính sách gần nhất từ logs/policies.log."""
+        """Đọc các dòng nhật ký chính sách gần nhất từ logs/policies.log (và các file xoay vòng nếu cần)."""
         log_path = os.path.join(LOGS_DIR, "policies.log")
-        if not os.path.exists(log_path):
-            return []
+        candidates = [log_path] + [f"{log_path}.{i}" for i in range(1, cls.BACKUP_COUNT + 1)]
+        collected = []
         try:
             with cls._lock:
-                with open(log_path, "r", encoding="utf-8") as f:
-                    lines = [ln.strip() for ln in f.readlines() if ln.strip()]
-            recent = lines[-limit:] if limit > 0 else lines
-            recent.reverse()
-            return [{"raw": ln} for ln in recent]
+                for path in candidates:
+                    if not os.path.exists(path):
+                        continue
+                    with open(path, "r", encoding="utf-8") as f:
+                        lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+                    lines.reverse()
+                    collected.extend(lines)
+                    if limit > 0 and len(collected) >= limit:
+                        collected = collected[:limit]
+                        break
+            return [{"raw": ln} for ln in collected]
         except Exception:
             return []

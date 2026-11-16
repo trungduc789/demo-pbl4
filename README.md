@@ -39,49 +39,66 @@ Hệ thống được thiết kế theo kiến trúc **Clean Architecture** 4 t�
 5. **💻 Giám sát Tài nguyên Phần cứng (Hardware Resources):**
    * Theo dõi thời gian thực mức tải CPU, dung lượng RAM khả dụng và tốc độ đọc/ghi dữ liệu ổ cứng (Disk I/O).
 
+6. **🌐 Quản lý Tập trung & Bảo mật Giao thức (Admin Fleet & Client Agent):**
+   * Quản lý nhiều máy trạm Client Agent trong mạng LAN từ Admin Dashboard (`admin_main.py`), hỗ trợ xem telemetry thời gian thực và áp đặt chính sách Firewall / QoS từ xa.
+   * **Bảo mật giao thức TCP:** Bắt tay xác thực 2 chiều Challenge-Response (PSK + HMAC-SHA256), dẫn xuất khóa phiên, bảo vệ toàn vẹn và chống replay theo `[Length][Seq][HMAC]`.
+   * **Phân tầng chính sách 2 lớp:** Chính sách do Admin áp đặt (`Admin Enforced`) được khóa cứng, ưu tiên cao hơn chính sách cục bộ (`Local Self-Protect`) trên máy con.
+
 ---
 
 ## 🏗️ 3. Cấu trúc thư mục dự án
 
 ```text
 NetworkMonitor/
-├── main.py                          # File chạy chính của ứng dụng độc lập
-├── admin_main.py                    # File chạy của Máy Chủ Quản Trị (Admin Server)
-├── client_main.py                   # File chạy của Máy Con (Client Agent)
-├── requirements.txt                 # Danh sách thư viện Python cần thiết
-├── pharse1.txt                      # Kế hoạch và ghi chú yêu cầu kỹ thuật
-├── tổng quan dự án .txt             # Bản tóm tắt tổng quan kiến trúc dự án
+├── main.py                              # Khởi chạy ứng dụng độc lập (Standalone)
+├── admin_main.py                        # Khởi chạy Máy Chủ Quản Trị (Admin Server)
+├── client_main.py                       # Khởi chạy Máy Con (Client Agent: Tray / GUI / Headless)
+├── build_dist.py                        # Script đóng gói PyInstaller (.exe) kèm driver WinDivert
+├── requirements.txt                     # Danh sách thư viện Python cần thiết
 │
-├── config/                          # Tầng cấu hình
-│   └── settings.py                  # Cấu hình chu kỳ lấy mẫu, cổng TCP Server-Client
+├── config/                              # Tầng cấu hình
+│   ├── settings.py                      # Chu kỳ lấy mẫu, cổng TCP, cấu hình bảo mật PSK/timeout
+│   └── client_config.json               # Cấu hình kết nối mặc định của Client Agent
 │
-├── models/                          # Tầng thực thể (Domain Model)
-│   ├── network_sample.py            # Cấu trúc dữ liệu đo lường băng thông & tiến trình
-│   └── network_protocol.py          # Giao thức truyền thông TCP giữa Admin & Client
+├── models/                              # Tầng thực thể (Domain Model)
+│   ├── network_sample.py                # Cấu trúc dữ liệu đo lường băng thông & tiến trình
+│   └── network_protocol.py              # Giao thức truyền thông TCP giữa Admin & Client
 │
-├── infrastructure/                  # Tầng hạ tầng & Tương tác Kernel
-│   ├── network_collector.py         # Lấy số liệu lưu lượng mạng qua psutil
-│   ├── etw_consumer.py              # Đọc gói tin qua Event Tracing for Windows (ETW API)
-│   └── packet_shaper.py             # Driver WinDivert can thiệp bóp băng thông & chặn mạng
+├── infrastructure/                      # Tầng hạ tầng & Tương tác Kernel / Mạng
+│   ├── network_collector.py             # Lấy số liệu lưu lượng mạng qua psutil
+│   ├── etw_consumer.py                  # Đọc gói tin qua Event Tracing for Windows (ETW API)
+│   ├── packet_shaper.py                 # Driver WinDivert bóp băng thông đa chính sách cô lập & Firewall
+│   ├── protocol_framing.py              # Đóng gói nhị phân, HMAC-SHA256 & kiểm tra sequence chống replay
+│   ├── network_server.py                # TCP Server quản lý đa kết nối & xác thực Client
+│   └── network_client.py                # TCP Client tự động kết nối lại, Heartbeat & khử trùng lặp lệnh
 │
-├── application/                     # Tầng nghiệp vụ
-│   ├── bandwidth_calculator.py      # Thuật toán tính toán delta tốc độ mạng
-│   ├── monitor_service.py           # Điều phối luồng dữ liệu trung tâm
-│   ├── fleet_manager_service.py     # Quản lý mạng lưới máy trạm tập trung cho Admin
-│   └── client_agent_service.py      # Dịch vụ ngầm kết nối máy trạm tới Admin Server
+├── application/                         # Tầng nghiệp vụ
+│   ├── bandwidth_calculator.py          # Thuật toán tính toán delta tốc độ mạng
+│   ├── monitor_service.py               # Điều phối luồng dữ liệu chế độ Standalone
+│   ├── fleet_manager_service.py         # Quản lý đội ngũ máy trạm tập trung cho Admin
+│   └── client_agent_service.py          # Dịch vụ Agent trên máy trạm & phân tầng chính sách 2 lớp
 │
-├── presentation/                    # Tầng giao diện người dùng (GUI)
-│   ├── dashboard.py                 # Dashboard PyQt6 + PyQtGraph đa tab
-│   ├── admin_fleet_view.py          # Giao diện quản lý danh sách máy trạm tập trung
-│   └── protect_view.py              # Giao diện điều khiển chính sách chặn & bóp băng thông
+├── presentation/                        # Tầng giao diện người dùng (GUI)
+│   ├── dashboard.py                     # Dashboard PyQt6 + PyQtGraph đa tab
+│   ├── widgets/                         # Các widget đồ họa tách rời khỏi Dashboard
+│   │   └── dashboard_widgets.py         # ArcGauge, WanLanWidget, TimelineScrubber, InspectionBar,...
+│   ├── admin_fleet_view.py              # Giao diện quản lý danh sách máy trạm tập trung
+│   ├── protect_view.py                  # Giao diện điều khiển chính sách chặn & bóp băng thông
+│   ├── traffic_usage_view.py            # Giao diện thống kê lịch sử sử dụng lưu lượng
+│   ├── client_status_window.py          # Cửa sổ trạng thái & chẩn đoán dành cho Client Agent
+│   ├── client_tray.py                   # Quản lý System Tray Icon & thông báo Toast trên Client
+│   ├── glasswire_icons.py               # Bộ icon vector cho giao diện
+│   └── styles.py                        # Theme & stylesheet PyQt6
 │
-├── logs/                            # Thư mục lưu nhật ký hệ thống
-│   ├── policies.log                 # Lịch sử các thao tác chính sách mạng (Block/QoS)
-│   └── connections.log              # Lịch sử socket kết nối mạng
+├── logs/                                # Thư mục lưu nhật ký hệ thống (hỗ trợ xoay vòng tự động)
+│   ├── policies.log                     # Lịch sử các thao tác chính sách mạng (Block/QoS)
+│   └── connections.log                  # Lịch sử socket kết nối mạng
 │
-└── utils/                           # Tiện ích dùng chung
-    ├── file_logger.py               # Quản lý ghi nhật ký file văn bản thread-safe
-    └── safe_print.py                # Hàm in log tương thích mã hóa UTF-8 tiếng Việt
+├── tests/                               # Bộ kiểm thử tự động (unittest)
+└── utils/                               # Tiện ích dùng chung
+    ├── env_setup.py                     # Thiết lập môi trường hệ thống & UTF-8
+    ├── file_logger.py                   # Ghi nhật ký file văn bản thread-safe có xoay vòng (5MB x 3)
+    └── safe_print.py                    # Hàm in log tương thích mã hóa UTF-8 tiếng Việt
 ```
 
 ---
@@ -122,6 +139,15 @@ pip install -r requirements.txt
   ```powershell
   python client_main.py --server 127.0.0.1 --port 9988
   ```
+- **Thiết lập khóa bảo mật PSK riêng (khuyến nghị khi triển khai LAN):**
+  ```powershell
+  $env:PBL4_PSK = "Your-Strong-PreShared-Key"
+  ```
+- **Chạy kiểm thử tự động & Đóng gói `.exe`:**
+  ```powershell
+  python -m unittest discover -s tests -q
+  python build_dist.py
+  ```
 
 > [!TIP]
 > Để ứng dụng theo dõi được lưu lượng chi tiết của từng ứng dụng/tiến trình thông qua kernel ETW và thiết lập can thiệp mạng WinDivert, hãy mở terminal với tùy chọn **Run as Administrator**.
@@ -130,7 +156,7 @@ pip install -r requirements.txt
 
 ## 📜 6. Quản lý Nhật ký Hệ thống (File Logging)
 
-Hệ thống sử dụng cơ chế ghi nhật ký phân tầng trực tiếp vào thư mục `logs/`:
+Hệ thống sử dụng cơ chế ghi nhật ký phân tầng trực tiếp vào thư mục `logs/` (tự động xoay vòng khi vượt quá 5 MB, giữ tối đa 3 file sao lưu `.1`–`.3`):
 * **`logs/policies.log`**: Lưu trữ toàn bộ lịch sử các thao tác bảo mật gồm: Thời gian, Loại thao tác (`POLICY_BLOCK`, `POLICY_UNBLOCK`, `POLICY_APPLY`, `POLICY_REMOVE`), Tên tiến trình, Hướng can thiệp, Mức trần tốc độ và Trạng thái thực thi.
 * **`logs/connections.log`**: Lưu trữ các phiên kết nối mạng TCP/UDP mới của các tiến trình kèm địa chỉ Local, Remote và trạng thái socket.
 

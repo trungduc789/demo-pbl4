@@ -371,15 +371,18 @@ class NetworkServer:
 
             handler.close()
             if registered_uuid:
+                removed_active = False
                 with self._clients_lock:
                     if self.clients.get(registered_uuid) == handler:
                         del self.clients[registered_uuid]
-                print(f"[NetServer] Máy con '{registered_uuid}' đã ngắt kết nối.")
-                if self.on_device_disconnected:
-                    try:
-                        self.on_device_disconnected(registered_uuid)
-                    except Exception as e:
-                        print(f"[NetServer Callback Error on_device_disconnected] {e}")
+                        removed_active = True
+                if removed_active:
+                    print(f"[NetServer] Máy con '{registered_uuid}' đã ngắt kết nối.")
+                    if self.on_device_disconnected:
+                        try:
+                            self.on_device_disconnected(registered_uuid)
+                        except Exception as e:
+                            print(f"[NetServer Callback Error on_device_disconnected] {e}")
 
     def _watchdog_loop(self):
         """Giám sát timeout định kỳ để loại bỏ các máy bị mất nguồn hoặc đứt cáp đột ngột."""

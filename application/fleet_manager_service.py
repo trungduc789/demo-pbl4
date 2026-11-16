@@ -290,7 +290,9 @@ class FleetManagerService:
                     elif action == CommandAction.UNBLOCK_APP.value:
                         state.applied_policies.pop(app_key, None)
                     elif action == CommandAction.UNBLOCK_ALL.value:
-                        state.applied_policies.clear()
+                        for k in list(state.applied_policies.keys()):
+                            if state.applied_policies[k].get("action") == CommandAction.BLOCK_APP.value:
+                                del state.applied_policies[k]
                     elif action == CommandAction.REMOVE_LIMIT.value:
                         if target_app:
                             state.applied_policies.pop(app_key, None)
