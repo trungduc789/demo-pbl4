@@ -9,12 +9,9 @@ Hỗ trợ kiến trúc Đa chính sách cô lập (Per-App Isolated Policy):
 """
 
 from __future__ import annotations
-import os
-import subprocess
 import time
 import queue
 import threading
-from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple, Any
 
 import psutil
@@ -23,68 +20,21 @@ try:
 except ImportError:
     pydivert = None
 
+from infrastructure.shaper_models import (
+    PORT_TTL_SECONDS,
+    MAX_PER_APP_QUEUE_SIZE,
+    ALIAS_MAP,
+    AppThrottlePolicy,
+    AppBlockPolicy,
+    resolve_target_name_and_exe,
+)
+from infrastructure.firewall_helper import (
+    clean_rule_name,
+    apply_windows_firewall_rule,
+    remove_windows_firewall_rule,
+    terminate_app_sockets,
+)
 from utils.safe_print import safe_print as print
-
-PORT_TTL_SECONDS = 5.0  # Cổng không còn hoạt động sẽ bị thu hồi sau 5s để tránh port reuse
-MAX_PER_APP_QUEUE_SIZE = 500  # Hàng đợi tối đa cho từng ứng dụng
-
-
-@dataclass
-class AppThrottlePolicy:
-    """Chính sách bóp băng thông độc lập cho một ứng dụng."""
-    app_key: str                    # Canonical lowercase key, vd: "chrome.exe"
-    target_app: str                 # Tên hiển thị/thực thi, vd: "chrome.exe"
-    limit_kbps: float               # Mức trần (KB/s)
-    direction: str = "both"         # "both", "upload", "download"
-    tokens: float = 0.0
-    last_refill: float = field(default_factory=time.perf_counter)
-    queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=MAX_PER_APP_QUEUE_SIZE))
-    stop_event: threading.Event = field(default_factory=threading.Event)
-    worker_thread: Optional[threading.Thread] = None
-
-    # Thống kê đo lường riêng biệt cho ứng dụng này
-    total_throttled_bytes: int = 0
-    total_throttled_packets: int = 0
-    total_down_bytes: int = 0
-    total_up_bytes: int = 0
-    _recent_down_bytes: int = 0
-    _recent_up_bytes: int = 0
-    _recent_ts: float = field(default_factory=time.time)
-    current_speed_kbps: float = 0.0
-    current_down_kbps: float = 0.0
-    current_up_kbps: float = 0.0
-
-    def update_speed_stats(self, packet_size: int, is_inbound: bool):
-        now = time.time()
-        if packet_size > 0:
-            self.total_throttled_bytes += packet_size
-            self.total_throttled_packets += 1
-            if is_inbound:
-                self.total_down_bytes += packet_size
-                self._recent_down_bytes += packet_size
-            else:
-                self.total_up_bytes += packet_size
-                self._recent_up_bytes += packet_size
-
-        dt = now - self._recent_ts
-        if dt >= 0.5:
-            self.current_down_kbps = (self._recent_down_bytes / 1024.0) / dt
-            self.current_up_kbps = (self._recent_up_bytes / 1024.0) / dt
-            self.current_speed_kbps = ((self._recent_down_bytes + self._recent_up_bytes) / 1024.0) / dt
-            self._recent_down_bytes = 0
-            self._recent_up_bytes = 0
-            self._recent_ts = now
-
-
-@dataclass
-class AppBlockPolicy:
-    """Chính sách chặn hoàn toàn một ứng dụng."""
-    app_key: str                    # Canonical lowercase key, vd: "chrome.exe"
-    target_app: str                 # Tên ứng dụng
-    direction: str = "both"         # "both", "upload", "download"
-    exe_path: str = ""
-    pids: Set[int] = field(default_factory=set)
-    firewall_rule_name: str = ""
 
 
 class WinDivertPacketShaper:
@@ -129,58 +79,11 @@ class WinDivertPacketShaper:
         except Exception:
             return False
 
-    ALIAS_MAP = {
-        "google chrome": "chrome",
-        "microsoft edge": "msedge",
-        "brave browser": "brave",
-        "riot client": "riotclientux",
-        "windows explorer": "explorer",
-        "discord": "discord",
-        "telegram": "telegram",
-        "zalo": "zalo",
-    }
+    ALIAS_MAP = ALIAS_MAP
 
     def _resolve_target_name_and_exe(self, app_name: str, provided_exe: str = "") -> Tuple[str, str, Set[int]]:
         """Phân giải tên hiển thị thân thiện sang tên file .exe thật, đường dẫn thực thi và danh sách PID."""
-        if not app_name:
-            return "", "", set()
-
-        raw_lower = app_name.lower().strip()
-        clean = raw_lower.replace(".exe", "").strip()
-        alias = self.ALIAS_MAP.get(clean, clean)
-
-        found_pids = set()
-        found_exe = provided_exe if (provided_exe and os.path.exists(provided_exe)) else ""
-        canonical_name = ""
-
-        for p in psutil.process_iter(['pid', 'name', 'exe']):
-            try:
-                p_name = (p.info.get('name') or "").lower()
-                p_exe = p.info.get('exe') or ""
-                p_exe_lower = p_exe.lower()
-                p_base = p_name.replace(".exe", "")
-
-                is_match = (
-                    p_name == raw_lower or
-                    p_name == f"{alias}.exe" or
-                    p_base == clean or
-                    p_base == alias or
-                    (alias and (alias in p_name or alias in p_exe_lower))
-                )
-
-                if is_match:
-                    found_pids.add(p.info['pid'])
-                    if not found_exe and p_exe and os.path.exists(p_exe):
-                        found_exe = p_exe
-                    if not canonical_name:
-                        canonical_name = p.info.get('name') or ""
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-
-        if not canonical_name:
-            canonical_name = f"{alias}.exe" if not raw_lower.endswith(".exe") else app_name
-
-        return canonical_name, found_exe, found_pids
+        return resolve_target_name_and_exe(app_name, provided_exe, self.ALIAS_MAP)
 
     def _find_pids_for_name(self, app_name: str) -> Set[int]:
         _, _, pids = self._resolve_target_name_and_exe(app_name)
@@ -391,8 +294,11 @@ class WinDivertPacketShaper:
                 sleep_sec = needed / rate_bytes_per_sec
                 if sleep_sec > 0.0002:
                     time.sleep(sleep_sec)
-                policy.tokens = 0.0
-                policy.last_refill = time.perf_counter()
+                after_sleep = time.perf_counter()
+                actual_elapsed = max(0.0, after_sleep - now)
+                refilled = min(burst_capacity, tokens + actual_elapsed * rate_bytes_per_sec)
+                policy.tokens = max(0.0, refilled - packet_size)
+                policy.last_refill = after_sleep
             else:
                 policy.tokens = tokens - packet_size
 
@@ -554,87 +460,19 @@ class WinDivertPacketShaper:
     # =========================================================================
     @staticmethod
     def _clean_rule_name(app_name: str) -> str:
-        raw = app_name.lower().strip().replace(".exe", "")
-        return f"PBL4_Block_{raw}"
+        return clean_rule_name(app_name)
 
     @staticmethod
     def _apply_windows_firewall_rule(app_name: str, exe_path: str = "", action: str = "block") -> bool:
-        rule_name = WinDivertPacketShaper._clean_rule_name(app_name)
-        if not exe_path or not os.path.exists(exe_path):
-            target_lower = app_name.lower().strip()
-            for p in psutil.process_iter(['name', 'exe']):
-                try:
-                    p_name = (p.info.get('name') or "").lower()
-                    if p_name == target_lower or p_name.replace(".exe", "") == target_lower.replace(".exe", ""):
-                        cand = p.info.get('exe', '')
-                        if cand and os.path.exists(cand):
-                            exe_path = cand
-                            break
-                except Exception:
-                    pass
-
-        if not exe_path or not os.path.exists(exe_path):
-            print(f"[Firewall Rule Warning] Chưa có đường dẫn .exe tuyệt đối của '{app_name}', WinDivert Kernel Dropper sẽ đảm nhiệm chặn toàn bộ gói tin.")
-            return False
-
-        # Xóa quy tắc cũ trước khi tạo để tránh trùng lặp
-        WinDivertPacketShaper._remove_windows_firewall_rule(app_name)
-
-        prog_param = f'program="{exe_path}"'
-        cmd_out = f'netsh advfirewall firewall add rule name="{rule_name}_Out" dir=out action={action} {prog_param} enable=yes'
-        cmd_in = f'netsh advfirewall firewall add rule name="{rule_name}_In" dir=in action={action} {prog_param} enable=yes'
-        try:
-            r1 = subprocess.run(cmd_out, shell=True, capture_output=True, text=True, timeout=3)
-            r2 = subprocess.run(cmd_in, shell=True, capture_output=True, text=True, timeout=3)
-            return r1.returncode == 0 and r2.returncode == 0
-        except Exception as e:
-            print(f"[Firewall Rule Warning] {e}")
-            return False
+        return apply_windows_firewall_rule(app_name, exe_path, action)
 
     @staticmethod
     def _remove_windows_firewall_rule(app_name: str) -> bool:
-        rule_name = WinDivertPacketShaper._clean_rule_name(app_name)
-        try:
-            subprocess.run(f'netsh advfirewall firewall delete rule name="{rule_name}_Out"', shell=True, capture_output=True, text=True, timeout=3)
-            subprocess.run(f'netsh advfirewall firewall delete rule name="{rule_name}_In"', shell=True, capture_output=True, text=True, timeout=3)
-            return True
-        except Exception:
-            return False
+        return remove_windows_firewall_rule(app_name)
 
     @staticmethod
     def _terminate_app_sockets(app_pids: Set[int]):
-        """Cắt đứt ngay lập tức các kết nối TCP hiện có của ứng dụng bằng SetTcpEntry."""
-        try:
-            import ctypes
-            from ctypes import wintypes
-            class MIB_TCPROW(ctypes.Structure):
-                _fields_ = [
-                    ("dwState", wintypes.DWORD),
-                    ("dwLocalAddr", wintypes.DWORD),
-                    ("dwLocalPort", wintypes.DWORD),
-                    ("dwRemoteAddr", wintypes.DWORD),
-                    ("dwRemotePort", wintypes.DWORD),
-                ]
-            MIB_TCP_STATE_DELETE_TCB = 12
-            for pid in app_pids:
-                try:
-                    for conn in psutil.Process(pid).net_connections(kind='tcp'):
-                        if conn.status == 'ESTABLISHED' and conn.laddr and conn.raddr:
-                            row = MIB_TCPROW()
-                            row.dwState = MIB_TCP_STATE_DELETE_TCB
-                            try:
-                                import socket
-                                row.dwLocalAddr = int.from_bytes(socket.inet_aton(conn.laddr.ip), 'little')
-                                row.dwLocalPort = socket.htons(conn.laddr.port)
-                                row.dwRemoteAddr = int.from_bytes(socket.inet_aton(conn.raddr.ip), 'little')
-                                row.dwRemotePort = socket.htons(conn.raddr.port)
-                                ctypes.windll.iphlpapi.SetTcpEntry(ctypes.byref(row))
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        terminate_app_sockets(app_pids)
 
     # =========================================================================
     # CÁC HÀM CÔNG KHAI: BLOCK & UNBLOCK (CHẶN HOÀN TOÀN)
@@ -775,6 +613,14 @@ class WinDivertPacketShaper:
                 tokens=0.0,
                 last_refill=time.perf_counter()
             )
+            if existing is not None:
+                while not existing.queue.empty():
+                    try:
+                        pkt_item = existing.queue.get_nowait()
+                        if pkt_item is not None:
+                            policy.queue.put_nowait(pkt_item)
+                    except (queue.Empty, queue.Full):
+                        break
             self.throttled_apps[app_key] = policy
 
         # Đảm bảo Engine chính chạy
