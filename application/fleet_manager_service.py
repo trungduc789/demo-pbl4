@@ -25,6 +25,8 @@ from models.network_protocol import (
     CommandResultPacket,
 )
 from infrastructure.network_server import NetworkServer
+from infrastructure.network_collector import NetworkCollector
+from utils.file_logger import FileLogger, LOGS_DIR
 from utils.safe_print import safe_print as print
 
 
@@ -68,6 +70,8 @@ class FleetManagerService:
 
         # 1. Khởi tạo tầng hạ tầng mạng
         self.server = NetworkServer(host=self.host, port=self.port)
+        self.collector = NetworkCollector()
+        self.proc_info_cache: Dict[int, Tuple[str, str]] = {}
 
         # 2. Bộ nhớ đệm danh bạ máy con & theo dõi lệnh đang chờ phản hồi
         self._devices: Dict[str, FleetDeviceState] = {}
@@ -304,3 +308,59 @@ class FleetManagerService:
             return True, f"Đã gửi lệnh '{action}' thành công tới '{state.hostname}' (ID: {cmd_id})"
         else:
             return False, f"Gửi lệnh tới máy '{state.hostname}' thất bại qua kênh truyền thông."
+
+    def get_raw_tcp_connections(self) -> List[Any]:
+        """Lấy danh sách đối tượng kết nối TCP thô từ tầng hạ tầng."""
+        return self.collector.collect_tcp_connections()
+
+    def resolve_executable_path(self, pid: int) -> str:
+        """Phân giải đường dẫn file .exe từ PID qua NetworkCollector."""
+        if pid <= 0:
+            return ""
+        if pid in self.proc_info_cache:
+            _, exe_path = self.proc_info_cache[pid]
+            if exe_path:
+                return exe_path
+        p_info = self.collector.get_process_info(pid)
+        if p_info:
+            p_name = p_info.name or f"PID {pid}"
+            exe_path = p_info.executable_path or ""
+            self.proc_info_cache[pid] = (p_name, exe_path)
+            return exe_path
+        return ""
+
+    def get_connections(self) -> List[Dict]:
+        """Lấy danh sách các kết nối socket TCP kèm thông tin tiến trình."""
+        raw_conns = self.collector.collect_tcp_connections()
+        enriched = []
+        for conn in raw_conns:
+            pid = conn.pid or 0
+            if pid in self.proc_info_cache:
+                proc_name, _ = self.proc_info_cache[pid]
+            else:
+                p_info = self.collector.get_process_info(pid)
+                proc_name = p_info.name if p_info else ("System" if pid == 0 else f"PID {pid}")
+                exe_path = p_info.executable_path if p_info and p_info.executable_path else ""
+                self.proc_info_cache[pid] = (proc_name, exe_path)
+            enriched.append({
+                "pid": pid,
+                "process_name": proc_name,
+                "protocol": conn.protocol,
+                "local_addr": f"{conn.local_ip}:{conn.local_port}" if conn.local_port else conn.local_ip,
+                "remote_addr": f"{conn.remote_ip}:{conn.remote_port}" if conn.remote_ip and conn.remote_port else ("*" if conn.state == "LISTEN" else "-"),
+                "state": conn.state
+            })
+        return enriched
+
+    def get_policy_history(self, limit: int = 200) -> List[Dict]:
+        """Đọc lịch sử chính sách an ninh mạng từ FileLogger."""
+        return FileLogger.read_policy_logs(limit)
+
+    def get_connection_history_text(self, limit: int = 200) -> str:
+        """Đọc nội dung nhật ký kết nối mạng từ FileLogger."""
+        return FileLogger.read_connection_logs(limit)
+
+    @staticmethod
+    def get_logs_directory() -> str:
+        """Trả về đường dẫn thư mục lưu trữ nhật ký."""
+        return LOGS_DIR

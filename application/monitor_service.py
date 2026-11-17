@@ -4,9 +4,9 @@ from infrastructure.network_collector import NetworkCollector
 from infrastructure.etw_consumer import ETWNetworkConsumer
 from infrastructure.packet_shaper import WinDivertPacketShaper
 from application.bandwidth_calculator import BandwidthCalculator
-from models.network_sample import RawNetworkSample, BandwidthSpeed
+from models.network_sample import RawNetworkSample, BandwidthSpeed, TCPConnectionInfo
 from config.settings import MAX_DATA_POINTS
-from utils.file_logger import FileLogger
+from utils.file_logger import FileLogger, LOGS_DIR
 from utils.safe_print import safe_print as print
 
 class MonitorService:
@@ -111,9 +111,9 @@ class MonitorService:
                     for p in proc_speeds:
                         p_name = p.get("name", "").lower()
                         if p_name == target_app or p_name.replace(".exe", "") == target_base or (target_base and target_base in p_name):
-                            if s_dir in ("download", "both"):
+                            if shaper_dir in ("download", "both"):
                                 p["down_kb"] = shaper_down
-                            if s_dir in ("upload", "both"):
+                            if shaper_dir in ("upload", "both"):
                                 p["up_kb"] = shaper_up
 
             # Sắp xếp tiến trình có lưu lượng mạng lớn nhất lên trên
@@ -128,6 +128,26 @@ class MonitorService:
         self.upload_history.append(speed.upload_speed_kb)
         self.download_history.append(speed.download_speed_kb)
         return speed, self.latest_proc_speeds, self.latest_total_proc_down, self.latest_total_proc_up
+
+    def get_raw_tcp_connections(self) -> List[TCPConnectionInfo]:
+        """Lấy danh sách đối tượng kết nối TCP thô từ tầng hạ tầng (phục vụ phân tích WAN/LAN)."""
+        return self.collector.collect_tcp_connections()
+
+    def resolve_executable_path(self, pid: int) -> str:
+        """Phân giải đường dẫn file .exe từ PID thông qua bộ nhớ đệm hoặc NetworkCollector."""
+        if pid <= 0:
+            return ""
+        if pid in self.proc_info_cache:
+            _, exe_path = self.proc_info_cache[pid]
+            if exe_path:
+                return exe_path
+        p_info = self.collector.get_process_info(pid)
+        if p_info:
+            p_name = p_info.name or f"PID {pid}"
+            exe_path = p_info.executable_path or ""
+            self.proc_info_cache[pid] = (p_name, exe_path)
+            return exe_path
+        return ""
 
     def get_connections(self) -> List[Dict]:
         """Lấy danh sách các kết nối socket TCP hiện tại kèm thông tin tiến trình."""
@@ -256,6 +276,15 @@ class MonitorService:
     def get_policy_history(self, limit: int = 50) -> List[Dict]:
         """Lấy danh sách lịch sử các chính sách an ninh mạng đã áp dụng từ file log."""
         return FileLogger.read_policy_logs(limit)
+
+    def get_connection_history_text(self, limit: int = 200) -> str:
+        """Lấy nội dung nhật ký kết nối mạng gần nhất từ file log."""
+        return FileLogger.read_connection_logs(limit)
+
+    @staticmethod
+    def get_logs_directory() -> str:
+        """Trả về đường dẫn thư mục lưu trữ nhật ký hệ thống."""
+        return LOGS_DIR
 
     # Giữ tương thích ngược với tên hàm cũ nếu có nơi gọi
     def apply_qos_upload_limit(self, app_name: str, limit_kbps: float, direction: str = "both") -> Tuple[bool, str]:

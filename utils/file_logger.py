@@ -155,6 +155,31 @@ class FileLogger:
             cls._append_line(log_path, line)
 
     @classmethod
+    def parse_policy_log_entry(cls, raw_line: str) -> dict:
+        """Phân tách dòng log chính sách thành dict có cấu trúc để tầng UI không phải tự xử lý Regex."""
+        import re
+        ts = ""
+        action = "POLICY"
+        details = raw_line
+        status = "SUCCESS"
+        m = re.match(r"^\[(.*?)\]\s*\[(.*?)\]\s*(.*)$", raw_line)
+        if m:
+            ts = m.group(1)
+            action = m.group(2)
+            details = m.group(3)
+        if "FAILED" in raw_line:
+            status = "FAILED"
+        elif "DENIED" in raw_line:
+            status = "DENIED"
+        return {
+            "raw": raw_line,
+            "timestamp": ts,
+            "action": action,
+            "details": details,
+            "status": status,
+        }
+
+    @classmethod
     def read_policy_logs(cls, limit: int = 50) -> list:
         """Đọc các dòng nhật ký chính sách gần nhất từ logs/policies.log (và các file xoay vòng nếu cần)."""
         log_path = os.path.join(LOGS_DIR, "policies.log")
@@ -172,6 +197,21 @@ class FileLogger:
                     if limit > 0 and len(collected) >= limit:
                         collected = collected[:limit]
                         break
-            return [{"raw": ln} for ln in collected]
+            return [cls.parse_policy_log_entry(ln) for ln in collected]
         except Exception:
             return []
+
+    @classmethod
+    def read_connection_logs(cls, limit: int = 200) -> str:
+        """Đọc các dòng nhật ký kết nối gần nhất từ logs/connections.log."""
+        conn_log_path = os.path.join(LOGS_DIR, "connections.log")
+        try:
+            with cls._lock:
+                if not os.path.exists(conn_log_path):
+                    return "Chưa có nhật ký kết nối nào được ghi nhận."
+                with open(conn_log_path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+                recent_lines = lines[-limit:] if (limit > 0 and len(lines) > limit) else lines
+                return "".join(recent_lines)
+        except Exception:
+            return "Chưa có nhật ký kết nối nào được ghi nhận."

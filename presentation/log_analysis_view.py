@@ -6,9 +6,6 @@ Giao diện Phân tích Nhật ký Hoạt động & Chính sách Mạng (Log Ana
 - Tuân thủ kiến trúc 3 lớp: chỉ nhận dữ liệu đã phân tích từ tầng Application.
 """
 
-import os
-import sys
-import subprocess
 from typing import Callable, Dict, List, Optional
 from PyQt6 import QtWidgets, QtCore, QtGui
 from utils.safe_print import safe_print as print
@@ -22,12 +19,14 @@ class LogAnalysisView(QtWidgets.QWidget):
         fetch_policy_logs: Optional[Callable[[int], List[Dict]]] = None,
         fetch_connection_logs: Optional[Callable[[int], str]] = None,
         get_logs_dir: Optional[Callable[[], str]] = None,
+        open_logs_folder_cb: Optional[Callable[[], bool]] = None,
         parent: Optional[QtWidgets.QWidget] = None,
     ):
         super().__init__(parent)
         self._fetch_policy_logs = fetch_policy_logs
         self._fetch_connection_logs = fetch_connection_logs
         self._get_logs_dir = get_logs_dir
+        self._open_logs_folder_cb = open_logs_folder_cb
         self.raw_policy_logs: List[Dict] = []
         self._init_ui()
 
@@ -157,17 +156,10 @@ class LogAnalysisView(QtWidgets.QWidget):
         layout.addWidget(self.log_tabs)
 
     def open_logs_folder(self):
-        """Mở thư mục logs trên hệ điều hành."""
+        """Ủy quyền mở thư mục logs xuống tầng Application."""
         try:
-            logs_dir = self._get_logs_dir() if self._get_logs_dir else ""
-            if not logs_dir:
-                return
-            if not os.path.exists(logs_dir):
-                os.makedirs(logs_dir, exist_ok=True)
-            if sys.platform == "win32":
-                os.startfile(logs_dir)
-            else:
-                subprocess.Popen(["xdg-open", logs_dir])
+            if self._open_logs_folder_cb:
+                self._open_logs_folder_cb()
         except Exception as e:
             print(f"[UI] Không thể mở thư mục logs: {e}")
 

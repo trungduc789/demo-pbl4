@@ -11,13 +11,10 @@ Dịch vụ Agent chạy trên máy con (Client Agent Service - Application Laye
 
 import os
 import sys
+import json
 import time
-import uuid
-import platform
 import threading
 from typing import Dict, List, Optional, Tuple, Callable, Any
-
-import psutil
 
 from config.settings import (
     SERVER_DEFAULT_HOST,
@@ -188,42 +185,10 @@ class ClientAgentService:
             return list(self.audit_logs)
 
     def _generate_device_info(self) -> Tuple[str, DeviceRegistrationData]:
-        """Tạo UUID phần cứng ổn định và thu thập thông tin hệ thống của máy con."""
-        hostname = platform.node() or "unknown-host"
-        os_name = platform.system() or "UnknownOS"
-        os_version = platform.version() or "unknown"
-        mac_num = uuid.getnode()
-        mac_str = ":".join(f"{(mac_num >> (8 * i)) & 0xFF:02X}" for i in reversed(range(6)))
-        stable_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{hostname}-{mac_num}"))
-
-        # Tìm IP LAN thực tế
-        local_ip = "127.0.0.1"
-        try:
-            for iface_name, addrs in psutil.net_if_addrs().items():
-                for addr in addrs:
-                    if addr.family == psutil.AF_LINK or not hasattr(addr, "address"):
-                        continue
-                    # Bỏ qua loopback
-                    if addr.address.startswith("127.") or addr.address == "::1":
-                        continue
-                    if "." in addr.address:  # IPv4
-                        local_ip = addr.address
-                        break
-                if local_ip != "127.0.0.1":
-                    break
-        except Exception:
-            pass
-
-        reg_data = DeviceRegistrationData(
-            device_uuid=stable_uuid,
-            hostname=hostname,
-            os_name=os_name,
-            os_version=os_version,
-            agent_version="1.0.0",
-            mac_address=mac_str,
-            ip_address=local_ip,
-        )
-        return stable_uuid, reg_data
+        """Tạo UUID phần cứng ổn định và thu thập thông tin hệ thống của máy con thông qua tầng Infrastructure."""
+        if isinstance(self.collector, NetworkCollector):
+            return self.collector.generate_device_info(agent_version="1.0.0")
+        return NetworkCollector().generate_device_info(agent_version="1.0.0")
 
     def start(self):
         """Khởi động toàn bộ dịch vụ Agent và bắt đầu gửi Telemetry."""
@@ -336,9 +301,11 @@ class ClientAgentService:
                 top_procs.sort(key=lambda p: (p.down_kbps + p.up_kbps), reverse=True)
                 top_procs = top_procs[:15]  # Lấy 15 tiến trình cao nhất để gói tin gọn nhẹ
 
-                # 2. Thu thập CPU, RAM
-                cpu_pct = psutil.cpu_percent(interval=None)
-                ram_pct = psutil.virtual_memory().percent
+                # 2. Thu thập CPU, RAM thông qua tầng Infrastructure
+                collector_obj = self.collector if isinstance(self.collector, NetworkCollector) else NetworkCollector()
+                sys_stats = collector_obj.collect_system_stats()
+                cpu_pct = sys_stats.get("cpu_percent", 0.0)
+                ram_pct = sys_stats.get("ram_percent", 0.0)
 
                 # 3. Thu thập số lượng Socket kết nối
                 try:
@@ -403,6 +370,12 @@ class ClientAgentService:
                 if not app_name:
                     success, message = False, "Tên ứng dụng cần chặn không được để trống."
                 else:
+                    existing_pol = self._find_policy_entry(app_name)
+                    if existing_pol and existing_pol.get("action") == "THROTTLE":
+                        try:
+                            self.packet_shaper.remove_limit(app_name)
+                        except TypeError:
+                            self.packet_shaper.remove_limit()
                     success, message = self.packet_shaper.block_app(app_name, direction=direction)
 
             elif action == CommandAction.UNBLOCK_APP.value:
@@ -420,6 +393,9 @@ class ClientAgentService:
                 elif limit_kbps <= 0:
                     success, message = False, "Hạn mức băng thông phải lớn hơn 0 KB/s."
                 else:
+                    existing_pol = self._find_policy_entry(app_name)
+                    if existing_pol and existing_pol.get("action") == "BLOCK":
+                        self.packet_shaper.unblock_app(app_name)
                     success, message = self.packet_shaper.apply_limit(app_name, limit_kbps=limit_kbps, direction=direction)
 
             elif action == CommandAction.REMOVE_LIMIT.value:
@@ -499,7 +475,9 @@ class ClientAgentService:
             elif action == CommandAction.UNBLOCK_APP.value:
                 self._remove_policy_entry(app_key)
             elif action == CommandAction.UNBLOCK_ALL.value:
-                self.active_policies.clear()
+                for k in list(self.active_policies.keys()):
+                    if self.active_policies[k].get("action") == "BLOCK":
+                        del self.active_policies[k]
             elif action == CommandAction.REMOVE_LIMIT.value:
                 if app_key:
                     pol = self._find_policy_entry(app_key)
@@ -591,7 +569,13 @@ class ClientAgentService:
             return False, msg
 
         act_upper = action.upper()
+        existing_local = self._find_policy_entry(app_name)
         if act_upper == "BLOCK":
+            if existing_local and existing_local.get("action") == "THROTTLE":
+                try:
+                    self.packet_shaper.remove_limit(app_name)
+                except TypeError:
+                    self.packet_shaper.remove_limit()
             ok, msg = self.packet_shaper.block_app(app_name, direction=direction)
             if ok:
                 self._remove_policy_entry(app_name)
@@ -621,6 +605,8 @@ class ClientAgentService:
         elif act_upper in ("THROTTLE", "QOS"):
             if limit_kbps <= 0:
                 return False, "Hạn mức băng thông phải lớn hơn 0 KB/s."
+            if existing_local and existing_local.get("action") == "BLOCK":
+                self.packet_shaper.unblock_app(app_name)
             ok, msg = self.packet_shaper.apply_limit(app_name, limit_kbps=limit_kbps, direction=direction)
             if ok:
                 self._remove_policy_entry(app_name)
@@ -781,85 +767,41 @@ class ClientAgentService:
 
         threading.Thread(target=_probe, daemon=True, name="ClientAgent-LatencyProbe").start()
 
+    def _get_infra_collector(self) -> NetworkCollector:
+        if isinstance(self.collector, NetworkCollector):
+            return self.collector
+        return NetworkCollector()
+
     def check_server_latency(self) -> Tuple[Optional[float], bool, str]:
-        """Đo độ trễ TCP tới Admin Server."""
-        import socket
-        t0 = time.perf_counter()
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(1.0)
-            s.connect((self.server_host, self.server_port))
-            s.close()
-            latency = round((time.perf_counter() - t0) * 1000.0, 1)
-            return latency, True, "Kết nối TCP ổn định"
-        except Exception:
-            if self.net_client.is_connected():
-                return 1.0, True, "Kênh kết nối Socket chính đang mở"
-            return None, False, "Không thể kết nối tới Server"
+        """Đo độ trễ TCP tới Admin Server thông qua tầng Infrastructure."""
+        lat, ok, msg = self._get_infra_collector().measure_tcp_latency(
+            host=self.server_host,
+            port=self.server_port,
+            timeout=1.0,
+            success_msg="Kết nối TCP ổn định",
+        )
+        if ok:
+            return lat, True, msg
+        if self.net_client.is_connected():
+            return 1.0, True, "Kênh kết nối Socket chính đang mở"
+        return None, False, "Không thể kết nối tới Server"
 
     def check_internet_latency(self, target_host: str = "8.8.8.8", target_port: int = 53, timeout: float = 1.0) -> Tuple[Optional[float], bool, str]:
-        """Đo độ trễ tới Gateway Internet / Public DNS."""
-        import socket
-        t0 = time.perf_counter()
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(timeout)
-            s.connect((target_host, target_port))
-            s.close()
-            latency = round((time.perf_counter() - t0) * 1000.0, 1)
-            return latency, True, "Internet sẵn sàng"
-        except Exception:
-            try:
-                t1 = time.perf_counter()
-                socket.gethostbyname("dns.google")
-                latency = round((time.perf_counter() - t1) * 1000.0, 1)
-                return latency, True, "DNS Lookup thành công"
-            except Exception:
-                return None, False, "Không phản hồi mạng ngoài"
+        """Đo độ trễ tới Gateway Internet / Public DNS thông qua tầng Infrastructure."""
+        return self._get_infra_collector().measure_tcp_latency(
+            host=target_host,
+            port=target_port,
+            timeout=timeout,
+            success_msg="Internet sẵn sàng",
+            dns_fallback_host="dns.google",
+        )
 
     def get_active_nic_info(self) -> Dict[str, Any]:
-        """Thu thập thông tin card mạng chính đang định tuyến."""
-        import socket
-        routing_ip = self.registration_data.ip_address
-        nic_name = "Tự động phát hiện"
-        nic_speed = 0
-        link_type = "Ethernet / Wi-Fi"
-
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            routing_ip = s.getsockname()[0]
-            s.close()
-        except Exception:
-            pass
-
-        try:
-            stats = psutil.net_if_stats()
-            addrs = psutil.net_if_addrs()
-            for name, addr_list in addrs.items():
-                for a in addr_list:
-                    if getattr(a, "address", "") == routing_ip:
-                        nic_name = name
-                        st = stats.get(name)
-                        if st:
-                            nic_speed = getattr(st, "speed", 0)
-                        lower_name = name.lower()
-                        if "wi-fi" in lower_name or "wireless" in lower_name or "wlan" in lower_name:
-                            link_type = "Wi-Fi (Wireless 802.11)"
-                        elif "ethernet" in lower_name or "eth" in lower_name:
-                            link_type = "Ethernet (LAN Cable)"
-                        break
-        except Exception:
-            pass
-
-        return {
-            "name": nic_name,
-            "ip": routing_ip,
-            "mac": self.registration_data.mac_address,
-            "speed_mbps": nic_speed if nic_speed > 0 else 100,
-            "type": link_type,
-            "gateway": "192.168.1.1",
-        }
+        """Thu thập thông tin card mạng chính đang định tuyến thông qua tầng Infrastructure."""
+        return self._get_infra_collector().get_active_nic_info(
+            default_ip=self.registration_data.ip_address,
+            mac_address=self.registration_data.mac_address,
+        )
 
     def run_full_diagnostics(self) -> List[str]:
         """Chạy bài kiểm tra toàn diện và trả về danh sách nhật ký."""
@@ -907,37 +849,43 @@ class ClientAgentService:
 
     def is_windows_autostart(self) -> bool:
         """Kiểm tra máy con có được thiết lập tự khởi động cùng Windows không."""
-        if sys.platform != "win32":
-            return False
-        try:
-            import winreg
-            run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_READ) as key:
-                winreg.QueryValueEx(key, "ClientNetworkAgent")
-                return True
-        except Exception:
-            return False
+        return NetworkCollector.is_windows_autostart("ClientNetworkAgent")
 
     def set_windows_autostart(self, enable: bool) -> bool:
         """Bật / tắt tự động khởi động cùng Windows cho Client Agent."""
-        if sys.platform != "win32":
-            return False
+        return NetworkCollector.set_windows_autostart(enable, "ClientNetworkAgent")
+
+    def save_client_config(
+        self,
+        server_host: str,
+        server_port: int,
+        show_toast: bool,
+        auto_start: bool,
+        config_path: Optional[str] = None,
+    ) -> bool:
+        """Lưu cấu hình kết nối máy con xuống tệp client_config.json và áp dụng ngay lập tức."""
+        if not config_path:
+            if getattr(sys, "frozen", False):
+                base = os.path.dirname(sys.executable)
+            else:
+                base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            config_path = os.path.join(base, "config", "client_config.json")
+
+        self.set_windows_autostart(auto_start)
+        cfg = {
+            "server_host": server_host,
+            "server_port": int(server_port),
+            "enable_etw": self.enable_etw,
+            "show_toast_notifications": bool(show_toast),
+            "auto_start_windows": bool(auto_start),
+        }
         try:
-            import winreg
-            run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE) as key:
-                if enable:
-                    if getattr(sys, "frozen", False):
-                        app_exe = sys.executable
-                    else:
-                        app_exe = f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}" --hide'
-                    winreg.SetValueEx(key, "ClientNetworkAgent", 0, winreg.REG_SZ, app_exe)
-                else:
-                    try:
-                        winreg.DeleteValue(key, "ClientNetworkAgent")
-                    except FileNotFoundError:
-                        pass
-            return True
+            os.makedirs(os.path.dirname(config_path), exist_ok=True)
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
         except Exception as e:
-            print(f"[ClientAgent Autostart Error] {e}")
-            return False
+            print(f"[ClientAgent] Lỗi ghi config: {e}")
+
+        self.show_toast_notifications = bool(show_toast)
+        self.update_server_target(server_host, int(server_port))
+        return True
