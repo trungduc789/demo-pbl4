@@ -24,7 +24,6 @@ Thiết kế chuẩn xác 100% theo giao diện GlassWire Protect (Firewall):
 import queue
 import threading
 from typing import Dict, List, Optional, Set, Any, Callable
-import psutil
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -32,181 +31,15 @@ from PyQt6.QtWidgets import (
     QHeaderView, QFrame, QCheckBox, QAbstractItemView,
     QMenu, QInputDialog, QMessageBox
 )
+from application.traffic_analytics import format_bytes
 from presentation.glasswire_icons import (
     get_protect_icon, get_filter_icon, get_firewall_shield_icon
 )
+from presentation.widgets.protect_widgets import (
+    FirewallSwitchButton,
+    ConnectionPillButton,
+)
 from utils.safe_print import safe_print as print
-
-
-class FirewallSwitchButton(QPushButton):
-    """Công tắc gạt Firewall chuẩn phong cách iOS / GlassWire (OFF / ON)."""
-    state_changed = QtCore.pyqtSignal(bool)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setCheckable(True)
-        self.setChecked(True)
-        self.setFixedSize(58, 28)
-        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self._update_appearance()
-        self.toggled.connect(self._on_toggled)
-
-    def _on_toggled(self, checked: bool):
-        self._update_appearance()
-        self.state_changed.emit(checked)
-
-    def _update_appearance(self):
-        if self.isChecked():
-            self.setText("ON")
-            self.setStyleSheet("""
-                QPushButton {
-                    background-color: #10B981;
-                    color: #FFFFFF;
-                    font-size: 11px;
-                    font-weight: bold;
-                    border-radius: 14px;
-                    border: none;
-                    text-align: center;
-                }
-                QPushButton:hover {
-                    background-color: #059669;
-                }
-            """)
-        else:
-            self.setText("OFF")
-            self.setStyleSheet("""
-                QPushButton {
-                    background-color: #94A3B8;
-                    color: #FFFFFF;
-                    font-size: 11px;
-                    font-weight: bold;
-                    border-radius: 14px;
-                    border: none;
-                    text-align: center;
-                }
-                QPushButton:hover {
-                    background-color: #64748B;
-                }
-            """)
-
-
-class ConnectionPillButton(QPushButton):
-    """Nút bấm dạng Pill chuyển trạng thái Allowed / Blocked / Throttled trong bảng."""
-    status_changed = QtCore.pyqtSignal(str, str, str)  # (app_name, direction, new_status)
-
-    def __init__(
-        self,
-        app_name: str,
-        direction: str,
-        initial_status: str = "allowed",
-        next_status_resolver: Optional[Callable[[str], str]] = None,
-    ):
-        super().__init__()
-        self.app_name = app_name
-        self.direction = direction  # "in" hoặc "out"
-        self.status = initial_status  # "allowed", "blocked", "throttled"
-        self._next_status_resolver = next_status_resolver
-        self.setFixedHeight(24)
-        self.setMinimumWidth(72)
-        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        self.customContextMenuRequested.connect(self._show_context_menu)
-        self._update_style()
-        self.clicked.connect(self._toggle_status)
-
-    def set_status(self, new_status: str):
-        if self.status == new_status:
-            return
-        self.status = new_status
-        self._update_style()
-
-    def _toggle_status(self):
-        if self._next_status_resolver:
-            new_st = self._next_status_resolver(self.status)
-        else:
-            # Mặc định chuyển đổi trực tiếp Allowed <-> Blocked để thao tác nhanh & an toàn
-            new_st = "blocked" if self.status == "allowed" else "allowed"
-        self.status = new_st
-        self._update_style()
-        # Phát tín hiệu bất đồng bộ qua hàng đợi sự kiện Qt để tránh hủy/chặn C++ stack của nút đang bấm
-        app_name = self.app_name
-        direction = self.direction
-        status = self.status
-        QtCore.QTimer.singleShot(0, lambda: self.status_changed.emit(app_name, direction, status))
-
-    def _show_context_menu(self, pos: QtCore.QPoint):
-        """Menu chuột phải cho phép chọn nhanh Allowed / Blocked / Throttled."""
-        menu = QMenu(self)
-        act_allow = menu.addAction("✅ Allowed (Cho phép)")
-        act_block = menu.addAction("🚫 Blocked (Chặn kết nối)")
-        act_throttle = menu.addAction("⚡ Throttled (Giới hạn QoS)")
-        chosen = menu.exec(self.mapToGlobal(pos))
-        if not chosen:
-            return
-        target_status = self.status
-        if chosen == act_allow:
-            target_status = "allowed"
-        elif chosen == act_block:
-            target_status = "blocked"
-        elif chosen == act_throttle:
-            target_status = "throttled"
-        if target_status != self.status or target_status == "throttled":
-            self.status = target_status
-            self._update_style()
-            app_name = self.app_name
-            direction = self.direction
-            status = self.status
-            QtCore.QTimer.singleShot(0, lambda: self.status_changed.emit(app_name, direction, status))
-
-    def _update_style(self):
-        if self.status == "allowed":
-            self.setText("Allowed")
-            self.setStyleSheet("""
-                QPushButton {
-                    background-color: #ECFDF5;
-                    color: #059669;
-                    font-size: 11px;
-                    font-weight: bold;
-                    border: 1px solid #A7F3D0;
-                    border-radius: 12px;
-                    padding: 2px 8px;
-                }
-                QPushButton:hover {
-                    background-color: #D1FAE5;
-                }
-            """)
-        elif self.status == "blocked":
-            self.setText("Blocked")
-            self.setStyleSheet("""
-                QPushButton {
-                    background-color: #FEF2F2;
-                    color: #DC2626;
-                    font-size: 11px;
-                    font-weight: bold;
-                    border: 1px solid #FECACA;
-                    border-radius: 12px;
-                    padding: 2px 8px;
-                }
-                QPushButton:hover {
-                    background-color: #FEE2E2;
-                }
-            """)
-        else:  # throttled
-            self.setText("Throttled")
-            self.setStyleSheet("""
-                QPushButton {
-                    background-color: #FFFBEB;
-                    color: #D97706;
-                    font-size: 11px;
-                    font-weight: bold;
-                    border: 1px solid #FDE68A;
-                    border-radius: 12px;
-                    padding: 2px 8px;
-                }
-                QPushButton:hover {
-                    background-color: #FEF3C7;
-                }
-            """)
 
 
 class GlassWireProtectView(QWidget):
@@ -307,6 +140,8 @@ class GlassWireProtectView(QWidget):
             # Đồng bộ lại chính sách đã áp dụng trên máy này
             if dev_state and dev_state.applied_policies:
                 for app_k, pol in dev_state.applied_policies.items():
+                    if pol.get("status") == "FAILED":
+                        continue
                     act = pol.get("action")
                     # Khớp lại tên hiển thị nếu đã có trong bảng
                     matched_name = app_k
@@ -632,7 +467,9 @@ class GlassWireProtectView(QWidget):
         if not is_active:
             def _stop_local():
                 try:
-                    if self.service and hasattr(self.service, 'packet_shaper'):
+                    if self.agent_service:
+                        self.agent_service.clear_all_local_policies()
+                    elif self.service and hasattr(self.service, 'packet_shaper'):
                         self.service.packet_shaper.stop()
                 except Exception as e:
                     print(f"[Protect] Lỗi tắt shaper: {e}")
@@ -1043,6 +880,9 @@ class GlassWireProtectView(QWidget):
                 "locked_by_admin": bool(self.remote_device_uuid),
             }
 
+        prev_pol_snapshot = dict(self.app_policies[app_name])
+        prev_effective = self._effective_status_history.get(app_name, "allowed")
+
         # Nếu ở chế độ Click To Block / Click To Throttle thông thường, đồng bộ cả 2 chiều In & Out
         # để người dùng chỉ cần 1 click là Chặn hoặc Mở chặn trọn vẹn cho ứng dụng đó
         self.app_policies[app_name][direction] = new_status
@@ -1062,7 +902,6 @@ class GlassWireProtectView(QWidget):
         out_status = self.app_policies[app_name].get("out", "allowed")
         effective_status = self._get_effective_status(in_status, out_status)
         effective_direction = self._get_effective_direction(in_status, out_status)
-        prev_effective = self._effective_status_history.get(app_name, "allowed")
         self._effective_status_history[app_name] = effective_status
 
         limit_val = float(self.app_policies[app_name].get("limit_kbps", self.default_throttle_kbps))
@@ -1073,9 +912,20 @@ class GlassWireProtectView(QWidget):
                     f"Nhập mức giới hạn tốc độ mạng cho '{app_name}' (KB/s):",
                     limit_val, 1.0, 102400.0, 1
                 )
-                if ok_diag:
-                    limit_val = float(new_lim)
-                    self.app_policies[app_name]["limit_kbps"] = limit_val
+                if not ok_diag:
+                    self.app_policies[app_name] = prev_pol_snapshot
+                    self._effective_status_history[app_name] = prev_effective
+                    if pills:
+                        if pills.get("in"):
+                            pills["in"].set_status(prev_pol_snapshot.get("in", "allowed"))
+                        if pills.get("out"):
+                            pills["out"].set_status(prev_pol_snapshot.get("out", "allowed"))
+                    row_idx = self._app_row_map.get(app_name)
+                    if row_idx is not None and row_idx < self.table.rowCount():
+                        self._update_row_policy_columns(row_idx, app_name)
+                    return
+                limit_val = float(new_lim)
+                self.app_policies[app_name]["limit_kbps"] = limit_val
             except Exception:
                 pass
 
@@ -1382,7 +1232,7 @@ class GlassWireProtectView(QWidget):
 
     def _reapply_all_policies(self):
         """Áp dụng lại TẤT CẢ các chính sách đã lưu khi bật lại tường lửa."""
-        if not self.service:
+        if not self.service and not self.agent_service:
             return
         for app_name, policy in list(self.app_policies.items()):
             in_status = policy.get("in", "allowed")
@@ -1391,22 +1241,24 @@ class GlassWireProtectView(QWidget):
                 effective_status = self._get_effective_status(in_status, out_status)
                 effective_direction = self._get_effective_direction(in_status, out_status)
                 try:
-                    if effective_status == "blocked":
-                        self.service.block_application(app_name, direction=effective_direction)
-                        print(f"[Protect] Reapply BLOCK: {app_name} ({effective_direction})")
-                    elif effective_status == "throttled":
-                        limit_kbps = policy.get("limit_kbps", self.default_throttle_kbps)
-                        self.service.apply_bandwidth_limit(app_name, limit_kbps, effective_direction)
-                        print(f"[Protect] Reapply THROTTLE: {app_name} ({effective_direction}, {limit_kbps} KB/s)")
+                    if self.agent_service:
+                        if policy.get("locked_by_admin"):
+                            continue
+                        if effective_status == "blocked":
+                            self.agent_service.apply_local_policy(app_name, action="BLOCK", limit_kbps=0.0, direction=effective_direction)
+                        elif effective_status == "throttled":
+                            limit_kbps = policy.get("limit_kbps", self.default_throttle_kbps)
+                            self.agent_service.apply_local_policy(app_name, action="THROTTLE", limit_kbps=limit_kbps, direction=effective_direction)
+                    elif self.service:
+                        if effective_status == "blocked":
+                            self.service.block_application(app_name, direction=effective_direction)
+                            print(f"[Protect] Reapply BLOCK: {app_name} ({effective_direction})")
+                        elif effective_status == "throttled":
+                            limit_kbps = policy.get("limit_kbps", self.default_throttle_kbps)
+                            self.service.apply_bandwidth_limit(app_name, limit_kbps, effective_direction)
+                            print(f"[Protect] Reapply THROTTLE: {app_name} ({effective_direction}, {limit_kbps} KB/s)")
                 except Exception as e:
                     print(f"[Protect] Lỗi reapply policy cho {app_name}: {e}")
 
     def _format_bytes(self, num_bytes: float) -> str:
-        if num_bytes < 1024:
-            return f"{num_bytes:,.0f} B"
-        elif num_bytes < 1024 * 1024:
-            return f"{num_bytes / 1024.0:,.1f} KB"
-        elif num_bytes < 1024 * 1024 * 1024:
-            return f"{num_bytes / (1024.0 * 1024.0):,.1f} MB"
-        else:
-            return f"{num_bytes / (1024.0 * 1024.0 * 1024.0):,.2f} GB"
+        return format_bytes(num_bytes)

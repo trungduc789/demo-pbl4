@@ -10,6 +10,10 @@ from presentation.widgets.dashboard_widgets import (
     ProcessIconManager,
     AsyncSignalBridge,
     HighFreqNetworkWorker,
+    FirewallSwitchButton,
+    ConnectionPillButton,
+    TrafficSparklineWidget,
+    generate_glasswire_wave,
 )
 
 __all__ = [
@@ -24,4 +28,8 @@ __all__ = [
     "ProcessIconManager",
     "AsyncSignalBridge",
     "HighFreqNetworkWorker",
+    "FirewallSwitchButton",
+    "ConnectionPillButton",
+    "TrafficSparklineWidget",
+    "generate_glasswire_wave",
 ]
