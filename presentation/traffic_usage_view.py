@@ -14,19 +14,11 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
     QScrollArea, QProgressBar, QSizePolicy
 )
+from application.traffic_analytics import (
+    format_bytes as format_bytes_human,
+    aggregate_connections_usage,
+)
 from utils.safe_print import safe_print as print
-
-
-def format_bytes_human(num_bytes: float) -> str:
-    """Quy đổi byte sang định dạng ngắn gọn B, KB, MB, GB chuẩn GlassWire."""
-    if num_bytes < 1024:
-        return f"{num_bytes:,.0f} B"
-    elif num_bytes < 1024 * 1024:
-        return f"{num_bytes / 1024.0:,.1f} KB"
-    elif num_bytes < 1024 * 1024 * 1024:
-        return f"{num_bytes / (1024.0 * 1024.0):,.1f} MB"
-    else:
-        return f"{num_bytes / (1024.0 * 1024.0 * 1024.0):,.2f} GB"
 
 
 class UsageItemWidget(QFrame):
@@ -206,57 +198,7 @@ class GlassWireUsageView(QWidget):
         self.col_traffic_type.clear_items()
         self.col_countries.clear_items()
 
-        host_counts: Dict[str, int] = {}
-        proto_counts: Dict[str, int] = {}
-        region_counts: Dict[str, int] = {}
-
-        for conn in active_conns:
-            r_ip = getattr(conn, "remote_ip", None) or (conn.raddr.ip if getattr(conn, "raddr", None) else None)
-            if not r_ip:
-                continue
-            r_port = getattr(conn, "remote_port", None) or (conn.raddr.port if getattr(conn, "raddr", None) else None)
-            host_str = f"{r_ip}:{r_port}" if r_port else str(r_ip)
-            host_counts[host_str] = host_counts.get(host_str, 0) + 1
-
-            # Phân loại Giao thức dựa trên cổng thực tế
-            port_num = int(r_port or 0)
-            if port_num == 443:
-                proto_name = "HTTPS (TCP/443)"
-            elif port_num in (80, 8080):
-                proto_name = f"HTTP (TCP/{port_num})"
-            elif port_num == 53:
-                proto_name = "DNS (UDP/TCP 53)"
-            elif port_num in (445, 139, 137):
-                proto_name = f"SMB / NetBIOS ({port_num})"
-            elif port_num == 3306:
-                proto_name = "MySQL Database (3306)"
-            elif port_num in (9988, 9999):
-                proto_name = f"PBL4 Control Channel ({port_num})"
-            elif port_num == 123:
-                proto_name = "NTP Time Sync (123)"
-            elif port_num > 0:
-                proto_name = f"Application Port ({port_num})"
-            else:
-                proto_name = "Other TCP / UDP"
-            proto_counts[proto_name] = proto_counts.get(proto_name, 0) + 1
-
-            # Phân loại Khu vực / Phạm vi mạng dựa trên IP thực tế
-            ip_str = str(r_ip)
-            if ip_str.startswith("127.") or ip_str == "::1":
-                region_name = "Localhost / Loopback (127.0.0.1)"
-            elif ip_str.startswith(("10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31.", "fe80:")):
-                region_name = "Mạng Nội Bộ LAN (Private IP)"
-            elif ip_str.startswith(("142.250.", "172.217.", "216.58.", "8.8.")):
-                region_name = "Google Cloud / DNS"
-            elif ip_str.startswith(("1.1.1.", "1.0.0.", "104.16.", "104.17.", "104.18.", "172.64.", "172.67.")):
-                region_name = "Cloudflare CDN / Edge"
-            elif ip_str.startswith(("20.", "40.", "52.", "13.")):
-                region_name = "Microsoft Azure / Cloud"
-            else:
-                region_name = "Internet Quốc Tế (Public WAN)"
-            region_counts[region_name] = region_counts.get(region_name, 0) + 1
-
-        total_conns = max(sum(host_counts.values()), 1)
+        host_counts, proto_counts, region_counts, total_conns = aggregate_connections_usage(active_conns)
 
         def _sort_items(items_list):
             if self.sort_order == "high_to_low":
