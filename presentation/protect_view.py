@@ -21,8 +21,6 @@ Thiết kế chuẩn xác 100% theo giao diện GlassWire Protect (Firewall):
 - Tích hợp trực tiếp với WinDivert Kernel Packet Shaper của đồ án.
 """
 
-import queue
-import threading
 from typing import Dict, List, Optional, Set, Any, Callable
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtWidgets import (
@@ -30,6 +28,11 @@ from PyQt6.QtWidgets import (
     QLineEdit, QComboBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QFrame, QCheckBox, QAbstractItemView,
     QMenu, QInputDialog, QMessageBox
+)
+from application.data_source import (
+    DashboardDataSource,
+    RemoteFleetDataSource,
+    create_data_source,
 )
 from application.traffic_analytics import format_bytes
 from presentation.glasswire_icons import (
@@ -49,12 +52,17 @@ class GlassWireProtectView(QWidget):
     """
     policy_changed = QtCore.pyqtSignal(str, str, str, float)  # app, direction, action, limit_kbps
 
-    def __init__(self, monitor_service=None, icon_manager=None, fleet_service=None, agent_service=None):
+    def __init__(self, monitor_service=None, icon_manager=None, fleet_service=None, agent_service=None, data_source: Optional[DashboardDataSource] = None):
         super().__init__()
         self.service = monitor_service
         self.icon_manager = icon_manager
         self.fleet_service = fleet_service
         self.agent_service = agent_service
+        self.data_source: DashboardDataSource = data_source or create_data_source(
+            monitor_service=monitor_service,
+            fleet_service=fleet_service,
+            agent_service=agent_service,
+        )
         self.is_firewall_active = True
         self.firewall_mode = "Click To Block"
         self.default_throttle_kbps = 100.0
@@ -72,14 +80,34 @@ class GlassWireProtectView(QWidget):
         self._row_pills: Dict[str, Dict[str, ConnectionPillButton]] = {}
         self._known_device_snapshot: List[tuple] = []
 
-        # Hàng đợi thực thi lệnh nền tuần tự để bấm liên tục 10-20 lần không gây đơ/crash UI
-        self._cmd_queue: queue.Queue = queue.Queue()
-        self._cmd_worker = threading.Thread(
-            target=self._command_worker_loop, daemon=True, name="ProtectView-CmdWorker"
-        )
-        self._cmd_worker.start()
-
         self._init_ui()
+
+    @property
+    def _cmd_queue(self):
+        """Thuộc tính ủy quyền tới hàng đợi lệnh của DataSource ở tầng Application."""
+        return self.data_source.dispatcher._queue
+
+    def _get_active_data_source(self) -> DashboardDataSource:
+        """Lấy chiến lược DataSource tương ứng với trạng thái hiện tại."""
+        if self.remote_device_uuid and self.remote_commander:
+            if not isinstance(self.data_source, RemoteFleetDataSource):
+                self.data_source = RemoteFleetDataSource(
+                    fleet_service=self.fleet_service,
+                    device_uuid=self.remote_device_uuid,
+                    commander_func=self.remote_commander,
+                    dispatcher=self.data_source.dispatcher,
+                )
+            else:
+                self.data_source.set_target_device(self.remote_device_uuid, self.remote_commander)
+            return self.data_source
+
+        self.data_source = create_data_source(
+            monitor_service=self.service,
+            fleet_service=None,
+            agent_service=self.agent_service,
+            dispatcher=self.data_source.dispatcher,
+        )
+        return self.data_source
 
     def _resolve_next_pill_status(self, current_status: str) -> str:
         """
@@ -91,23 +119,6 @@ class GlassWireProtectView(QWidget):
         if self.firewall_mode == "Click To Throttle":
             return "throttled" if current_status == "allowed" else "allowed"
         return "blocked" if current_status == "allowed" else "allowed"
-
-    def _command_worker_loop(self):
-        """Luồng nền thực thi tuần tự các lệnh Block / Unblock / Throttle để không bao giờ khóa cứng GUI."""
-        while True:
-            try:
-                task = self._cmd_queue.get()
-                if task is None:
-                    break
-                fn = task
-                fn()
-            except Exception as e:
-                print(f"[Protect CmdWorker Error] {e}")
-            finally:
-                try:
-                    self._cmd_queue.task_done()
-                except Exception:
-                    pass
 
     def set_fleet_service(self, fleet_service):
         """Kích hoạt dịch vụ quản trị Fleet và thanh chọn máy con trên giao diện Protect."""
@@ -454,28 +465,12 @@ class GlassWireProtectView(QWidget):
 
     def _on_firewall_toggled(self, is_active: bool):
         self.is_firewall_active = is_active
-        if self.remote_device_uuid and self.remote_commander:
-            uid = self.remote_device_uuid
-            commander = self.remote_commander
-            if not is_active:
-                self._cmd_queue.put(lambda: (
-                    commander(uid, "UNBLOCK_ALL", "", 0.0, "both"),
-                    commander(uid, "REMOVE_LIMIT", "", 0.0, "both")
-                ))
-            return
-
-        if not is_active:
-            def _stop_local():
-                try:
-                    if self.agent_service:
-                        self.agent_service.clear_all_local_policies()
-                    elif self.service and hasattr(self.service, 'packet_shaper'):
-                        self.service.packet_shaper.stop()
-                except Exception as e:
-                    print(f"[Protect] Lỗi tắt shaper: {e}")
-            self._cmd_queue.put(_stop_local)
-        else:
-            self._cmd_queue.put(self._reapply_all_policies)
+        ds = self._get_active_data_source()
+        ds.set_firewall_enabled(
+            enabled=is_active,
+            app_policies=self.app_policies,
+            default_throttle_kbps=self.default_throttle_kbps,
+        )
 
     def _on_mode_changed(self, idx: int):
         modes = ["Click To Block", "Click To Throttle", "Block All"]
@@ -936,74 +931,15 @@ class GlassWireProtectView(QWidget):
         if self._status_filter_mode != "all":
             self._apply_all_rows_visibility()
 
-        # Chế độ điều khiển máy con từ xa (Remote Machine Control)
-        if self.remote_device_uuid and self.remote_commander:
-            uid = self.remote_device_uuid
-            commander = self.remote_commander
-
-            def _exec_remote():
-                try:
-                    if effective_status == "blocked":
-                        commander(uid, "BLOCK_APP", app_name, 0.0, effective_direction)
-                    elif effective_status == "throttled":
-                        if prev_effective == "blocked":
-                            commander(uid, "UNBLOCK_APP", app_name, 0.0, effective_direction)
-                        commander(uid, "THROTTLE_SET", app_name, limit_val, effective_direction)
-                    else:
-                        commander(uid, "UNBLOCK_APP", app_name, 0.0, effective_direction)
-                        if prev_effective == "throttled":
-                            commander(uid, "REMOVE_LIMIT", app_name, 0.0, effective_direction)
-                except Exception as e:
-                    print(f"[Protect Remote Command Error] {e}")
-
-            self._cmd_queue.put(_exec_remote)
-            return
-
-        # --- Chế độ cục bộ: kiểm tra firewall và service ---
-        if not self.is_firewall_active or (not self.service and not self.agent_service):
-            return
-
-        def _exec_local():
-            try:
-                if self.agent_service:
-                    if effective_status == "blocked":
-                        if prev_effective == "throttled":
-                            self.agent_service.remove_local_policy(app_name)
-                        self.agent_service.apply_local_policy(
-                            app_name, action="BLOCK", limit_kbps=0.0, direction=effective_direction
-                        )
-                    elif effective_status == "throttled":
-                        if prev_effective == "blocked":
-                            self.agent_service.remove_local_policy(app_name)
-                        self.agent_service.apply_local_policy(
-                            app_name, action="THROTTLE", limit_kbps=limit_val, direction=effective_direction
-                        )
-                    else:
-                        self.agent_service.remove_local_policy(app_name)
-                elif self.service:
-                    if effective_status == "blocked":
-                        if prev_effective == "throttled":
-                            self.service.remove_bandwidth_limit(app_name)
-                        success, msg = self.service.block_application(app_name, direction=effective_direction)
-                        print(f"[Protect] BLOCK {app_name} ({effective_direction}): {msg}")
-
-                    elif effective_status == "throttled":
-                        if prev_effective == "blocked":
-                            self.service.unblock_application(app_name)
-                        success, msg = self.service.apply_bandwidth_limit(
-                            app_name, limit_kbps=limit_val, direction=effective_direction
-                        )
-                        print(f"[Protect] THROTTLE {app_name} ({effective_direction}, {limit_val} KB/s): {msg}")
-
-                    else:
-                        self.service.unblock_application(app_name)
-                        if prev_effective == "throttled":
-                            self.service.remove_bandwidth_limit(app_name)
-                        print(f"[Protect] ALLOW {app_name}: Đã gỡ bỏ mọi hạn chế mạng")
-            except Exception as e:
-                print(f"[Protect] Lỗi áp dụng chính sách cho {app_name}: {e}")
-
-        self._cmd_queue.put(_exec_local)
+        ds = self._get_active_data_source()
+        ds.apply_app_policy(
+            app_name=app_name,
+            effective_status=effective_status,
+            prev_effective=prev_effective,
+            direction=effective_direction,
+            limit_kbps=limit_val,
+            is_firewall_active=self.is_firewall_active,
+        )
 
     def _get_effective_status(self, in_status: str, out_status: str) -> str:
         """Xác định trạng thái ưu tiên cao nhất: blocked > throttled > allowed."""
@@ -1026,64 +962,22 @@ class GlassWireProtectView(QWidget):
         return "both"
 
     def unblock_all_apps(self):
-        """Cho phép tất cả ứng dụng truyền tải bình thường - tôn trọng khóa Admin nếu ở chế độ Client."""
-        if not self.remote_device_uuid and self.agent_service:
-            for app_name in list(self.app_policies.keys()):
-                if not self.agent_service.is_locked_by_admin(app_name):
-                    self.app_policies[app_name]["in"] = "allowed"
-                    self.app_policies[app_name]["out"] = "allowed"
-                    self.app_policies[app_name]["source"] = ""
-                    self.app_policies[app_name]["locked_by_admin"] = False
-                    self._effective_status_history[app_name] = "allowed"
-
-            self._sync_all_pills_from_policies()
-            if self._status_filter_mode != "all":
-                self._apply_all_rows_visibility()
-
-            def _agent_clear_local():
-                try:
-                    self.agent_service.clear_all_local_policies()
-                except Exception as e:
-                    print(f"[Protect] Lỗi gỡ chính sách cục bộ: {e}")
-
-            self._cmd_queue.put(_agent_clear_local)
-            return
-
-        # 1. Reset trạng thái nội bộ & giao diện ngay lập tức
-        for app_name in self.app_policies:
+        """Cho phép tất cả ứng dụng truyền tải bình thường thông qua chiến lược DataSource."""
+        ds = self._get_active_data_source()
+        for app_name in list(self.app_policies.keys()):
+            if ds.is_locked_by_admin(app_name):
+                continue
             self.app_policies[app_name]["in"] = "allowed"
             self.app_policies[app_name]["out"] = "allowed"
-        self._effective_status_history.clear()
+            self.app_policies[app_name]["source"] = ""
+            self.app_policies[app_name]["locked_by_admin"] = False
+            self._effective_status_history[app_name] = "allowed"
 
         self._sync_all_pills_from_policies()
         if self._status_filter_mode != "all":
             self._apply_all_rows_visibility()
 
-        # 2a. Nếu đang ở chế độ Admin điều khiển từ xa -> gửi lệnh cho máy con qua worker
-        if self.remote_device_uuid and self.remote_commander:
-            uid = self.remote_device_uuid
-            commander = self.remote_commander
-
-            def _remote_unblock_all():
-                try:
-                    commander(uid, "UNBLOCK_ALL", "", 0.0, "both")
-                    commander(uid, "REMOVE_LIMIT", "", 0.0, "both")
-                    print(f"[Protect Remote] UNBLOCK_ALL gửi tới {uid}")
-                except Exception as e:
-                    print(f"[Protect Remote] Lỗi gửi UNBLOCK_ALL: {e}")
-
-            self._cmd_queue.put(_remote_unblock_all)
-        # 2b. Chế độ cục bộ: gỡ chặn qua MonitorService
-        elif self.service:
-            def _local_unblock_all():
-                try:
-                    self.service.unblock_all_applications()
-                    self.service.remove_bandwidth_limit()
-                    print("[Protect] Đã gỡ bỏ TẤT CẢ chính sách chặn và giới hạn băng thông")
-                except Exception as e:
-                    print(f"[Protect] Lỗi khi gỡ chặn tất cả: {e}")
-
-            self._cmd_queue.put(_local_unblock_all)
+        ds.unblock_all_policies()
 
     def refresh_fleet_devices_dropdown(self):
         """Làm mới danh sách máy con trong combo_target_device từ FleetManagerService."""
@@ -1200,65 +1094,24 @@ class GlassWireProtectView(QWidget):
 
         self._apply_all_rows_visibility()
 
-        if self.remote_device_uuid and self.remote_commander:
-            uid = self.remote_device_uuid
-            commander = self.remote_commander
-
-            def _remote_block():
-                try:
-                    ok_cmd, msg = commander(uid, "BLOCK_APP", app_name, 0.0, "both")
-                    print(f"[Protect Remote] BLOCK_APP '{app_name}': {msg}")
-                except Exception as e:
-                    print(f"[Protect Remote] Lỗi BLOCK_APP '{app_name}': {e}")
-
-            self._cmd_queue.put(_remote_block)
-        elif self.agent_service and self.is_firewall_active:
-            def _agent_local_block():
-                try:
-                    self.agent_service.apply_local_policy(app_name, action="BLOCK", limit_kbps=0.0, direction="both")
-                except Exception as e:
-                    print(f"[Protect] Lỗi BLOCK '{app_name}': {e}")
-
-            self._cmd_queue.put(_agent_local_block)
-        elif self.service and self.is_firewall_active:
-            def _local_block():
-                try:
-                    success, msg = self.service.block_application(app_name, direction="both")
-                    print(f"[Protect] BLOCK '{app_name}': {msg}")
-                except Exception as e:
-                    print(f"[Protect] Lỗi BLOCK '{app_name}': {e}")
-
-            self._cmd_queue.put(_local_block)
+        ds = self._get_active_data_source()
+        ds.apply_app_policy(
+            app_name=app_name,
+            effective_status="blocked",
+            prev_effective="allowed",
+            direction="both",
+            limit_kbps=0.0,
+            is_firewall_active=self.is_firewall_active,
+        )
 
     def _reapply_all_policies(self):
         """Áp dụng lại TẤT CẢ các chính sách đã lưu khi bật lại tường lửa."""
-        if not self.service and not self.agent_service:
-            return
-        for app_name, policy in list(self.app_policies.items()):
-            in_status = policy.get("in", "allowed")
-            out_status = policy.get("out", "allowed")
-            if in_status != "allowed" or out_status != "allowed":
-                effective_status = self._get_effective_status(in_status, out_status)
-                effective_direction = self._get_effective_direction(in_status, out_status)
-                try:
-                    if self.agent_service:
-                        if policy.get("locked_by_admin"):
-                            continue
-                        if effective_status == "blocked":
-                            self.agent_service.apply_local_policy(app_name, action="BLOCK", limit_kbps=0.0, direction=effective_direction)
-                        elif effective_status == "throttled":
-                            limit_kbps = policy.get("limit_kbps", self.default_throttle_kbps)
-                            self.agent_service.apply_local_policy(app_name, action="THROTTLE", limit_kbps=limit_kbps, direction=effective_direction)
-                    elif self.service:
-                        if effective_status == "blocked":
-                            self.service.block_application(app_name, direction=effective_direction)
-                            print(f"[Protect] Reapply BLOCK: {app_name} ({effective_direction})")
-                        elif effective_status == "throttled":
-                            limit_kbps = policy.get("limit_kbps", self.default_throttle_kbps)
-                            self.service.apply_bandwidth_limit(app_name, limit_kbps, effective_direction)
-                            print(f"[Protect] Reapply THROTTLE: {app_name} ({effective_direction}, {limit_kbps} KB/s)")
-                except Exception as e:
-                    print(f"[Protect] Lỗi reapply policy cho {app_name}: {e}")
+        ds = self._get_active_data_source()
+        ds.set_firewall_enabled(
+            enabled=True,
+            app_policies=self.app_policies,
+            default_throttle_kbps=self.default_throttle_kbps,
+        )
 
     def _format_bytes(self, num_bytes: float) -> str:
         return format_bytes(num_bytes)

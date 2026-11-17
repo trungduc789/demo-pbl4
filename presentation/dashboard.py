@@ -16,6 +16,7 @@ import numpy as np
 from PyQt6 import QtWidgets, QtCore, QtGui
 
 from application.monitor_service import MonitorService
+from application.data_source import DashboardDataSource, create_data_source
 from application.traffic_analytics import (
     format_bytes,
     format_speed,
@@ -51,8 +52,13 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self.service = monitor_service
         self.fleet_service = fleet_service
         self.agent_service = agent_service
-        self.is_admin_mode = bool(fleet_service is not None)
-        self.is_client_mode = bool(agent_service is not None)
+        self.data_source: DashboardDataSource = create_data_source(
+            monitor_service=monitor_service,
+            fleet_service=fleet_service,
+            agent_service=agent_service,
+        )
+        self.is_admin_mode = self.data_source.has_fleet_management
+        self.is_client_mode = (self.data_source.mode_name == "client")
         self.selected_device_uuid: Optional[str] = None
         self.icon_manager = ProcessIconManager()
         self.async_bridge = AsyncSignalBridge(self)
@@ -205,59 +211,35 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
         self.setCentralWidget(container)
 
     # =========================================================================
-    # KẾT NỐI TẦNG APPLICATION (BACKEND DELEGATION)
+    # KẾT NỐI TẦNG APPLICATION THÔNG QUA DATA SOURCE STRATEGY
     # =========================================================================
-    def _get_app_backend(self):
-        if self.service is not None:
-            return self.service
-        if self.fleet_service is not None:
-            return self.fleet_service
-        return None
-
     def _get_raw_tcp_connections(self) -> List:
-        backend = self._get_app_backend()
-        if backend and hasattr(backend, "get_raw_tcp_connections"):
-            try:
-                return backend.get_raw_tcp_connections()
-            except Exception:
-                pass
-        return []
+        try:
+            return self.data_source.get_raw_tcp_connections()
+        except Exception:
+            return []
 
     def _resolve_process_exe(self, pid: int) -> str:
-        backend = self._get_app_backend()
-        if backend and hasattr(backend, "resolve_executable_path"):
-            try:
-                return backend.resolve_executable_path(pid)
-            except Exception:
-                pass
-        return ""
+        try:
+            return self.data_source.resolve_executable_path(pid)
+        except Exception:
+            return ""
 
     def _get_active_connections(self) -> List[Dict]:
-        backend = self._get_app_backend()
-        if backend and hasattr(backend, "get_connections"):
-            try:
-                return backend.get_connections()
-            except Exception as e:
-                print(f"[Dashboard Connections Error] {e}")
-        return []
+        try:
+            return self.data_source.get_connections()
+        except Exception as e:
+            print(f"[Dashboard Connections Error] {e}")
+            return []
 
     def _fetch_policy_logs_from_backend(self, limit: int = 200) -> List[Dict]:
-        backend = self._get_app_backend()
-        if backend and hasattr(backend, "get_policy_history"):
-            return backend.get_policy_history(limit)
-        return []
+        return self.data_source.get_policy_history(limit)
 
     def _fetch_connection_logs_from_backend(self, limit: int = 200) -> str:
-        backend = self._get_app_backend()
-        if backend and hasattr(backend, "get_connection_history_text"):
-            return backend.get_connection_history_text(limit)
-        return "Chưa có nhật ký kết nối nào được ghi nhận."
+        return self.data_source.get_connection_history_text(limit)
 
     def _get_logs_dir_from_backend(self) -> str:
-        backend = self._get_app_backend()
-        if backend and hasattr(backend, "get_logs_directory"):
-            return backend.get_logs_directory()
-        return MonitorService.get_logs_directory()
+        return self.data_source.get_logs_directory()
 
     # =========================================================================
     # THIẾT LẬP CÁC TRANG CON & HEADER / BREADCRUMB
@@ -272,6 +254,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             self.icon_manager,
             fleet_service=self.fleet_service,
             agent_service=self.agent_service,
+            data_source=self.data_source,
         )
         if hasattr(self.protect_view, "combo_target_device") and self.is_admin_mode:
             self.protect_view.combo_target_device.currentIndexChanged.connect(self._on_protect_device_combo_synced)
@@ -286,6 +269,7 @@ class BandwidthDashboard(QtWidgets.QMainWindow):
             fetch_policy_logs=self._fetch_policy_logs_from_backend,
             fetch_connection_logs=self._fetch_connection_logs_from_backend,
             get_logs_dir=self._get_logs_dir_from_backend,
+            open_logs_folder_cb=self.data_source.open_logs_folder,
             parent=parent,
         )
         self.txt_policy_filter = self.log_analysis_view.txt_policy_filter
