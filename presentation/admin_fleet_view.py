@@ -361,15 +361,16 @@ class AdminFleetView(QWidget):
                 policy_item = QTableWidgetItem()
                 policy_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
                 self.tbl_devices.setItem(row, 6, policy_item)
-            if applied:
-                num_block = sum(1 for p in applied.values() if p.get('action') == 'BLOCK_APP')
-                num_throttle = sum(1 for p in applied.values() if p.get('action') == 'THROTTLE_SET')
+            active_applied = [p for p in applied.values() if p.get('status') != 'FAILED'] if applied else []
+            if active_applied:
+                num_block = sum(1 for p in active_applied if p.get('action') == 'BLOCK_APP')
+                num_throttle = sum(1 for p in active_applied if p.get('action') == 'THROTTLE_SET')
                 policy_parts = []
                 if num_block > 0:
                     policy_parts.append(f"{num_block} Chặn")
                 if num_throttle > 0:
                     policy_parts.append(f"{num_throttle} Giới hạn")
-                policy_text = ", ".join(policy_parts) or f"{len(applied)} chính sách"
+                policy_text = ", ".join(policy_parts) or f"{len(active_applied)} chính sách"
                 policy_item.setText(f"🛡️ {policy_text}")
                 policy_item.setForeground(QtGui.QColor("#2563EB"))
                 policy_item.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
