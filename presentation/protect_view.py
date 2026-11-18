@@ -878,6 +878,21 @@ class GlassWireProtectView(QWidget):
         prev_pol_snapshot = dict(self.app_policies[app_name])
         prev_effective = self._effective_status_history.get(app_name, "allowed")
 
+        limit_val = float(self.app_policies[app_name].get("limit_kbps", self.default_throttle_kbps))
+        if new_status == "throttled":
+            try:
+                new_lim, ok_diag = QInputDialog.getDouble(
+                    self, "Giới Hạn Băng Thông (QoS)",
+                    f"Nhập mức giới hạn tốc độ mạng cho '{app_name}' (KB/s):",
+                    limit_val, 1.0, 102400.0, 1
+                )
+                if not ok_diag:
+                    return
+                limit_val = float(new_lim)
+                self.app_policies[app_name]["limit_kbps"] = limit_val
+            except Exception:
+                pass
+
         # Nếu ở chế độ Click To Block / Click To Throttle thông thường, đồng bộ cả 2 chiều In & Out
         # để người dùng chỉ cần 1 click là Chặn hoặc Mở chặn trọn vẹn cho ứng dụng đó
         self.app_policies[app_name][direction] = new_status
@@ -898,31 +913,6 @@ class GlassWireProtectView(QWidget):
         effective_status = self._get_effective_status(in_status, out_status)
         effective_direction = self._get_effective_direction(in_status, out_status)
         self._effective_status_history[app_name] = effective_status
-
-        limit_val = float(self.app_policies[app_name].get("limit_kbps", self.default_throttle_kbps))
-        if effective_status == "throttled":
-            try:
-                new_lim, ok_diag = QInputDialog.getDouble(
-                    self, "Giới Hạn Băng Thông (QoS)",
-                    f"Nhập mức giới hạn tốc độ mạng cho '{app_name}' (KB/s):",
-                    limit_val, 1.0, 102400.0, 1
-                )
-                if not ok_diag:
-                    self.app_policies[app_name] = prev_pol_snapshot
-                    self._effective_status_history[app_name] = prev_effective
-                    if pills:
-                        if pills.get("in"):
-                            pills["in"].set_status(prev_pol_snapshot.get("in", "allowed"))
-                        if pills.get("out"):
-                            pills["out"].set_status(prev_pol_snapshot.get("out", "allowed"))
-                    row_idx = self._app_row_map.get(app_name)
-                    if row_idx is not None and row_idx < self.table.rowCount():
-                        self._update_row_policy_columns(row_idx, app_name)
-                    return
-                limit_val = float(new_lim)
-                self.app_policies[app_name]["limit_kbps"] = limit_val
-            except Exception:
-                pass
 
         row_idx = self._app_row_map.get(app_name)
         if row_idx is not None and row_idx < self.table.rowCount():

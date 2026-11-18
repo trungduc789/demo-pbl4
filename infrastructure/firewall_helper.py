@@ -16,23 +16,64 @@ def clean_rule_name(app_name: str) -> str:
     return f"PBL4_Block_{raw}"
 
 
+def remove_all_pbl4_firewall_rules() -> int:
+    """
+    Quét và gỡ bỏ toàn bộ các quy tắc tường lửa có tiền tố 'PBL4_Block_' đang tồn tại
+    trong Windows Defender Firewall (phòng trường hợp tiến trình trước thoát đột ngột).
+    """
+    removed_count = 0
+    try:
+        res = subprocess.run(
+            "netsh advfirewall firewall show rule name=all",
+            shell=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=5,
+        )
+        if res.returncode == 0 and res.stdout:
+            rule_names = set()
+            for line in res.stdout.splitlines():
+                if "PBL4_Block_" in line:
+                    parts = line.split(":", 1)
+                    rname = parts[1].strip() if len(parts) > 1 else line.strip()
+                    if rname.startswith("PBL4_Block_"):
+                        rule_names.add(rname)
+            for rname in rule_names:
+                subprocess.run(
+                    f'netsh advfirewall firewall delete rule name="{rname}"',
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    timeout=3,
+                )
+                removed_count += 1
+    except Exception:
+        pass
+    return removed_count
+
+
 def remove_windows_firewall_rule(app_name: str) -> bool:
     rule_name = clean_rule_name(app_name)
+    raw = app_name.lower().strip().replace(".exe", "")
+    candidates = {f"{rule_name}_Out", f"{rule_name}_In", rule_name}
+    if raw:
+        candidates.add(f"PBL4_Block_{raw}_Out")
+        candidates.add(f"PBL4_Block_{raw}_In")
     try:
-        subprocess.run(
-            f'netsh advfirewall firewall delete rule name="{rule_name}_Out"',
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        subprocess.run(
-            f'netsh advfirewall firewall delete rule name="{rule_name}_In"',
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
+        for rname in candidates:
+            subprocess.run(
+                f'netsh advfirewall firewall delete rule name="{rname}"',
+                shell=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=3,
+            )
         return True
     except Exception:
         return False
@@ -66,8 +107,8 @@ def apply_windows_firewall_rule(app_name: str, exe_path: str = "", action: str =
     cmd_out = f'netsh advfirewall firewall add rule name="{rule_name}_Out" dir=out action={action} {prog_param} enable=yes'
     cmd_in = f'netsh advfirewall firewall add rule name="{rule_name}_In" dir=in action={action} {prog_param} enable=yes'
     try:
-        r1 = subprocess.run(cmd_out, shell=True, capture_output=True, text=True, timeout=3)
-        r2 = subprocess.run(cmd_in, shell=True, capture_output=True, text=True, timeout=3)
+        r1 = subprocess.run(cmd_out, shell=True, capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=3)
+        r2 = subprocess.run(cmd_in, shell=True, capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=3)
         return r1.returncode == 0 and r2.returncode == 0
     except Exception as e:
         print(f"[Firewall Rule Warning] {e}")

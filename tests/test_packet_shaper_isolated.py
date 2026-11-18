@@ -15,10 +15,13 @@ class TestIsolatedPacketShaper(unittest.TestCase):
     """Kiểm thử tính năng đa chính sách độc lập và logic bảo vệ của WinDivertPacketShaper."""
 
     def setUp(self):
-        self.shaper = WinDivertPacketShaper()
+        with patch("infrastructure.packet_shaper.remove_all_pbl4_firewall_rules"):
+            self.shaper = WinDivertPacketShaper()
 
     def tearDown(self):
-        self.shaper.stop()
+        with patch("infrastructure.packet_shaper.remove_all_pbl4_firewall_rules"), \
+             patch("infrastructure.packet_shaper.remove_windows_firewall_rule"):
+            self.shaper.stop()
 
     def test_01_multi_app_throttle_policies_stored_independently(self):
         """Kiểm tra nhiều ứng dụng có chính sách bóp băng thông độc lập, không bị ghi đè."""

@@ -1,16 +1,12 @@
 """
 Bộ truyền thông mạng tại máy con (Client Network Transport - TCP):
 - Quản lý kết nối socket bền vững đến máy chủ Admin.
-- Bắt tay xác thực 2 chiều Challenge-Response (PSK + HMAC-SHA256) và dẫn xuất khóa phiên K.
-- Xác thực toàn vẹn mọi gói tin bằng [Length][Seq][HMAC], chống replay, đảo thứ tự và giả mạo lệnh.
-- Khử trùng lặp lệnh (Command Deduplication) theo command_id.
-- Nhận xác nhận TELEMETRY_ACK từ Admin khi telemetry được tiếp nhận thành công.
-- Tự động duy trì nhịp tim (Heartbeat / Keepalive) và kết nối lại (Auto-Reconnect).
+- Ủy quyền bắt tay xác thực 2 chiều Challenge-Response (PSK + HMAC-SHA256) cho `infrastructure.auth_handshake`.
+- Xác thực toàn vẹn mọi gói tin bằng [Length][Seq][HMAC], khử trùng lặp lệnh theo command_id.
+- Nhận xác nhận TELEMETRY_ACK, duy trì nhịp tim (Heartbeat) và tự động kết nối lại (Auto-Reconnect).
 """
 
 from collections import deque
-import hmac
-import secrets
 import socket
 import threading
 import time
@@ -22,7 +18,6 @@ from config.settings import (
     CLIENT_RECONNECT_DELAY,
     NETWORK_PSK,
     AUTH_TIMEOUT,
-    RECV_POLL_TIMEOUT,
 )
 from models.network_protocol import (
     MessageType,
@@ -36,14 +31,10 @@ from infrastructure.protocol_framing import (
     DIR_CLIENT_TO_SERVER,
     DIR_SERVER_TO_CLIENT,
     RecvTimeoutError,
-    compute_auth_hmac,
-    compute_server_proof,
-    derive_session_key,
     recv_authenticated_message,
-    recv_message,
     send_authenticated_message,
-    send_message,
 )
+from infrastructure.auth_handshake import perform_client_handshake
 from utils.safe_print import safe_print as print
 
 
@@ -71,25 +62,20 @@ class NetworkClient:
         self._is_running = threading.Event()
         self._is_connected = threading.Event()
 
-        # Trạng thái mật mã học của phiên hiện tại
         self._session_key: Optional[bytes] = None
         self._tx_seq: int = 1
         self._rx_seq: int = 1
 
-        # Bộ lọc chống xử lý lặp lệnh theo command_id
         self._processed_command_ids: deque = deque(maxlen=256)
 
-        # Trạng thái xác nhận Telemetry từ Admin
         self.last_telemetry_ack_ts: float = 0.0
         self.telemetry_ack_count: int = 0
         self.on_telemetry_ack: Optional[Callable[[float], None]] = None
 
-        # Callback khi nhận lệnh can thiệp từ Server
         self.on_command_received: Optional[
             Callable[[CommandPacket], Optional[CommandResultPacket]]
         ] = None
 
-        # Callbacks thông báo trạng thái kết nối
         self.on_connected: Optional[Callable[[], None]] = None
         self.on_disconnected: Optional[Callable[[], None]] = None
 
@@ -120,7 +106,6 @@ class NetworkClient:
         """Dừng Agent Client và đóng kết nối an toàn."""
         self._is_running.clear()
 
-        # Gửi thông báo DISCONNECT đã ký HMAC nếu phiên đang active
         with self._sock_lock:
             if self._sock and self._session_key and self._is_connected.is_set():
                 try:
@@ -155,70 +140,20 @@ class NetworkClient:
 
     def _perform_handshake(self, sock: socket.socket) -> bool:
         """Thực hiện bắt tay Challenge-Response & xác thực 2 chiều với Admin Server."""
-        sock.settimeout(AUTH_TIMEOUT)
-
-        # 1. Nhận CHALLENGE từ Server
-        chal_msg = recv_message(sock, timeout_is_fatal=True)
-        if not chal_msg or chal_msg.msg_type != MessageType.CHALLENGE.value:
-            print("[NetClient Auth Error] Không nhận được gói CHALLENGE hợp lệ từ Server.")
+        result = perform_client_handshake(sock, self.reg_data, self.psk_bytes)
+        if result is None:
             return False
-
-        nonce_server = str(chal_msg.payload.get("nonce_server", ""))
-        if len(nonce_server) < 16:
-            print("[NetClient Auth Error] Nonce CHALLENGE từ Server không hợp lệ.")
-            return False
-
-        # 2. Tạo nonce_agent và tính HMAC(PSK, nonce_server || device_uuid)
-        nonce_agent = secrets.token_hex(16)
-        device_uuid = self.reg_data.device_uuid if self.reg_data else ""
-        auth_mac = compute_auth_hmac(self.psk_bytes, nonce_server, device_uuid)
-
-        reg_payload = self.reg_data.to_dict() if self.reg_data else {"device_uuid": device_uuid}
-        reg_payload["nonce_agent"] = nonce_agent
-        reg_payload["auth_mac"] = auth_mac
-
-        reg_msg = ProtocolMessage(
-            msg_type=MessageType.REGISTER.value,
-            payload=reg_payload,
-            timestamp=time.time(),
-        )
-        if not send_message(sock, reg_msg):
-            return False
-
-        # 3. Dẫn xuất khóa phiên K = HMAC(PSK, nonce_server || nonce_agent)
-        session_key = derive_session_key(self.psk_bytes, nonce_server, nonce_agent)
-
-        # 4. Chờ REGISTER_OK có ký HMAC từ Server (Mutual Auth, seq=1)
-        ok_msg = recv_authenticated_message(
-            sock,
-            session_key,
-            DIR_SERVER_TO_CLIENT,
-            expected_seq=1,
-            timeout_is_fatal=True,
-        )
-        if not ok_msg or ok_msg.msg_type != MessageType.REGISTER_OK.value:
-            print("[NetClient Auth Error] Server từ chối đăng ký hoặc sai khóa PSK.")
-            return False
-
-        server_proof = str(ok_msg.payload.get("server_proof", ""))
-        expected_proof = compute_server_proof(session_key, nonce_agent)
-        if not hmac.compare_digest(server_proof, expected_proof):
-            print("[NetClient Auth Error] Server không chứng minh được khóa PSK (nghi ngờ giả mạo Server).")
-            return False
-
+        session_key, tx_seq, rx_seq = result
         with self._sock_lock:
             self._session_key = session_key
-            self._tx_seq = 1
-            self._rx_seq = 2  # REGISTER_OK đã dùng seq=1
-
-        sock.settimeout(RECV_POLL_TIMEOUT)
+            self._tx_seq = tx_seq
+            self._rx_seq = rx_seq
         return True
 
     def _connection_manager_loop(self):
         """Vòng lặp giám sát kết nối và tự động kết nối lại khi rớt mạng."""
         while self._is_running.is_set():
             try:
-                # 1. Tạo kết nối TCP mới
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 s.settimeout(AUTH_TIMEOUT)
@@ -227,7 +162,6 @@ class NetworkClient:
                 with self._sock_lock:
                     self._sock = s
 
-                # 2. Bắt tay xác thực PSK + HMAC
                 if not self._perform_handshake(s):
                     raise OSError("Bắt tay xác thực PSK/HMAC thất bại")
 
@@ -239,13 +173,11 @@ class NetworkClient:
                     except Exception as e:
                         print(f"[NetClient Callback Error on_connected] {e}")
 
-                # 3. Khởi động luồng Heartbeat riêng cho phiên kết nối này
                 self._heartbeat_thread = threading.Thread(
                     target=self._heartbeat_loop, daemon=True, name="NetClient-Heartbeat"
                 )
                 self._heartbeat_thread.start()
 
-                # 4. Luồng chính chờ nhận thông điệp đã xác thực (Commands / Telemetry ACK) từ Server
                 while self._is_running.is_set() and self._is_connected.is_set():
                     try:
                         msg = recv_authenticated_message(
@@ -265,7 +197,6 @@ class NetworkClient:
 
                     if msg.msg_type == MessageType.COMMAND.value:
                         cmd = CommandPacket.from_dict(msg.payload)
-                        # Kiểm tra khử trùng lặp lệnh (Command Deduplication)
                         if cmd.command_id and cmd.command_id in self._processed_command_ids:
                             print(f"[NetClient Security] Bỏ qua lệnh trùng lặp (ID: {cmd.command_id})")
                             continue

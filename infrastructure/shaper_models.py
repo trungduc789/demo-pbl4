@@ -15,7 +15,7 @@ from typing import Dict, Optional, Set, Tuple
 import psutil
 
 PORT_TTL_SECONDS = 5.0
-MAX_PER_APP_QUEUE_SIZE = 500
+MAX_PER_APP_QUEUE_SIZE = 4096
 
 ALIAS_MAP: Dict[str, str] = {
     "google chrome": "chrome",
@@ -102,7 +102,8 @@ def resolve_target_name_and_exe(
     clean = raw_lower.replace(".exe", "").strip()
     alias = amap.get(clean, clean)
 
-    found_pids: Set[int] = set()
+    exact_pids: Set[int] = set()
+    sub_pids: Set[int] = set()
     found_exe = provided_exe if (provided_exe and os.path.exists(provided_exe)) else ""
     exact_name = ""
     substring_name = ""
@@ -121,18 +122,24 @@ def resolve_target_name_and_exe(
                 or p_base == clean
                 or p_base == alias
             )
-            is_sub = bool(alias and (alias in p_name or alias in p_exe_lower))
+            is_sub = bool(alias and len(alias) >= 4 and (alias in p_name or alias in p_exe_lower))
 
-            if is_exact or is_sub:
-                found_pids.add(p.info["pid"])
-                if p_exe and os.path.exists(p_exe) and (is_exact or not found_exe):
+            if is_exact:
+                exact_pids.add(p.info["pid"])
+                if p_exe and os.path.exists(p_exe):
                     found_exe = p_exe
-                if is_exact and not exact_name:
+                if not exact_name:
                     exact_name = p_name_raw
-                elif is_sub and not substring_name:
+            elif is_sub:
+                sub_pids.add(p.info["pid"])
+                if p_exe and os.path.exists(p_exe) and not found_exe:
+                    found_exe = p_exe
+                if not substring_name:
                     substring_name = p_name_raw
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
+
+    found_pids = exact_pids if exact_pids else sub_pids
 
     if exact_name:
         canonical_name = exact_name

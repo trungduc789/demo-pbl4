@@ -98,12 +98,9 @@ class ConnectionPillButton(QPushButton):
             new_st = self._next_status_resolver(self.status)
         else:
             new_st = "blocked" if self.status == "allowed" else "allowed"
-        self.status = new_st
-        self._update_style()
         app_name = self.app_name
         direction = self.direction
-        status = self.status
-        QtCore.QTimer.singleShot(0, lambda: self.status_changed.emit(app_name, direction, status))
+        QtCore.QTimer.singleShot(0, lambda: self.status_changed.emit(app_name, direction, new_st))
 
     def _show_context_menu(self, pos: QtCore.QPoint):
         """Menu chuột phải cho phép chọn nhanh Allowed / Blocked / Throttled."""
@@ -122,12 +119,9 @@ class ConnectionPillButton(QPushButton):
         elif chosen == act_throttle:
             target_status = "throttled"
         if target_status != self.status or target_status == "throttled":
-            self.status = target_status
-            self._update_style()
             app_name = self.app_name
             direction = self.direction
-            status = self.status
-            QtCore.QTimer.singleShot(0, lambda: self.status_changed.emit(app_name, direction, status))
+            QtCore.QTimer.singleShot(0, lambda: self.status_changed.emit(app_name, direction, target_status))
 
     def _update_style(self):
         if self.status == "allowed":

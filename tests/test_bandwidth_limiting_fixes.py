@@ -139,20 +139,105 @@ class TestBandwidthLimitingFixes(unittest.TestCase):
         self.assertEqual(active_applied, [])
 
     def test_04_packet_shaper_apply_limit_drains_existing_queue(self):
-        shaper = WinDivertPacketShaper()
-        try:
-            with patch.object(shaper, "is_admin", return_value=True), \
-                 patch.object(shaper, "_ensure_engine_running"), \
-                 patch.object(shaper, "_app_throttle_worker_loop"):
-                ok1, _ = shaper.apply_limit("chrome.exe", 500.0, "both")
-                self.assertTrue(ok1)
-                shaper.throttled_apps["chrome.exe"].queue.put(("pkt1", 100, True))
-                ok2, _ = shaper.apply_limit("chrome.exe", 200.0, "both")
-                self.assertTrue(ok2)
-                self.assertEqual(shaper.throttled_apps["chrome.exe"].queue.qsize(), 1)
-                self.assertEqual(shaper.throttled_apps["chrome.exe"].limit_kbps, 200.0)
-        finally:
-            shaper.stop()
+        with patch("infrastructure.packet_shaper.remove_all_pbl4_firewall_rules"), \
+             patch("infrastructure.packet_shaper.remove_windows_firewall_rule"):
+            shaper = WinDivertPacketShaper()
+            try:
+                with patch.object(shaper, "is_admin", return_value=True), \
+                     patch.object(shaper, "_ensure_engine_running"), \
+                     patch.object(shaper, "_app_throttle_worker_loop"):
+                    ok1, _ = shaper.apply_limit("chrome.exe", 500.0, "both")
+                    self.assertTrue(ok1)
+                    shaper.throttled_apps["chrome.exe"].queue.put(("pkt1", 100, True))
+                    ok2, _ = shaper.apply_limit("chrome.exe", 200.0, "both")
+                    self.assertTrue(ok2)
+                    self.assertEqual(shaper.throttled_apps["chrome.exe"].queue.qsize(), 1)
+                    self.assertEqual(shaper.throttled_apps["chrome.exe"].limit_kbps, 200.0)
+            finally:
+                shaper.stop()
+
+    def test_05_worker_token_bucket_high_rate_does_not_choke_connection(self):
+        """
+        Kiểm tra worker Token Bucket ở tốc độ cao (10,240 KB/s = 10 MB/s) không bị kẹt bởi
+        độ phân giải timer 15.6ms của Windows và gỡ sạch rule Firewall cũ khi apply_limit.
+        """
+        with patch("infrastructure.packet_shaper.remove_all_pbl4_firewall_rules"), \
+             patch("infrastructure.packet_shaper.remove_windows_firewall_rule"):
+            shaper = WinDivertPacketShaper()
+            try:
+                mock_handle = MagicMock()
+                mock_handle.is_open = True
+                shaper._divert_handle = mock_handle
+
+                with patch.object(shaper, "is_admin", return_value=True), \
+                     patch.object(shaper, "_ensure_engine_running"), \
+                     patch.object(shaper, "_remove_windows_firewall_rule", return_value=True) as mock_rm_fw:
+                    ok, _ = shaper.apply_limit("msedge.exe", 10240.0, "both")
+                    self.assertTrue(ok)
+                    mock_rm_fw.assert_called_with("msedge.exe")
+
+                    policy = shaper.throttled_apps["msedge.exe"]
+                    # Bơm 50 gói tin 1500 bytes (75 KB, nhỏ hơn burst_capacity 2.5 MB của mức 10 MB/s)
+                    for i in range(50):
+                        policy.queue.put_nowait((f"pkt_{i}", 1500, False))
+
+                    # Đợi tối đa 0.3s -> Toàn bộ 50 gói phải được gửi qua handle mà không bị nghẽn
+                    import time
+                    deadline = time.time() + 0.3
+                    while not policy.queue.empty() and time.time() < deadline:
+                        time.sleep(0.01)
+
+                    self.assertTrue(policy.queue.empty())
+                    self.assertEqual(mock_handle.send.call_count, 50)
+            finally:
+                shaper.stop()
+
+    def test_06_apply_limit_after_unblock_does_not_kill_new_policy_worker(self):
+        """
+        Kiểm tra hồi quy: Khi một ứng dụng vừa được unblock_app (khiến is_active=False)
+        và ngay lập tức được gọi apply_limit(), hàm _ensure_engine_running() KHÔNG ĐƯỢC
+        set policy.stop_event của policy mới vừa tạo!
+        """
+        with patch("infrastructure.packet_shaper.remove_all_pbl4_firewall_rules"), \
+             patch("infrastructure.packet_shaper.remove_windows_firewall_rule"), \
+             patch("infrastructure.packet_shaper.apply_windows_firewall_rule", return_value=True), \
+             patch("infrastructure.packet_shaper.terminate_app_sockets"):
+            shaper = WinDivertPacketShaper()
+            try:
+                mock_handle = MagicMock()
+                mock_handle.is_open = True
+
+                def fake_capture_loop(stop_ev):
+                    shaper._divert_handle = mock_handle
+                    stop_ev.wait(0.5)
+
+                with patch.object(shaper, "is_admin", return_value=True), \
+                     patch.object(shaper, "_capture_loop", side_effect=fake_capture_loop):
+                    ok_b, _ = shaper.block_app("msedge.exe")
+                    self.assertTrue(ok_b)
+                    ok_u, _ = shaper.unblock_app("msedge.exe")
+                    self.assertTrue(ok_u)
+                    self.assertFalse(shaper.is_active)
+
+                    ok_t, _ = shaper.apply_limit("msedge.exe", 1024.0, "both")
+                    self.assertTrue(ok_t)
+
+                    policy = shaper.throttled_apps["msedge.exe"]
+                    self.assertFalse(policy.stop_event.is_set(), "policy.stop_event bị set nhầm bởi _stop_engine_threads!")
+                    self.assertTrue(policy.worker_thread.is_alive(), "Worker thread của msedge.exe phải đang sống!")
+
+                    for i in range(20):
+                        policy.queue.put_nowait((f"pkt_{i}", 1400, True))
+
+                    import time
+                    deadline = time.time() + 0.4
+                    while not policy.queue.empty() and time.time() < deadline:
+                        time.sleep(0.01)
+
+                    self.assertTrue(policy.queue.empty(), "Worker phải tiêu thụ hết gói tin trong queue!")
+                    self.assertEqual(mock_handle.send.call_count, 20)
+            finally:
+                shaper.stop()
 
 
 if __name__ == "__main__":

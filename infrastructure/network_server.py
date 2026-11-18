@@ -1,15 +1,11 @@
 """
 Máy chủ truyền thông mạng tập trung (Centralized Network Server - TCP):
 - Quản lý đa kết nối từ các máy con (Multi-threaded TCP Socket Server).
-- Xác thực bắt tay Challenge-Response (PSK + HMAC-SHA256) với hạn chót 5s và giới hạn pending auth.
+- Ủy quyền bắt tay Challenge-Response (PSK + HMAC-SHA256) cho `infrastructure.auth_handshake`.
 - Gắn cứng danh tính phiên (Session Binding) vào device_uuid đã xác thực.
-- Bảo vệ toàn vẹn, chống Replay & đảo thứ tự gói tin bằng Khóa phiên (K) + Sequence Number + HMAC.
-- Tiếp nhận Heartbeat & Telemetry (phản hồi TELEMETRY_ACK) thời gian thực.
-- Đẩy lệnh điều khiển đã xác thực xuống máy con.
+- Tiếp nhận Heartbeat & Telemetry (phản hồi TELEMETRY_ACK) và đẩy lệnh điều khiển đã xác thực xuống máy con.
 """
 
-import hmac
-import secrets
 import socket
 import threading
 import time
@@ -20,9 +16,7 @@ from config.settings import (
     SERVER_DEFAULT_PORT,
     SERVER_CLIENT_TIMEOUT,
     NETWORK_PSK,
-    AUTH_TIMEOUT,
     MAX_PENDING_AUTH,
-    RECV_POLL_TIMEOUT,
 )
 from models.network_protocol import (
     MessageType,
@@ -36,14 +30,10 @@ from infrastructure.protocol_framing import (
     DIR_CLIENT_TO_SERVER,
     DIR_SERVER_TO_CLIENT,
     RecvTimeoutError,
-    compute_auth_hmac,
-    compute_server_proof,
-    derive_session_key,
     recv_authenticated_message,
-    recv_message,
     send_authenticated_message,
-    send_message,
 )
+from infrastructure.auth_handshake import perform_server_handshake
 from utils.safe_print import safe_print as print
 
 
@@ -116,11 +106,9 @@ class NetworkServer:
         self._clients_lock = threading.RLock()
         self.clients: Dict[str, ClientConnectionHandler] = {}  # device_uuid -> Handler
 
-        # Giới hạn kết nối chưa xác thực (chống DoS cạn kiệt tài nguyên)
         self._pending_auth_lock = threading.Lock()
         self._pending_auth_count: int = 0
 
-        # Các Callback phục vụ tầng nghiệp vụ (Application Layer)
         self.on_device_registered: Optional[Callable[[DeviceRegistrationData], None]] = None
         self.on_telemetry_received: Optional[Callable[[str, TelemetryPacket], None]] = None
         self.on_command_result: Optional[Callable[[CommandResultPacket], None]] = None
@@ -166,7 +154,7 @@ class NetworkServer:
             self._server_sock = None
 
         with self._clients_lock:
-            for uuid_val, handler in list(self.clients.items()):
+            for _uuid_val, handler in list(self.clients.items()):
                 handler.close()
             self.clients.clear()
 
@@ -208,69 +196,7 @@ class NetworkServer:
 
     def _perform_handshake(self, handler: ClientConnectionHandler) -> Optional[DeviceRegistrationData]:
         """Thực hiện bắt tay Challenge-Response trong thời hạn AUTH_TIMEOUT (5s)."""
-        sock = handler.sock
-        if not sock:
-            return None
-
-        sock.settimeout(AUTH_TIMEOUT)
-        nonce_server = secrets.token_hex(16)
-
-        challenge_msg = ProtocolMessage(
-            msg_type=MessageType.CHALLENGE.value,
-            payload={"nonce_server": nonce_server},
-            timestamp=time.time(),
-        )
-        if not send_message(sock, challenge_msg):
-            return None
-
-        reg_msg = recv_message(sock, timeout_is_fatal=True)
-        if not reg_msg or reg_msg.msg_type != MessageType.REGISTER.value:
-            print(f"[NetServer Auth Failed] Không nhận được gói REGISTER hợp lệ từ {handler.addr} (hết hạn hoặc sai định dạng)")
-            return None
-
-        reg = DeviceRegistrationData.from_dict(reg_msg.payload)
-        nonce_agent = str(reg_msg.payload.get("nonce_agent", ""))
-        auth_mac = str(reg_msg.payload.get("auth_mac", ""))
-
-        if not reg.device_uuid or len(nonce_agent) < 16 or not auth_mac:
-            print(f"[NetServer Auth Failed] Thiếu thông tin xác thực từ {handler.addr}")
-            return None
-
-        expected_mac = compute_auth_hmac(self.psk_bytes, nonce_server, reg.device_uuid)
-        if not hmac.compare_digest(auth_mac, expected_mac):
-            print(f"[NetServer Auth Failed] Sai chữ ký HMAC xác thực từ {handler.addr} (UUID: {reg.device_uuid})")
-            return None
-
-        if not reg.ip_address:
-            reg.ip_address = handler.addr[0]
-
-        # Dẫn xuất khóa phiên K = HMAC(PSK, nonce_server || nonce_agent)
-        session_key = derive_session_key(self.psk_bytes, nonce_server, nonce_agent)
-        handler.session_key = session_key
-        handler.tx_seq = 1
-        handler.rx_seq = 1
-        handler.device_uuid = reg.device_uuid
-        handler.reg_data = reg
-        handler.is_authenticated = True
-        handler.last_seen = time.time()
-
-        # Chuyển sang poll timeout để vòng lặp kiểm tra _is_running / is_active mượt mà
-        sock.settimeout(RECV_POLL_TIMEOUT)
-
-        # Gửi REGISTER_OK có ký HMAC bằng khóa phiên (Mutual Authentication)
-        ok_msg = ProtocolMessage(
-            msg_type=MessageType.REGISTER_OK.value,
-            payload={
-                "status": "OK",
-                "device_uuid": reg.device_uuid,
-                "server_proof": compute_server_proof(session_key, nonce_agent),
-            },
-            timestamp=time.time(),
-        )
-        if not handler.send(ok_msg):
-            return None
-
-        return reg
+        return perform_server_handshake(handler, self.psk_bytes)
 
     def _handle_client_session(self, handler: ClientConnectionHandler):
         """Xử lý luồng dữ liệu độc lập của một máy con."""
@@ -319,7 +245,6 @@ class NetworkServer:
                 handler.last_seen = time.time()
 
                 if msg.msg_type == MessageType.REGISTER.value:
-                    # Mỗi socket chỉ được đăng ký đúng 1 lần
                     print(f"[NetServer Security] Máy con '{registered_uuid}' gửi lại REGISTER bất hợp lệ. Đóng phiên.")
                     break
 
@@ -329,7 +254,6 @@ class NetworkServer:
                 elif msg.msg_type == MessageType.TELEMETRY.value:
                     handler.last_seen = time.time()
                     telem = TelemetryPacket.from_dict(msg.payload)
-                    # Gắn cứng danh tính phiên: bỏ qua device_uuid tự khai báo trong payload
                     telem.device_uuid = registered_uuid
 
                     if self.on_telemetry_received:
@@ -338,7 +262,6 @@ class NetworkServer:
                         except Exception as e:
                             print(f"[NetServer Callback Error on_telemetry_received] {e}")
 
-                    # Xác nhận đã tiếp nhận Telemetry thành công
                     ack_msg = ProtocolMessage(
                         msg_type=MessageType.TELEMETRY_ACK.value,
                         payload={"timestamp": telem.timestamp, "status": "OK"},
@@ -350,7 +273,6 @@ class NetworkServer:
                     handler.last_seen = time.time()
                     if self.on_command_result:
                         res = CommandResultPacket.from_dict(msg.payload)
-                        # Gắn cứng danh tính phiên: chỉ dùng UUID của phiên đã xác thực
                         res.device_uuid = registered_uuid
                         try:
                             self.on_command_result(res)
@@ -392,12 +314,14 @@ class NetworkServer:
             stale_handlers: List[ClientConnectionHandler] = []
 
             with self._clients_lock:
-                for uuid_val, handler in list(self.clients.items()):
+                for _uuid_val, handler in list(self.clients.items()):
                     if now - handler.last_seen > SERVER_CLIENT_TIMEOUT:
                         stale_handlers.append(handler)
 
             for h in stale_handlers:
-                print(f"[NetServer Watchdog] Phát hiện máy '{h.device_uuid}' quá hạn phản hồi (Timeout > {SERVER_CLIENT_TIMEOUT}s). Đóng kết nối.")
+                print(
+                    f"[NetServer Watchdog] Phát hiện máy '{h.device_uuid}' quá hạn phản hồi (Timeout > {SERVER_CLIENT_TIMEOUT}s). Đóng kết nối."
+                )
                 h.close()
 
     def send_command(self, device_uuid: str, command: CommandPacket) -> bool:
@@ -415,7 +339,9 @@ class NetworkServer:
         )
         ok = handler.send(msg)
         if ok:
-            print(f"[NetServer Command Sent] Đã gửi lệnh '{command.action}' cho app '{command.target_app}' tới máy '{device_uuid}'")
+            print(
+                f"[NetServer Command Sent] Đã gửi lệnh '{command.action}' cho app '{command.target_app}' tới máy '{device_uuid}'"
+            )
         else:
             print(f"[NetServer Command Failed] Gửi lệnh tới máy '{device_uuid}' thất bại.")
         return ok

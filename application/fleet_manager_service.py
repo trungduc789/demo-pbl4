@@ -26,6 +26,10 @@ from models.network_protocol import (
 )
 from infrastructure.network_server import NetworkServer
 from infrastructure.network_collector import NetworkCollector
+from application.process_aggregator import (
+    resolve_executable_path_cached,
+    enrich_tcp_connections,
+)
 from utils.file_logger import FileLogger, LOGS_DIR
 from utils.safe_print import safe_print as print
 
@@ -35,7 +39,7 @@ class FleetDeviceState:
     """Trạng thái thời gian thực và lịch sử lưu lượng của một máy con trong hệ thống."""
     device_uuid: str
     registration: Optional[DeviceRegistrationData] = None
-    status: str = "offline"  # "online" hoặc "offline"
+    status: str = "offline"
     last_seen: float = field(default_factory=time.time)
     offline_at: float = 0.0
     ip_address: str = ""
@@ -44,7 +48,7 @@ class FleetDeviceState:
     upload_history: deque = field(default_factory=lambda: deque(maxlen=MAX_DATA_POINTS))
     current_down_kbps: float = 0.0
     current_up_kbps: float = 0.0
-    applied_policies: Dict[str, Dict] = field(default_factory=dict)  # app_name -> policy_info
+    applied_policies: Dict[str, Dict] = field(default_factory=dict)
 
     @property
     def hostname(self) -> str:
@@ -68,22 +72,18 @@ class FleetManagerService:
         self.host = host
         self.port = port
 
-        # 1. Khởi tạo tầng hạ tầng mạng
         self.server = NetworkServer(host=self.host, port=self.port)
         self.collector = NetworkCollector()
         self.proc_info_cache: Dict[int, Tuple[str, str]] = {}
 
-        # 2. Bộ nhớ đệm danh bạ máy con & theo dõi lệnh đang chờ phản hồi
         self._devices: Dict[str, FleetDeviceState] = {}
         self._pending_commands: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
 
-        # 3. Các Callbacks phát tín hiệu cho Giao diện Admin (UI Notifications)
         self.on_fleet_updated: Optional[Callable[[], None]] = None
         self.on_telemetry_updated: Optional[Callable[[str, TelemetryPacket], None]] = None
         self.on_command_result: Optional[Callable[[CommandResultPacket], None]] = None
 
-        # 4. Đăng ký callbacks từ NetworkServer
         self.server.on_device_registered = self._on_server_device_registered
         self.server.on_telemetry_received = self._on_server_telemetry_received
         self.server.on_command_result = self._on_server_command_result
@@ -165,7 +165,6 @@ class FleetManagerService:
                     if app_key and app_key in state.applied_policies:
                         state.applied_policies[app_key]["status"] = "SUCCESS"
                 else:
-                    # Ghi nhận trạng thái thất bại và hoàn tác nếu trước đó có chính sách cũ
                     prev_pol = cmd_meta.get("prev_policy")
                     if prev_pol is not None and app_key:
                         state.applied_policies[app_key] = prev_pol
@@ -189,7 +188,6 @@ class FleetManagerService:
                 state.offline_at = now_ts
                 state.current_down_kbps = 0.0
                 state.current_up_kbps = 0.0
-                # Chốt 1 điểm về 0 để biểu đồ khi xem lại máy Offline hạ xuống trục 0 thay vì giữ ngang
                 last_ts = state.download_history[-1][0] if state.download_history else now_ts
                 drop_ts = max(last_ts + 1.0, now_ts)
                 if not state.download_history or state.download_history[-1][1] != 0.0:
@@ -204,7 +202,7 @@ class FleetManagerService:
                 print(f"[FleetService Callback Error on_fleet_updated] {e}")
 
     # =========================================================================
-    # CÁC API TRUY VẤN VÀ ĐIỀU KHIỂN CHO GIAO DIỆN ADMIN (PHASE 4)
+    # CÁC API TRUY VẤN VÀ ĐIỀU KHIỂN CHO GIAO DIỆN ADMIN
     # =========================================================================
 
     def get_fleet_summary(self) -> Dict[str, Any]:
@@ -227,7 +225,6 @@ class FleetManagerService:
     def get_all_device_states(self) -> List[FleetDeviceState]:
         """Lấy danh sách tất cả các máy con đang quản lý."""
         with self._lock:
-            # Ưu tiên các máy online xếp lên trước, sau đó sắp xếp theo hostname
             return sorted(
                 list(self._devices.values()),
                 key=lambda d: (0 if d.status == "online" else 1, d.hostname.lower()),
@@ -246,13 +243,7 @@ class FleetManagerService:
         limit_kbps: float = 0.0,
         direction: str = "both",
     ) -> Tuple[bool, str]:
-        """
-        Admin gửi lệnh can thiệp xuống máy con cụ thể:
-        - action: BLOCK_APP, UNBLOCK_APP, UNBLOCK_ALL, THROTTLE_SET, REMOVE_LIMIT, PING
-        - target_app: Ví dụ 'chrome.exe', 'brave.exe'
-        - limit_kbps: Hạn mức băng thông (áp dụng cho THROTTLE_SET)
-        - direction: 'both', 'upload', 'download'
-        """
+        """Admin gửi lệnh can thiệp xuống máy con cụ thể."""
         with self._lock:
             state = self._devices.get(device_uuid)
             if not state:
@@ -271,43 +262,42 @@ class FleetManagerService:
         )
 
         ok = self.server.send_command(device_uuid, cmd)
-        if ok:
-            # Cập nhật tạm thời chính sách trên bộ nhớ kèm lưu bản chụp để rollback nếu lệnh thất bại
-            with self._lock:
-                if state:
-                    app_key = target_app.lower()
-                    prev_pol = dict(state.applied_policies[app_key]) if app_key in state.applied_policies else None
-                    self._pending_commands[cmd_id] = {
-                        "device_uuid": device_uuid,
-                        "action": action,
-                        "target_app": target_app,
-                        "prev_policy": prev_pol,
-                    }
-                    if action in (CommandAction.BLOCK_APP.value, CommandAction.THROTTLE_SET.value):
-                        state.applied_policies[app_key] = {
-                            "action": action,
-                            "limit_kbps": limit_kbps,
-                            "direction": direction,
-                            "applied_at": time.time(),
-                            "status": "PENDING",
-                        }
-                    elif action == CommandAction.UNBLOCK_APP.value:
-                        state.applied_policies.pop(app_key, None)
-                    elif action == CommandAction.UNBLOCK_ALL.value:
-                        for k in list(state.applied_policies.keys()):
-                            if state.applied_policies[k].get("action") == CommandAction.BLOCK_APP.value:
-                                del state.applied_policies[k]
-                    elif action == CommandAction.REMOVE_LIMIT.value:
-                        if target_app:
-                            state.applied_policies.pop(app_key, None)
-                        else:
-                            for k in list(state.applied_policies.keys()):
-                                if state.applied_policies[k].get("action") == CommandAction.THROTTLE_SET.value:
-                                    del state.applied_policies[k]
-
-            return True, f"Đã gửi lệnh '{action}' thành công tới '{state.hostname}' (ID: {cmd_id})"
-        else:
+        if not ok:
             return False, f"Gửi lệnh tới máy '{state.hostname}' thất bại qua kênh truyền thông."
+
+        with self._lock:
+            if state:
+                app_key = target_app.lower()
+                prev_pol = dict(state.applied_policies[app_key]) if app_key in state.applied_policies else None
+                self._pending_commands[cmd_id] = {
+                    "device_uuid": device_uuid,
+                    "action": action,
+                    "target_app": target_app,
+                    "prev_policy": prev_pol,
+                }
+                if action in (CommandAction.BLOCK_APP.value, CommandAction.THROTTLE_SET.value):
+                    state.applied_policies[app_key] = {
+                        "action": action,
+                        "limit_kbps": limit_kbps,
+                        "direction": direction,
+                        "applied_at": time.time(),
+                        "status": "PENDING",
+                    }
+                elif action == CommandAction.UNBLOCK_APP.value:
+                    state.applied_policies.pop(app_key, None)
+                elif action == CommandAction.UNBLOCK_ALL.value:
+                    for k in list(state.applied_policies.keys()):
+                        if state.applied_policies[k].get("action") == CommandAction.BLOCK_APP.value:
+                            del state.applied_policies[k]
+                elif action == CommandAction.REMOVE_LIMIT.value:
+                    if target_app:
+                        state.applied_policies.pop(app_key, None)
+                    else:
+                        for k in list(state.applied_policies.keys()):
+                            if state.applied_policies[k].get("action") == CommandAction.THROTTLE_SET.value:
+                                del state.applied_policies[k]
+
+        return True, f"Đã gửi lệnh '{action}' thành công tới '{state.hostname}' (ID: {cmd_id})"
 
     def get_raw_tcp_connections(self) -> List[Any]:
         """Lấy danh sách đối tượng kết nối TCP thô từ tầng hạ tầng."""
@@ -315,42 +305,11 @@ class FleetManagerService:
 
     def resolve_executable_path(self, pid: int) -> str:
         """Phân giải đường dẫn file .exe từ PID qua NetworkCollector."""
-        if pid <= 0:
-            return ""
-        if pid in self.proc_info_cache:
-            _, exe_path = self.proc_info_cache[pid]
-            if exe_path:
-                return exe_path
-        p_info = self.collector.get_process_info(pid)
-        if p_info:
-            p_name = p_info.name or f"PID {pid}"
-            exe_path = p_info.executable_path or ""
-            self.proc_info_cache[pid] = (p_name, exe_path)
-            return exe_path
-        return ""
+        return resolve_executable_path_cached(self.collector, self.proc_info_cache, pid)
 
     def get_connections(self) -> List[Dict]:
         """Lấy danh sách các kết nối socket TCP kèm thông tin tiến trình."""
-        raw_conns = self.collector.collect_tcp_connections()
-        enriched = []
-        for conn in raw_conns:
-            pid = conn.pid or 0
-            if pid in self.proc_info_cache:
-                proc_name, _ = self.proc_info_cache[pid]
-            else:
-                p_info = self.collector.get_process_info(pid)
-                proc_name = p_info.name if p_info else ("System" if pid == 0 else f"PID {pid}")
-                exe_path = p_info.executable_path if p_info and p_info.executable_path else ""
-                self.proc_info_cache[pid] = (proc_name, exe_path)
-            enriched.append({
-                "pid": pid,
-                "process_name": proc_name,
-                "protocol": conn.protocol,
-                "local_addr": f"{conn.local_ip}:{conn.local_port}" if conn.local_port else conn.local_ip,
-                "remote_addr": f"{conn.remote_ip}:{conn.remote_port}" if conn.remote_ip and conn.remote_port else ("*" if conn.state == "LISTEN" else "-"),
-                "state": conn.state
-            })
-        return enriched
+        return enrich_tcp_connections(self.collector, self.proc_info_cache, log_to_file=False)
 
     def get_policy_history(self, limit: int = 200) -> List[Dict]:
         """Đọc lịch sử chính sách an ninh mạng từ FileLogger."""

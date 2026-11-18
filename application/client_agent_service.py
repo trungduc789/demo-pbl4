@@ -27,6 +27,10 @@ from infrastructure.network_client import NetworkClient
 from application.bandwidth_calculator import BandwidthCalculator
 from application.client_policy_manager import ClientPolicyMixin
 from application.client_diagnostics import ClientDiagnosticsMixin
+from application.process_aggregator import (
+    aggregate_etw_samples_to_dicts,
+    sync_shaper_speeds_to_metric_list,
+)
 from utils.safe_print import safe_print as print
 
 
@@ -47,7 +51,6 @@ class ClientAgentService(ClientPolicyMixin, ClientDiagnosticsMixin):
         self.enable_etw = enable_etw
         self.monitor_service = monitor_service
 
-        # 1. Khởi tạo các module hạ tầng kỹ thuật (hoặc dùng chung từ monitor_service)
         if self.monitor_service is not None:
             self.collector = getattr(self.monitor_service, "collector", NetworkCollector())
             self.calculator = getattr(self.monitor_service, "calculator", BandwidthCalculator())
@@ -67,10 +70,8 @@ class ClientAgentService(ClientPolicyMixin, ClientDiagnosticsMixin):
                     print(f"[ClientAgent Warning] Không thể khởi động ETW Consumer: {e}")
                     self.etw_consumer = None
 
-        # 2. Định danh máy cố định
         self.device_uuid, self.registration_data = self._generate_device_info()
 
-        # 3. Quản lý trạng thái và kết nối mạng
         self._is_running = threading.Event()
         self._telemetry_thread: Optional[threading.Thread] = None
         self.prev_sample: RawNetworkSample = self.collector.collect_io_counters()
@@ -84,7 +85,6 @@ class ClientAgentService(ClientPolicyMixin, ClientDiagnosticsMixin):
         self.latest_ram_pct: float = 0.0
         self.latest_top_procs: List[ProcessMetricData] = []
 
-        # Bộ đệm kết quả đo độ trễ bất đồng bộ
         self.cached_server_latency: Optional[float] = None
         self.cached_server_ok: bool = False
         self.cached_server_msg: str = "Đang đo..."
@@ -93,7 +93,6 @@ class ClientAgentService(ClientPolicyMixin, ClientDiagnosticsMixin):
         self.cached_internet_msg: str = "Đang đo..."
         self._latency_probe_busy: bool = False
 
-        # 4. Nhật ký kiểm toán thao tác từ Admin & Client
         self._audit_lock = threading.Lock()
         self.audit_logs: List[Dict[str, Any]] = []
         self._init_initial_audit_log()
@@ -179,6 +178,44 @@ class ClientAgentService(ClientPolicyMixin, ClientDiagnosticsMixin):
 
         print("[ClientAgent] Agent Service đã dừng an toàn.")
 
+    def _collect_top_process_metrics(self, time_delta: float) -> List[ProcessMetricData]:
+        """Thu thập danh sách ProcessMetricData từ MonitorService dùng chung hoặc từ ETW Consumer riêng."""
+        top_procs: List[ProcessMetricData] = []
+        if self.monitor_service is not None:
+            raw_proc_speeds = getattr(self.monitor_service, "latest_proc_speeds", [])
+            for p in raw_proc_speeds[:15]:
+                top_procs.append(
+                    ProcessMetricData(
+                        name=p.get("name", "Unknown"),
+                        pid=p.get("pid", 0),
+                        down_kbps=round(float(p.get("down_kb", 0.0)), 2),
+                        up_kbps=round(float(p.get("up_kb", 0.0)), 2),
+                        connections_count=0,
+                    )
+                )
+        elif self.etw_consumer:
+            try:
+                etw_samples = self.etw_consumer.flush_and_aggregate()
+                proc_dicts, _, _ = aggregate_etw_samples_to_dicts(
+                    etw_samples, time_delta, self.collector, self.proc_info_cache
+                )
+                for p in proc_dicts:
+                    top_procs.append(
+                        ProcessMetricData(
+                            name=p["name"],
+                            pid=p["pid"],
+                            down_kbps=round(float(p["down_kb"]), 2),
+                            up_kbps=round(float(p["up_kb"]), 2),
+                            connections_count=0,
+                        )
+                    )
+            except Exception as e:
+                print(f"[ClientAgent ETW Loop Warning] {e}")
+
+        sync_shaper_speeds_to_metric_list(getattr(self, "packet_shaper", None), top_procs)
+        top_procs.sort(key=lambda p: (p.down_kbps + p.up_kbps), reverse=True)
+        return top_procs[:15]
+
     def _telemetry_loop(self):
         """Vòng lặp thu thập telemetry định kỳ và đẩy lên Server."""
         while self._is_running.is_set():
@@ -195,63 +232,19 @@ class ClientAgentService(ClientPolicyMixin, ClientDiagnosticsMixin):
                 self.total_tx_bytes = curr_sample.bytes_sent
                 self.total_rx_bytes = curr_sample.bytes_recv
 
-                top_procs: List[ProcessMetricData] = []
                 if self.monitor_service is not None:
                     latest_sp = getattr(self.monitor_service, "latest_speed", None)
                     if latest_sp is not None:
                         speed = latest_sp
 
-                    raw_proc_speeds = getattr(self.monitor_service, "latest_proc_speeds", [])
-                    for p in raw_proc_speeds[:15]:
-                        top_procs.append(
-                            ProcessMetricData(
-                                name=p.get("name", "Unknown"),
-                                pid=p.get("pid", 0),
-                                down_kbps=round(float(p.get("down_kb", 0.0)), 2),
-                                up_kbps=round(float(p.get("up_kb", 0.0)), 2),
-                                connections_count=0,
-                            )
-                        )
-                elif self.etw_consumer:
-                    try:
-                        etw_samples = self.etw_consumer.flush_and_aggregate()
-                        if etw_samples:
-                            for pid, b_info in etw_samples.items():
-                                rx = b_info.get("rx_bytes", 0)
-                                tx = b_info.get("tx_bytes", 0)
-                                down_kb = rx / (time_delta * 1024.0)
-                                up_kb = tx / (time_delta * 1024.0)
-
-                                if pid in self.proc_info_cache:
-                                    p_name, _ = self.proc_info_cache[pid]
-                                else:
-                                    p_info = self.collector.get_process_info(pid)
-                                    p_name = p_info.name if p_info else f"PID {pid}"
-                                    p_exe = p_info.executable_path if p_info and p_info.executable_path else ""
-                                    self.proc_info_cache[pid] = (p_name, p_exe)
-
-                                top_procs.append(
-                                    ProcessMetricData(
-                                        name=p_name,
-                                        pid=pid,
-                                        down_kbps=round(down_kb, 2),
-                                        up_kbps=round(up_kb, 2),
-                                        connections_count=0,
-                                    )
-                                )
-                    except Exception as e:
-                        print(f"[ClientAgent ETW Loop Warning] {e}")
-
-                top_procs.sort(key=lambda p: (p.down_kbps + p.up_kbps), reverse=True)
-                top_procs = top_procs[:15]
+                top_procs = self._collect_top_process_metrics(time_delta)
 
                 sys_stats = self._get_infra_collector().collect_system_stats()
                 cpu_pct = sys_stats.get("cpu_percent", 0.0)
                 ram_pct = sys_stats.get("ram_percent", 0.0)
 
                 try:
-                    active_conns = self.collector.collect_tcp_connections()
-                    active_conns_count = len(active_conns)
+                    active_conns_count = len(self.collector.collect_tcp_connections())
                 except Exception:
                     active_conns_count = 0
 

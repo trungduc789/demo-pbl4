@@ -1,7 +1,8 @@
 """
-Quản lý Chính sách An ninh 2 Lớp (2-Tier Policy) & Nhật ký Kiểm toán (Audit Log) cho Client Agent:
+Quản lý Chính sách An ninh 2 Lớp (2-Tier Policy) cho Client Agent (ClientPolicyMixin - Application Layer):
 - Lớp 1 (Admin Enforced 🔒): Lệnh từ Admin Server, khóa cứng không cho phép người dùng máy con gỡ bỏ.
 - Lớp 2 (Local Self-Protect 🔓): Người dùng máy con tự thiết lập cho các tiến trình chưa bị Admin khóa.
+- Ủy quyền lưu trữ và định dạng Nhật ký Kiểm toán (Audit Log) cho `application.audit_logger`.
 """
 
 import time
@@ -11,6 +12,10 @@ from models.network_protocol import (
     CommandAction,
     CommandPacket,
     CommandResultPacket,
+)
+from application.audit_logger import (
+    append_audit_entry,
+    format_admin_command_audit,
 )
 from utils.safe_print import safe_print as print
 
@@ -30,24 +35,108 @@ class ClientPolicyMixin:
 
     def add_audit_log(self, source: str, action: str, target: str, status: str, details: str):
         """Ghi nhận sự kiện kiểm toán nghiệp vụ an ninh vào bộ đệm."""
-        with self._audit_lock:
-            entry = {
-                "timestamp": time.time(),
-                "time_str": time.strftime("%H:%M:%S"),
-                "source": source,
-                "action": action,
-                "target": target,
-                "status": status,
-                "details": details,
-            }
-            self.audit_logs.insert(0, entry)
-            if len(self.audit_logs) > 200:
-                self.audit_logs.pop()
+        append_audit_entry(
+            audit_logs=self.audit_logs,
+            audit_lock=self._audit_lock,
+            source=source,
+            action=action,
+            target=target,
+            status=status,
+            details=details,
+        )
 
     def get_audit_logs(self) -> List[Dict[str, Any]]:
         """Lấy danh sách nhật ký kiểm toán cho giao diện."""
         with self._audit_lock:
             return list(self.audit_logs)
+
+    def _execute_shaper_command(
+        self, action: str, app_name: str, direction: str, limit_kbps: float
+    ) -> Tuple[bool, str]:
+        """Thực thi thao tác tương ứng trên WinDivertPacketShaper."""
+        if action == CommandAction.BLOCK_APP.value:
+            if not app_name:
+                return False, "Tên ứng dụng cần chặn không được để trống."
+            existing_pol = self._find_policy_entry(app_name)
+            if existing_pol and existing_pol.get("action") == "THROTTLE":
+                try:
+                    self.packet_shaper.remove_limit(app_name)
+                except TypeError:
+                    self.packet_shaper.remove_limit()
+            return self.packet_shaper.block_app(app_name, direction=direction)
+
+        if action == CommandAction.UNBLOCK_APP.value:
+            if not app_name:
+                return False, "Tên ứng dụng cần gỡ chặn không được để trống."
+            return self.packet_shaper.unblock_app(app_name)
+
+        if action == CommandAction.UNBLOCK_ALL.value:
+            return self.packet_shaper.unblock_all()
+
+        if action == CommandAction.THROTTLE_SET.value:
+            if not app_name:
+                return False, "Tên ứng dụng cần bóp băng thông không được để trống."
+            if limit_kbps <= 0:
+                return False, "Hạn mức băng thông phải lớn hơn 0 KB/s."
+            existing_pol = self._find_policy_entry(app_name)
+            if existing_pol and existing_pol.get("action") == "BLOCK":
+                self.packet_shaper.unblock_app(app_name)
+            return self.packet_shaper.apply_limit(app_name, limit_kbps=limit_kbps, direction=direction)
+
+        if action == CommandAction.REMOVE_LIMIT.value:
+            try:
+                return self.packet_shaper.remove_limit(app_name if app_name else None)
+            except TypeError:
+                return self.packet_shaper.remove_limit()
+
+        if action == CommandAction.PING.value:
+            return (
+                True,
+                f"Pong from Client '{self.registration_data.hostname}' at {time.strftime('%H:%M:%S')}",
+            )
+
+        return False, f"Hành động không xác định: {action}"
+
+    def _update_admin_policy_state(self, action: str, app_name: str, direction: str, limit_kbps: float):
+        """Cập nhật bảng active_policies sau khi lệnh từ Admin thực thi thành công."""
+        app_key = app_name.lower()
+        if action == CommandAction.BLOCK_APP.value:
+            self._remove_policy_entry(app_key)
+            self.active_policies[app_key] = {
+                "action": "BLOCK",
+                "app": app_name,
+                "limit_kbps": 0.0,
+                "direction": direction,
+                "time": time.time(),
+                "source": "ADMIN",
+                "locked_by_admin": True,
+            }
+        elif action == CommandAction.THROTTLE_SET.value:
+            self._remove_policy_entry(app_key)
+            self.active_policies[app_key] = {
+                "action": "THROTTLE",
+                "app": app_name,
+                "limit_kbps": limit_kbps,
+                "direction": direction,
+                "time": time.time(),
+                "source": "ADMIN",
+                "locked_by_admin": True,
+            }
+        elif action == CommandAction.UNBLOCK_APP.value:
+            self._remove_policy_entry(app_key)
+        elif action == CommandAction.UNBLOCK_ALL.value:
+            for k in list(self.active_policies.keys()):
+                if self.active_policies[k].get("action") == "BLOCK":
+                    del self.active_policies[k]
+        elif action == CommandAction.REMOVE_LIMIT.value:
+            if app_key:
+                pol = self._find_policy_entry(app_key)
+                if pol and pol.get("action") == "THROTTLE":
+                    self._remove_policy_entry(app_key)
+            else:
+                for k in list(self.active_policies.keys()):
+                    if self.active_policies[k].get("action") == "THROTTLE":
+                        del self.active_policies[k]
 
     def handle_remote_command(self, cmd: CommandPacket) -> Optional[CommandResultPacket]:
         """Xử lý lệnh can thiệp từ xa do Admin gửi tới (Lớp 1 - Admin Enforced 🔒)."""
@@ -58,87 +147,15 @@ class ClientPolicyMixin:
 
         print(f"[ClientAgent Command Executing] Hành động: '{action}' | App: '{app_name}' | Limit: {limit_kbps} KB/s")
 
-        success = False
-        message = ""
-
         try:
-            if action == CommandAction.BLOCK_APP.value:
-                if not app_name:
-                    success, message = False, "Tên ứng dụng cần chặn không được để trống."
-                else:
-                    existing_pol = self._find_policy_entry(app_name)
-                    if existing_pol and existing_pol.get("action") == "THROTTLE":
-                        try:
-                            self.packet_shaper.remove_limit(app_name)
-                        except TypeError:
-                            self.packet_shaper.remove_limit()
-                    success, message = self.packet_shaper.block_app(app_name, direction=direction)
-
-            elif action == CommandAction.UNBLOCK_APP.value:
-                if not app_name:
-                    success, message = False, "Tên ứng dụng cần gỡ chặn không được để trống."
-                else:
-                    success, message = self.packet_shaper.unblock_app(app_name)
-
-            elif action == CommandAction.UNBLOCK_ALL.value:
-                success, message = self.packet_shaper.unblock_all()
-
-            elif action == CommandAction.THROTTLE_SET.value:
-                if not app_name:
-                    success, message = False, "Tên ứng dụng cần bóp băng thông không được để trống."
-                elif limit_kbps <= 0:
-                    success, message = False, "Hạn mức băng thông phải lớn hơn 0 KB/s."
-                else:
-                    existing_pol = self._find_policy_entry(app_name)
-                    if existing_pol and existing_pol.get("action") == "BLOCK":
-                        self.packet_shaper.unblock_app(app_name)
-                    success, message = self.packet_shaper.apply_limit(
-                        app_name, limit_kbps=limit_kbps, direction=direction
-                    )
-
-            elif action == CommandAction.REMOVE_LIMIT.value:
-                try:
-                    success, message = self.packet_shaper.remove_limit(app_name if app_name else None)
-                except TypeError:
-                    success, message = self.packet_shaper.remove_limit()
-
-            elif action == CommandAction.PING.value:
-                success, message = (
-                    True,
-                    f"Pong from Client '{self.registration_data.hostname}' at {time.strftime('%H:%M:%S')}",
-                )
-
-            else:
-                success, message = False, f"Hành động không xác định: {action}"
-
+            success, message = self._execute_shaper_command(action, app_name, direction, limit_kbps)
         except Exception as e:
             success, message = False, f"Ngoại lệ khi thực thi lệnh: {e}"
 
         status_str = "SUCCESS" if success else "FAILED"
         print(f"[ClientAgent Command Finished] {cmd.command_id} -> {status_str}: {message}")
 
-        audit_act = action
-        if action == CommandAction.BLOCK_APP.value:
-            audit_act = "BLOCK"
-            audit_desc = f"Chặn hoàn toàn lưu lượng của ứng dụng '{app_name}' ({direction}) [🔒 Admin Locked]"
-        elif action == CommandAction.THROTTLE_SET.value:
-            audit_act = "QoS"
-            audit_desc = f"Giới hạn tốc độ '{app_name}' mức {limit_kbps:.1f} KB/s ({direction}) [🔒 Admin Locked]"
-        elif action == CommandAction.UNBLOCK_APP.value:
-            audit_act = "UNBLOCK"
-            audit_desc = f"Gỡ bỏ chặn cho ứng dụng '{app_name}'"
-        elif action == CommandAction.UNBLOCK_ALL.value:
-            audit_act = "UNBLOCK_ALL"
-            audit_desc = "Gỡ bỏ toàn bộ danh sách ứng dụng bị chặn"
-        elif action == CommandAction.REMOVE_LIMIT.value:
-            audit_act = "REMOVE_LIMIT"
-            audit_desc = f"Gỡ bỏ hạn mức QoS cho '{app_name or 'toàn bộ'}'"
-        elif action == CommandAction.PING.value:
-            audit_act = "PING"
-            audit_desc = "Admin Server gửi gói tin kiểm tra kết nối (Ping)"
-        else:
-            audit_desc = message
-
+        audit_act, audit_desc = format_admin_command_audit(action, app_name, direction, limit_kbps, message)
         self.add_audit_log(
             source="Admin Server",
             action=audit_act,
@@ -148,50 +165,8 @@ class ClientPolicyMixin:
         )
 
         if success:
-            app_key = app_name.lower()
-            if action == CommandAction.BLOCK_APP.value:
-                self._remove_policy_entry(app_key)
-                self.active_policies[app_key] = {
-                    "action": "BLOCK",
-                    "app": app_name,
-                    "limit_kbps": 0.0,
-                    "direction": direction,
-                    "time": time.time(),
-                    "source": "ADMIN",
-                    "locked_by_admin": True,
-                }
-            elif action == CommandAction.THROTTLE_SET.value:
-                self._remove_policy_entry(app_key)
-                self.active_policies[app_key] = {
-                    "action": "THROTTLE",
-                    "app": app_name,
-                    "limit_kbps": limit_kbps,
-                    "direction": direction,
-                    "time": time.time(),
-                    "source": "ADMIN",
-                    "locked_by_admin": True,
-                }
-            elif action == CommandAction.UNBLOCK_APP.value:
-                self._remove_policy_entry(app_key)
-            elif action == CommandAction.UNBLOCK_ALL.value:
-                for k in list(self.active_policies.keys()):
-                    if self.active_policies[k].get("action") == "BLOCK":
-                        del self.active_policies[k]
-            elif action == CommandAction.REMOVE_LIMIT.value:
-                if app_key:
-                    pol = self._find_policy_entry(app_key)
-                    if pol and pol.get("action") == "THROTTLE":
-                        self._remove_policy_entry(app_key)
-                else:
-                    for k in list(self.active_policies.keys()):
-                        if self.active_policies[k].get("action") == "THROTTLE":
-                            del self.active_policies[k]
-
-            if self.on_policy_applied_locally:
-                try:
-                    self.on_policy_applied_locally(action, app_name, status_str, limit_kbps)
-                except Exception as ex:
-                    print(f"[ClientAgent Toast Error] {ex}")
+            self._update_admin_policy_state(action, app_name, direction, limit_kbps)
+            self._notify_policy_toast(action, app_name, status_str, limit_kbps)
 
         return CommandResultPacket(
             command_id=cmd.command_id,
@@ -200,6 +175,13 @@ class ClientPolicyMixin:
             message=message,
             applied_at=time.time(),
         )
+
+    def _notify_policy_toast(self, action: str, app_name: str, status_str: str, limit_kbps: float):
+        if self.on_policy_applied_locally:
+            try:
+                self.on_policy_applied_locally(action, app_name, status_str, limit_kbps)
+            except Exception as ex:
+                print(f"[ClientAgent Toast Error] {ex}")
 
     def _find_policy_entry(self, app_name: str) -> Optional[Dict[str, Any]]:
         """Tìm chính sách đang áp dụng cho ứng dụng (khớp cả tên có/không có .exe)."""
@@ -249,13 +231,7 @@ class ClientPolicyMixin:
                 f"Từ chối thao tác: Ứng dụng '{app_name}' đang chịu sự kiểm soát bắt buộc từ Admin Server (🔒 Admin Locked). "
                 "Máy con không được phép thay đổi hoặc ghi đè chính sách của Quản trị viên!"
             )
-            self.add_audit_log(
-                source="Local User",
-                action=f"DENIED_{action.upper()}",
-                target=app_name,
-                status="DENIED",
-                details=msg,
-            )
+            self.add_audit_log("Local User", f"DENIED_{action.upper()}", app_name, "DENIED", msg)
             return False, msg
 
         act_upper = action.upper()
@@ -279,17 +255,13 @@ class ClientPolicyMixin:
                     "locked_by_admin": False,
                 }
                 self.add_audit_log(
-                    source="Local User",
-                    action="LOCAL_BLOCK",
-                    target=app_name,
-                    status="SUCCESS",
-                    details=f"Người dùng máy con chủ động chặn cục bộ '{app_name}' ({direction})",
+                    "Local User",
+                    "LOCAL_BLOCK",
+                    app_name,
+                    "SUCCESS",
+                    f"Người dùng máy con chủ động chặn cục bộ '{app_name}' ({direction})",
                 )
-                if self.on_policy_applied_locally:
-                    try:
-                        self.on_policy_applied_locally("LOCAL_BLOCK", app_name, "SUCCESS", 0.0)
-                    except Exception:
-                        pass
+                self._notify_policy_toast("LOCAL_BLOCK", app_name, "SUCCESS", 0.0)
             return ok, msg
 
         if act_upper in ("THROTTLE", "QOS"):
@@ -310,17 +282,13 @@ class ClientPolicyMixin:
                     "locked_by_admin": False,
                 }
                 self.add_audit_log(
-                    source="Local User",
-                    action="LOCAL_QoS",
-                    target=app_name,
-                    status="SUCCESS",
-                    details=f"Người dùng máy con tự giới hạn tốc độ '{app_name}' mức {limit_kbps:.1f} KB/s ({direction})",
+                    "Local User",
+                    "LOCAL_QoS",
+                    app_name,
+                    "SUCCESS",
+                    f"Người dùng máy con tự giới hạn tốc độ '{app_name}' mức {limit_kbps:.1f} KB/s ({direction})",
                 )
-                if self.on_policy_applied_locally:
-                    try:
-                        self.on_policy_applied_locally("LOCAL_THROTTLE", app_name, "SUCCESS", float(limit_kbps))
-                    except Exception:
-                        pass
+                self._notify_policy_toast("LOCAL_THROTTLE", app_name, "SUCCESS", float(limit_kbps))
             return ok, msg
 
         return False, f"Hành động cục bộ không hợp lệ: {action}"
@@ -336,13 +304,7 @@ class ClientPolicyMixin:
                 f"Từ chối gỡ bỏ: Chính sách đối với '{app_name}' được áp đặt bởi Admin Server (🔒 Admin Locked). "
                 "Chỉ Quản trị viên mới có quyền mở khóa ứng dụng này!"
             )
-            self.add_audit_log(
-                source="Local User",
-                action="DENIED_UNBLOCK",
-                target=app_name,
-                status="DENIED",
-                details=msg,
-            )
+            self.add_audit_log("Local User", "DENIED_UNBLOCK", app_name, "DENIED", msg)
             return False, msg
 
         pol = self._find_policy_entry(app_name)
@@ -355,18 +317,15 @@ class ClientPolicyMixin:
             ok, msg = self.packet_shaper.unblock_app(app_name)
 
         self._remove_policy_entry(app_name)
+        status_str = "SUCCESS" if ok else "FAILED"
         self.add_audit_log(
-            source="Local User",
-            action="LOCAL_UNBLOCK",
-            target=app_name,
-            status="SUCCESS" if ok else "FAILED",
-            details=f"Người dùng máy con đã gỡ bỏ chính sách tự vệ cục bộ cho '{app_name}'",
+            "Local User",
+            "LOCAL_UNBLOCK",
+            app_name,
+            status_str,
+            f"Người dùng máy con đã gỡ bỏ chính sách tự vệ cục bộ cho '{app_name}'",
         )
-        if self.on_policy_applied_locally:
-            try:
-                self.on_policy_applied_locally("LOCAL_UNBLOCK", app_name, "SUCCESS" if ok else "FAILED", 0.0)
-            except Exception:
-                pass
+        self._notify_policy_toast("LOCAL_UNBLOCK", app_name, status_str, 0.0)
         return ok, msg
 
     def clear_all_local_policies(self) -> Tuple[int, int]:
@@ -390,15 +349,11 @@ class ClientPolicyMixin:
 
         if removed > 0:
             self.add_audit_log(
-                source="Local User",
-                action="LOCAL_CLEAR_ALL",
-                target="*",
-                status="SUCCESS",
-                details=f"Đã gỡ {removed} chính sách cục bộ (Giữ nguyên {kept_admin} chính sách khóa bởi Admin).",
+                "Local User",
+                "LOCAL_CLEAR_ALL",
+                "*",
+                "SUCCESS",
+                f"Đã gỡ {removed} chính sách cục bộ (Giữ nguyên {kept_admin} chính sách khóa bởi Admin).",
             )
-            if self.on_policy_applied_locally:
-                try:
-                    self.on_policy_applied_locally("LOCAL_CLEAR_ALL", "*", "SUCCESS", 0.0)
-                except Exception:
-                    pass
+            self._notify_policy_toast("LOCAL_CLEAR_ALL", "*", "SUCCESS", 0.0)
         return removed, kept_admin
